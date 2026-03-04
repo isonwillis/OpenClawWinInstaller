@@ -1,6 +1,6 @@
 # OpenClawWinInstaller
 
-> **Status: v1.0.2 — PRODUCTION READY** · 2026-03-04
+> **Status: v1.0.3 — PRODUCTION READY** · 2026-03-04 → v1.0.3
 
 A fully automated Windows installer that sets up **OpenClaw** with a local LLM (LYRA via Ollama).  
 After running the script, LYRA is immediately ready to use — no manual configuration, no token issues, no approval prompts.
@@ -31,7 +31,7 @@ Unlike other setups that require hours of googling, Stack Overflow deep-dives, a
 
 ## Table of Contents
 
-- [What's New in v1.0.2](#whats-new-in-v102)
+- [What's New in v1.0.3](#whats-new-in-v102)
 - [Machines](#machines)
 - [What Works](#what-works)
 - [Machine Role Hierarchy](#machine-role-hierarchy)
@@ -46,7 +46,7 @@ Unlike other setups that require hours of googling, Stack Overflow deep-dives, a
 
 ---
 
-## What's New in v1.0.2
+## What's New in v1.0.3
 
 ### OpenClaw 2026.3.2 Sentinel Bug Fixes (DECISION #11 + #12)
 

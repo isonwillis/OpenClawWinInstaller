@@ -54,9 +54,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 class OpenClawWinInstaller(OpenClawOperations):
     def __init__(self, root):
         self.root = root
-        self.root.title("OpenClaw Windows Setup  –  v1.0.2")
+        self.root.title("OpenClaw Windows Setup  –  v1.0.3")
         self.root.geometry("1020x860")
         self.root.resizable(True, True)
+
+        # ── Hardware profile (v1.0.3) — detect before config write ────────
+        self._hw_profile: dict | None = None  # populated in _log_hardware_info
 
         # ── Configuration module (all config writes delegated here) ────────
         # Callbacks are set after full init because some (like self._npm_prefix)
@@ -82,7 +85,7 @@ class OpenClawWinInstaller(OpenClawOperations):
         self.setup_ui()
 
         self.log("=" * 70)
-        self.log("OPENCLAW WINDOWS SETUP  –  v1.0.2")
+        self.log("OPENCLAW WINDOWS SETUP  –  v1.0.3")
         self.log("=" * 70)
         self.log(f"Python:   {sys.version.split()[0]}")
         self.log(f"System:   {platform.system()} {platform.release()} "
@@ -110,6 +113,34 @@ class OpenClawWinInstaller(OpenClawOperations):
             except Exception:
                 pass
         return None, None
+
+    def _log_hardware_info(self):
+        """
+        Runs HardwareProfile.detect() and logs the result.
+        Called 200ms after startup so the log window is ready.
+        Stores result in self._hw_profile for use by write_openclaw_config().
+        """
+        self.log("── HARDWARE PROFILE (v1.0.3) ────────────────────────────────────────────")
+        try:
+            hw = HardwareProfile(log_fn=self.log)
+            profile = hw.detect()
+            self._hw_profile = profile
+            for line in hw.summary_lines():
+                self.log(f"  {line}", "INFO")
+            self.log(
+                f"  → Recommended timeout: {profile['recommended_timeout']}s  "
+                f"(current DECISION #3 default: 3600s)", "INFO"
+            )
+            if profile["recommended_timeout"] != 3600:
+                self.log(
+                    f"  ⚡ Hardware allows faster timeout — will use "
+                    f"{profile['recommended_timeout']}s on next install/config-write",
+                    "SUCCESS"
+                )
+        except Exception as e:
+            self.log(f"  Hardware detection failed (non-fatal): {e}", "WARNING")
+            self._hw_profile = None
+        self.log("─" * 70)
 
     def _startup_config_analysis(self):
         """500ms after start: analyze config + build diagnostic tab.
@@ -2959,7 +2990,7 @@ class OpenClawWinInstaller(OpenClawOperations):
             # v10 PRE-FLIGHT: Clean config FIRST, BEFORE gateway is started!
             # Otherwise gateway start/install reads the old broken config and crashes immediately.
             self.log("  Pre-flight: Cleaning config before gateway start...")
-            self.cfg.write_openclaw_config("llama3.1:8b")  # Model will be refined in step 14
+            self.cfg.write_openclaw_config("llama3.1:8b", hw_profile=self._hw_profile)  # Model will be refined in step 14
             self.log("  Pre-flight completed – config is now valid", "SUCCESS")
 
             gw_ok = self.setup_gateway()
@@ -3076,7 +3107,7 @@ class OpenClawWinInstaller(OpenClawOperations):
             oc = self.get_openclaw_cmd()
 
             # v10: Write valid config (rebuild, no merge → no systemPrompt leak)
-            cfg_ok, cfg_path = self.cfg.write_openclaw_config(primary_model)
+            cfg_ok, cfg_path = self.cfg.write_openclaw_config(primary_model, hw_profile=self._hw_profile)
 
             # Run doctor --fix to remove any legacy remnants
             self.log("  openclaw doctor --fix...")
@@ -3089,7 +3120,7 @@ class OpenClawWinInstaller(OpenClawOperations):
             # Therefore write AGAIN after doctor --fix:
             if "doctor complete" in fix_out or "changes" in fix_out:
                 self.log("  doctor --fix changed config – writing again...", "INFO")
-                self.cfg.write_openclaw_config(primary_model)
+                self.cfg.write_openclaw_config(primary_model, hw_profile=self._hw_profile)
                 self.log("  Config restored after doctor fix ✓", "SUCCESS")
 
             # Check if config is now clean

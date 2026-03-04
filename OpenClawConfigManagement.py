@@ -148,6 +148,186 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# HardwareProfile  –  v1.0.3
+# Detects GPU/RAM/CPU at runtime and derives optimal config values.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class HardwareProfile:
+    """
+    Detects local hardware and recommends OpenClaw config values.
+
+    Detection chain:
+      1. nvidia-smi  → GPU name, VRAM total (most reliable)
+      2. Ollama API  → running model layer distribution (fallback)
+      3. WMI / PS   → RAM total
+      4. CPU info   → core count, AVX2 support
+
+    All detection is best-effort — missing data falls back to safe defaults.
+    Never raises; always returns a complete profile dict.
+    """
+
+    # VRAM tiers → (recommended_primary_model, timeoutSeconds, role)
+    VRAM_TIERS = [
+        (24 * 1024,  "glm-4.7-flash",   600,  "head"),    # > 24 GB — full VRAM
+        (16 * 1024,  "glm-4.7-flash",   900,  "head"),    # 16–24 GB — full VRAM
+        ( 8 * 1024,  "glm-4.7-flash",  2400,  "head"),    # 8–16 GB — hybrid
+        ( 6 * 1024,  "glm-4.7-flash",  3600,  "head"),    # 6–8 GB  — hybrid (default)
+        ( 4 * 1024,  "qwen2.5:7b",     3600,  "senior"),  # 4–6 GB
+        (     0,     "qwen2.5:3b",     7200,  "junior"),  # < 4 GB
+    ]
+
+    def __init__(self, log_fn=None):
+        self._log = log_fn or (lambda msg, lvl="INFO": print(f"[HW] {msg}"))
+
+    # ── Public API ─────────────────────────────────────────────────────────────
+
+    def detect(self) -> dict:
+        """
+        Returns a hardware profile dict:
+          {
+            "gpu_name":        str,   # e.g. "NVIDIA GeForce RTX 3050"
+            "vram_mb":         int,   # total VRAM in MB (0 if unknown)
+            "ram_gb":          int,   # total system RAM in GB
+            "cpu_cores":       int,   # logical CPU count
+            "avx2":            bool,  # AVX2 support
+            "recommended_model":    str,
+            "recommended_timeout":  int,
+            "recommended_role":     str,   # "head" | "senior" | "junior"
+          }
+        """
+        gpu_name, vram_mb = self._detect_gpu()
+        ram_gb             = self._detect_ram()
+        cpu_cores, avx2    = self._detect_cpu()
+        model, timeout, role = self._recommend(vram_mb)
+
+        profile = {
+            "gpu_name":            gpu_name,
+            "vram_mb":             vram_mb,
+            "ram_gb":              ram_gb,
+            "cpu_cores":           cpu_cores,
+            "avx2":                avx2,
+            "recommended_model":   model,
+            "recommended_timeout": timeout,
+            "recommended_role":    role,
+        }
+
+        self._log(
+            f"  [HW] GPU: {gpu_name} ({vram_mb} MB VRAM) | "
+            f"RAM: {ram_gb} GB | Cores: {cpu_cores} | AVX2: {avx2}", "INFO"
+        )
+        self._log(
+            f"  [HW] Recommendation → model={model} "
+            f"timeout={timeout}s role={role}", "INFO"
+        )
+        return profile
+
+    # ── Detection helpers ──────────────────────────────────────────────────────
+
+    def _detect_gpu(self) -> tuple[str, int]:
+        """Returns (gpu_name, vram_mb). Falls back to (unknown, 0)."""
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["nvidia-smi",
+                 "--query-gpu=name,memory.total",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                line = result.stdout.strip().splitlines()[0]
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) == 2:
+                    name   = parts[0]
+                    vram   = int(parts[1])
+                    return name, vram
+        except Exception as e:
+            self._log(f"  [HW] nvidia-smi failed: {e}", "INFO")
+
+        # Fallback: Ollama API
+        try:
+            req = urllib.request.Request("http://127.0.0.1:11434/api/ps")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read())
+                # Ollama reports total VRAM via size_vram field per model
+                for m in data.get("models", []):
+                    vram = m.get("size_vram", 0)
+                    if vram > 0:
+                        return "GPU (via Ollama)", vram // (1024 * 1024)
+        except Exception:
+            pass
+
+        return "Unknown GPU", 0
+
+    def _detect_ram(self) -> int:
+        """Returns total system RAM in GB."""
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["powershell", "-Command",
+                 "(Get-CimInstance Win32_PhysicalMemory | "
+                 "Measure-Object -Property Capacity -Sum).Sum / 1GB"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                return int(float(result.stdout.strip()))
+        except Exception as e:
+            self._log(f"  [HW] RAM detection failed: {e}", "INFO")
+        return 0
+
+    def _detect_cpu(self) -> tuple[int, bool]:
+        """Returns (logical_cores, avx2_supported)."""
+        import os as _os
+        cores = _os.cpu_count() or 0
+        avx2  = False
+        try:
+            import subprocess
+            # Check AVX2 via PowerShell + CPUID
+            result = subprocess.run(
+                ["powershell", "-Command",
+                 "(Get-WmiObject -Class Win32_Processor).Description"],
+                capture_output=True, text=True, timeout=10
+            )
+            # AVX2 machines report it in processor description or we check via
+            # a small Python snippet as the most reliable method
+            avx2_check = subprocess.run(
+                ["python", "-c",
+                 "import platform; "
+                 "f=platform.processor(); "
+                 "print('avx2' if 'avx2' in f.lower() else 'no')"],
+                capture_output=True, text=True, timeout=10
+            )
+            if avx2_check.returncode == 0:
+                avx2 = "avx2" in avx2_check.stdout.lower()
+            else:
+                # Most modern Intel/AMD i5+ support AVX2 — optimistic default
+                avx2 = True
+        except Exception as e:
+            self._log(f"  [HW] CPU detection failed: {e}", "INFO")
+            avx2 = True  # safe optimistic default
+        return cores, avx2
+
+    def _recommend(self, vram_mb: int) -> tuple[str, int, str]:
+        """Returns (model, timeoutSeconds, role) based on VRAM."""
+        for threshold_mb, model, timeout, role in self.VRAM_TIERS:
+            if vram_mb >= threshold_mb:
+                return model, timeout, role
+        return "qwen2.5:3b", 7200, "junior"
+
+    def summary_lines(self) -> list[str]:
+        """Returns human-readable summary lines for GUI display."""
+        p = self.detect()
+        lines = [
+            f"GPU:    {p['gpu_name']} ({p['vram_mb']} MB VRAM)",
+            f"RAM:    {p['ram_gb']} GB",
+            f"CPU:    {p['cpu_cores']} cores  AVX2: {'yes' if p['avx2'] else 'no'}",
+            f"→ Model:   {p['recommended_model']}",
+            f"→ Timeout: {p['recommended_timeout']}s",
+            f"→ Role:    {p['recommended_role']}",
+        ]
+        return lines
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # LyraDelegateToolRegistrar
 # (kept here because it is pure config — no GUI dependency)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -413,7 +593,8 @@ class OpenClawConfig:
 
     # ── Core config write ──────────────────────────────────────────────────────
 
-    def write_openclaw_config(self, primary_model: str = "llama3.1:8b"):
+    def write_openclaw_config(self, primary_model: str = "llama3.1:8b",
+                              hw_profile: dict | None = None):
         """
         Writes ~/.openclaw/openclaw.json with correct Ollama provider config.
 
@@ -543,6 +724,18 @@ class OpenClawConfig:
             except Exception:
                 pass
 
+        # ── Hardware-based config values (v1.0.3) ───────────────────────────
+        # hw_profile comes from HardwareProfile.detect() when available.
+        # Falls back to safe defaults (RTX 3050 / 6 GB VRAM baseline).
+        timeout_seconds = (
+            hw_profile.get("recommended_timeout", 3600)
+            if hw_profile else 3600
+        )
+        self._log(
+            f"  Config: timeoutSeconds={timeout_seconds} "
+            f"({'from HW profile' if hw_profile else 'default'})", "INFO"
+        )
+
         config = {
             # DECISION #9: meta block required by 2026.3.1
             "meta": {
@@ -578,7 +771,7 @@ class OpenClawConfig:
                     # DECISION #1 — timeoutSeconds only, NOT runTimeoutSeconds
                     # DECISION #3 — 3600s correct for RTX 3050 GPU-hybrid
                     # DECISION #9 — 7200 causes orphaned session-write-locks
-                    "timeoutSeconds": 3600,
+                    "timeoutSeconds": timeout_seconds,  # from HardwareProfile (v1.0.3)
                 },
             },
             "commands": {
@@ -1017,7 +1210,7 @@ class OpenClawConfig:
 
     # ── SOUL.md ────────────────────────────────────────────────────────────────
 
-    def _build_soul_content(self) -> str:
+    def _build_soul_content(self, hw_profile: dict | None = None) -> str:
         """
         Builds the full SOUL.md content string for LYRA.
         This is the behavioural rulebook injected into LYRA's workspace.
@@ -1045,6 +1238,17 @@ class OpenClawConfig:
 "LYRA (head) - RTX 3050 (6 GB VRAM + 26 GB shared RAM = 32 GB GPU-total), i7-8700, 64 GB RAM.\n"
 "  Model: glm-4.7-flash (30B, 19 GB) — läuft GPU+CPU hybrid. CUDA beschleunigt.\n"
 "  Ollama verteilt Layer automatisch: VRAM zuerst, Rest im shared RAM (schnell).\n"
++ (
+f"  [HW-Profil] GPU: {hw_profile.get('gpu_name','?')} "
+f"({hw_profile.get('vram_mb',0)} MB VRAM) | "
+f"RAM: {hw_profile.get('ram_gb',0)} GB | "
+f"Cores: {hw_profile.get('cpu_cores',0)} | "
+f"AVX2: {'ja' if hw_profile.get('avx2') else 'nein'}\n"
+f"  [HW-Profil] Empfehlung: model={hw_profile.get('recommended_model','?')} "
+f"timeout={hw_profile.get('recommended_timeout',3600)}s "
+f"role={hw_profile.get('recommended_role','?')}\n"
+if hw_profile else ""
+) +
 "Senior worker: AVX2, qwen2.5:1.5b-3b, complex helper tasks.\n"
 "Junior worker: any hardware, qwen2.5:0.5b, simple tasks + web search via SearXNG.\n"
 "\n"
@@ -1315,8 +1519,8 @@ class OpenClawConfig:
 "## Python / venv\n"
 "\n"
 "REGEL: Niemals nur `pip` oder `python` aufrufen — immer den vollen venv-Pfad nutzen.\n"
-"  Richtig:  C:\\Users\\scari\\pytorch_env\\venv\\Scripts\\pip.exe install ...\n"
-"  Richtig:  C:\\Users\\scari\\pytorch_env\\venv\\Scripts\\python.exe -c \"...\"\n"
+"  Richtig:  $HOME\\pytorch_env\\venv\\Scripts\\pip.exe install ...\n"
+"  Richtig:  $HOME\\pytorch_env\\venv\\Scripts\\python.exe -c \"...\"\n"
 "  Falsch:   pip install torch   ← findet keine Pakete wenn kein Netz oder falsches env\n"
 "\n"
 "Wenn pip 'no matching distribution found' meldet:\n"
@@ -1328,12 +1532,12 @@ class OpenClawConfig:
 "\n"
 "## PyTorch venv — bereits installiert unter\n"
 "\n"
-"  C:\\Users\\scari\\pytorch_env\\venv\\\n"
+"  $HOME\\pytorch_env\\venv\\\n"
 "  torch 2.10.0+cu128  |  CUDA 12.8  |  RTX 3050  |  CUDA available: True\n"
 "  transformers 5.2.0  |  accelerate 1.12.0  |  bitsandbytes 0.49.2\n"
 "\n"
 "Schnelltest:\n"
-"  C:\\Users\\scari\\pytorch_env\\venv\\Scripts\\python.exe -c \"import torch; print(torch.__version__)\"\n"
+"  $HOME\\pytorch_env\\venv\\Scripts\\python.exe -c \"import torch; print(torch.__version__)\"\n"
 "\n"
 "---\n"
 "\n"
@@ -1382,7 +1586,7 @@ class OpenClawConfig:
 "\n"
 "FALLE 3: ~ in Pfaden\n"
 "  ~ funktioniert in PS nicht immer zuverlässig in allen Kontexten.\n"
-"  Lösung: $HOME oder den vollen Pfad nutzen (C:\\Users\\scari\\...).\n"
+"  Lösung: $HOME oder den vollen Pfad nutzen ($env:USERPROFILE\\...).\n"
 "\n"
 "---\n"
 "\n"
@@ -1551,7 +1755,8 @@ class OpenClawConfig:
 "Format: [LEARNING] YYYY-MM-DD: <Fehler> → <Ursache> → <Lösung>\n"
         )
 
-    def write_soul_files(self, log_prefix: str = "") -> None:
+    def write_soul_files(self, log_prefix: str = "",
+                         hw_profile: dict | None = None) -> None:
         """
         Writes SOUL.md, BOOTSTRAP.md and FORCE-DELEGATE.md to the workspace directory.
         Called pre-gateway (during configure_ollama_via_cli) and
@@ -1576,7 +1781,7 @@ class OpenClawConfig:
 
         # ── SOUL.md — Identität & Verhaltensregeln, LYRA-Additions bewahren ──
         soul_path    = os.path.join(workspace_dir, "SOUL.md")
-        soul_content = self._build_soul_content()
+        soul_content = self._build_soul_content(hw_profile=hw_profile)
         self.safe_write_workspace(soul_path, soul_content)
         self._log(f"  {tag} SOUL.md written: {soul_path}  ✓", "SUCCESS")
 
@@ -1775,7 +1980,7 @@ ASKING FOR API KEY = ERROR. NEVER DO. Call delegate_to_worker.
         log_candidates = [
             r"C:\tmp\openclaw",
             os.path.join(os.path.expanduser("~"), ".openclaw", "logs"),
-            r"C:\Users\scari\AppData\Local\Temp",
+            os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "Temp"),
         ]
         import glob, datetime
 
@@ -2052,7 +2257,7 @@ class LyraHeadServer:
     HTTP Task server for the LYRA head (Port 18790). Only stdlib, no Flask.
     ThreadingTCPServer → parallel worker connections. CORS set.
 
-    Verified: 2026-02-23 (Head: scari/192.168.2.107, Worker: Junior PC).
+    Verified: 2026-02-23 (Head: 192.168.2.107, Worker: Junior PC).
     Updated: 2026-02-27  – Added /result POST endpoint for worker results
               and robust connection error handling.
 
