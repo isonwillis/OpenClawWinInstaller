@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OpenClawWinInstaller.py  –  v1.0.1
+OpenClawWinInstaller.py  –  v1.0.2
 ====================================
 GUI installer for OpenClaw / LYRA on Windows.
 Handles the "New Installation" flow (Steps 1-16) and all GUI interactions.
@@ -19,7 +19,7 @@ OpenClawWinInstaller inherits OpenClawOperations so all operational methods
 are available as self.X() — no extra wiring needed.
 """
 
-# OpenClawWinInstaller.py  –  v1.0.1
+# OpenClawWinInstaller.py  –  v1.0.2
 
 from OpenClawConfigManagement import (
     OpenClawConfig, LyraDelegateToolRegistrar,
@@ -54,7 +54,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 class OpenClawWinInstaller(OpenClawOperations):
     def __init__(self, root):
         self.root = root
-        self.root.title("OpenClaw Windows Setup  –  v1.0.1")
+        self.root.title("OpenClaw Windows Setup  –  v1.0.2")
         self.root.geometry("1020x860")
         self.root.resizable(True, True)
 
@@ -82,7 +82,7 @@ class OpenClawWinInstaller(OpenClawOperations):
         self.setup_ui()
 
         self.log("=" * 70)
-        self.log("OPENCLAW WINDOWS SETUP  –  v1.0.1")
+        self.log("OPENCLAW WINDOWS SETUP  –  v1.0.2")
         self.log("=" * 70)
         self.log(f"Python:   {sys.version.split()[0]}")
         self.log(f"System:   {platform.system()} {platform.release()} "
@@ -353,7 +353,7 @@ class OpenClawWinInstaller(OpenClawOperations):
         # Header
         header = ttk.Frame(main_frame)
         header.pack(fill=tk.X, pady=(0, 4))
-        ttk.Label(header, text="OpenClaw — v1.0.1",
+        ttk.Label(header, text="OpenClaw — v1.0.2",
                   font=("Arial", 15, "bold")).pack(side=tk.LEFT)
         role_display = (f"  [{self._saved_role}]" if self._saved_role else "  [Role unknown]")
         self._role_badge = ttk.Label(header, text=role_display,
@@ -638,18 +638,18 @@ class OpenClawWinInstaller(OpenClawOperations):
                    ).pack(anchor=tk.W, pady=(4, 0))
 
         # Update SOUL.md
-        sec7 = ttk.LabelFrame(left, text="📜  Update SOUL.md", padding="8")
+        sec7 = ttk.LabelFrame(left, text="🛠  Update Config + Fixes", padding="8")
         sec7.pack(fill=tk.X, **pad)
         ttk.Label(sec7,
-                  text=("Writes the latest SOUL.md to LYRA's workspace. "
-                        "LYRA's own additions are preserved (merge strategy). "
+                  text=("Writes latest SOUL.md/BOOTSTRAP.md to workspace (LYRA additions preserved).\n"
+                        "Applies adaptive config fixes to openclaw.json (never overwrites valid values).\n"
                         "No reinstall required — takes effect after Gateway restart."),
                   font=("Arial", 9), wraplength=320).pack(anchor=tk.W)
         self._soul_update_status = ttk.Label(sec7, text="", font=("Consolas", 9),
                                               foreground="#555555")
         self._soul_update_status.pack(anchor=tk.W, pady=(4, 0))
-        ttk.Button(sec7, text="📜 Update SOUL.md + restart Gateway",
-                   command=self._update_soul_md).pack(anchor=tk.W, pady=(4, 0))
+        ttk.Button(sec7, text="🛠 Apply fixes + Update SOUL.md + restart Gateway",
+                   command=self._apply_fixes_and_update).pack(anchor=tk.W, pady=(4, 0))
 
         # ── Right column — LLM Model Manager ─────────────────────────
         right = ttk.Frame(outer)
@@ -1801,43 +1801,96 @@ class OpenClawWinInstaller(OpenClawOperations):
         except Exception as e:
             self.log(f"[Browser] Could not write config: {e}", "ERROR")
 
-    def _update_soul_md(self):
-        """Write the current SOUL.md to LYRA's workspace without a full reinstall.
+    def _apply_fixes_and_update(self):
+        """Universal fix + update function. Called by the 'Apply fixes + Update SOUL.md' button.
 
-        Uses safe_write_workspace() with the installer-owned end marker so that
-        any content LYRA has appended herself (language preferences, identity
-        extensions, personal learnings) is detected and preserved after the
-        marker.  Only the installer-owned section is refreshed.
+        Runs all adaptive config fixes against openclaw.json (never overwrites
+        valid existing values), then refreshes SOUL.md/BOOTSTRAP.md in the workspace.
+        One backup per run. Gateway restarted once at the end.
 
-        After writing, the Gateway is restarted automatically so the new rules
-        take effect immediately without manual intervention.
+        Adding new fixes here keeps the GUI clean — one button for all corrections.
+
+        Current fixes applied:
+          - DECISION #11: gateway.auth.password — add '' if absent or sentinel present.
+            (OpenClaw 2026.3.2 requires this field; absent → sentinel → rejected)
         """
-        cfg_dir = self.cfg._find_openclaw_config_dir()
+        cfg_dir       = self.cfg._find_openclaw_config_dir()
+        cfg_path      = os.path.join(cfg_dir, "openclaw.json")
         workspace_dir = os.path.join(cfg_dir, "workspace")
         os.makedirs(workspace_dir, exist_ok=True)
-        soul_path = os.path.join(workspace_dir, "SOUL.md")
+        soul_path     = os.path.join(workspace_dir, "SOUL.md")
 
-        # Pull current soul_content from the install method's closure by
-        # re-using the same string that write_openclaw_config() would write.
-        # We call _build_soul_content() which returns the canonical string.
+        fixes_applied = []
+
+        # ── openclaw.json adaptive fixes ──────────────────────────────────────
+        if os.path.isfile(cfg_path):
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+
+                # DECISION #11: gateway.auth.password
+                # Only touch if absent or contains the sentinel — never overwrite
+                # a real password value a user may have set intentionally.
+                cfg.setdefault("gateway", {}).setdefault("auth", {})
+                current_pw = cfg["gateway"]["auth"].get("password", "__NOT_SET__")
+                if current_pw in ("__NOT_SET__", "__OPENCLAW_REDACTED__"):
+                    cfg["gateway"]["auth"]["password"] = ""
+                    label = "absent → added" if current_pw == "__NOT_SET__" else "sentinel → cleared"
+                    fixes_applied.append(f"gateway.auth.password ({label})")
+
+                # DECISION #12: commands.ownerDisplaySecret
+                # Required HMAC secret for owner-ID obfuscation (2026.3.x+).
+                # Web Config Admin Panel corrupts openclaw.json by writing the
+                # redaction sentinel back to disk (upstream bug #13058).
+                # Generate a new secret ONLY if absent or sentinel — never overwrite
+                # a valid existing secret (changing it invalidates owner-ID history).
+                cfg.setdefault("commands", {})
+                current_secret = cfg["commands"].get("ownerDisplaySecret", "__NOT_SET__")
+                if current_secret in ("__NOT_SET__", "__OPENCLAW_REDACTED__"):
+                    import uuid as _uuid
+                    cfg["commands"]["ownerDisplaySecret"] = _uuid.uuid4().hex
+                    label = "absent → generated" if current_secret == "__NOT_SET__" else "sentinel → regenerated"
+                    fixes_applied.append(f"commands.ownerDisplaySecret ({label})")
+
+                # ── Future fixes go here, same pattern ────────────────────────
+                # Example:
+                #   current = cfg.get("some", {}).get("key", "__NOT_SET__")
+                #   if current == "__NOT_SET__":
+                #       cfg["some"]["key"] = correct_value
+                #       fixes_applied.append("some.key (added)")
+
+                if fixes_applied:
+                    shutil.copy2(cfg_path, cfg_path + f".bak_{int(time.time())}")
+                    with open(cfg_path, "w", encoding="utf-8") as f:
+                        json.dump(cfg, f, indent=2, ensure_ascii=False)
+                    for fix in fixes_applied:
+                        self.log(f"[Fix] {fix}  ✓", "SUCCESS")
+                else:
+                    self.log("[Fix] openclaw.json — all values already correct, nothing changed ✓", "INFO")
+
+            except Exception as e:
+                self.log(f"[Fix] openclaw.json error: {e}", "ERROR")
+        else:
+            self.log("[Fix] openclaw.json not found — skipping config fixes", "WARNING")
+
+        # ── SOUL.md + BOOTSTRAP.md update ─────────────────────────────────────
         soul_content = self.cfg._build_soul_content()
-
         try:
             self.cfg.safe_write_workspace(soul_path, soul_content)
-            self.log("[SOUL] SOUL.md updated successfully ✓", "SUCCESS")
+            self.log("[Fix] SOUL.md updated (LYRA additions preserved) ✓", "SUCCESS")
             self._soul_update_status.config(
-                text="✅ SOUL.md updated — restarting Gateway...",
+                text="✅ Fixes applied · SOUL.md updated — restarting Gateway...",
                 foreground="green")
         except Exception as e:
-            self.log(f"[SOUL] SOUL.md update failed: {e}", "ERROR")
+            self.log(f"[Fix] SOUL.md update failed: {e}", "ERROR")
             self._soul_update_status.config(
-                text=f"❌ Error: {e}", foreground="red")
+                text=f"❌ SOUL.md error: {e}", foreground="red")
             return
 
-        # Restart Gateway so the new SOUL.md is picked up immediately
+        # ── Gateway restart ────────────────────────────────────────────────────
         self.root.after(800, self._restart_gateway)
         self.root.after(1000, lambda: self._soul_update_status.config(
-            text="✅ SOUL.md updated · Gateway restarting...",
+            text="✅ Fixes applied · SOUL.md updated · Gateway restarting...",
             foreground="#cc7700"))
 
     def _apply_search_fix(self):

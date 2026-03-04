@@ -1,6 +1,6 @@
 # OpenClawWinInstaller
 
-> **Status: v1.0.1 — PRODUCTION READY** · 2026-03-03
+> **Status: v1.0.2 — PRODUCTION READY** · 2026-03-04
 
 A fully automated Windows installer that sets up **OpenClaw** with a local LLM (LYRA via Ollama).  
 After running the script, LYRA is immediately ready to use — no manual configuration, no token issues, no approval prompts.
@@ -17,7 +17,7 @@ From v1.0.0 the system supports a **machine role hierarchy**: a LYRA head orches
 
 Unlike other setups that require hours of googling, Stack Overflow deep-dives, and manual debugging, this installer handles everything:
 - ✅ 50+ components automatically installed
-- ✅ 65+ edge cases fixed and documented
+- ✅ 67+ edge cases fixed and documented
 - ✅ 3-stage fallback strategies
 - ✅ Bidirectional worker communication
 - ✅ Worker auto-start on every app launch
@@ -31,7 +31,7 @@ Unlike other setups that require hours of googling, Stack Overflow deep-dives, a
 
 ## Table of Contents
 
-- [What's New in v1.0.0](#whats-new-in-v100)
+- [What's New in v1.0.2](#whats-new-in-v102)
 - [Machines](#machines)
 - [What Works](#what-works)
 - [Machine Role Hierarchy](#machine-role-hierarchy)
@@ -43,6 +43,27 @@ Unlike other setups that require hours of googling, Stack Overflow deep-dives, a
 - [File Paths & Ports](#file-paths)
 - [Running the Installer](#running-the-installer)
 - [Testing Worker Communication](#testing-worker-communication)
+
+---
+
+## What's New in v1.0.2
+
+### OpenClaw 2026.3.2 Sentinel Bug Fixes (DECISION #11 + #12)
+
+Two new required fields in OpenClaw 2026.3.x caused `GatewayRequestError` after every install and every Web Config Admin Panel interaction. Root cause: OpenClaw auto-fills missing fields with the internal sentinel `__OPENCLAW_REDACTED__`, then immediately rejects it as invalid real data (upstream bug [#13058](https://github.com/openclaw/openclaw/issues/13058)).
+
+**`gateway.auth.password`** — new required field in 2026.3.2. Empty string is the correct value for token-auth mode.
+
+**`commands.ownerDisplaySecret`** — new HMAC secret for owner-ID obfuscation (2026.3.x). The Web Config Admin Panel triggers this: it reads `openclaw.json`, redacts sensitive fields for display, then writes the redacted content back to disk — destroying the secret on every config save.
+
+Both fixes are applied at three levels:
+1. `write_openclaw_config()` — written correctly from the start on fresh install
+2. `setup_lyra_agent()` — adaptive check runs automatically post-gateway during installation
+3. `🛠 Apply fixes + Update SOUL.md` button — for running installations without reinstall
+
+### Universal Fix Button replaces "Update SOUL.md"
+
+The `📜 Update SOUL.md` button has been replaced by `🛠 Apply fixes + Update SOUL.md`. It now runs all adaptive config fixes in a single pass before refreshing SOUL.md/BOOTSTRAP.md — one Gateway restart for everything. Future fixes are added here, not as new buttons.
 
 ---
 
@@ -80,7 +101,7 @@ Version history ballast removed. All critical knowledge preserved as `⚠️ DEC
 
 | Machine | CPU | RAM | GPU | Role | Status |
 |---|---|---|---|---|---|
-| **Lyra machine** (192.168.2.107) | i7-8700, AVX2 ✓ | 64 GB | RTX 3050 · 6 GB VRAM + 26 GB shared | **LYRA (head)** | ✅ Production · glm-4.7-flash hybrid |
+| **Lyra machine** (192.168.2.107) | i7-8700, AVX2 ✓ | 64 GB | RTX 3050 · 6 GB VRAM + 26 GB shared | **LYRA (head)** | ✅ Production · voytas26/openclaw-oss-20b-deterministic |
 | **Junior worker machine** (192.168.2.102) | i5-2500, no AVX2 | ~32 GB | — | **Junior** | ✅ Auto-starts · qwen2.5:0.5b |
 
 ---
@@ -102,9 +123,11 @@ Version history ballast removed. All critical knowledge preserved as `⚠️ DEC
 - ✅ `gateway.cmd` patched: TZ + OLLAMA_API_KEY + OPENCLAW_GATEWAY_TOKEN
 - ✅ `timeoutSeconds: 3600` — correct for RTX 3050 GPU-hybrid
 - ✅ `runTimeoutSeconds` intentionally absent — schema rejects it, Gateway cannot start
+- ✅ `gateway.auth.password: ""` — explicit empty string prevents sentinel injection (2026.3.2+)
+- ✅ `commands.ownerDisplaySecret` — random hex secret generated at install, never overwritten
 
 ### LYRA Behavior
-- ✅ SOUL.md written to workspace on every install + "📜 Update SOUL.md" button
+- ✅ SOUL.md written to workspace on every install + "🛠 Apply fixes + Update SOUL.md" button
 - ✅ FORCE-DELEGATE.md prevents Brave Search API requests
 - ✅ Web search fallback chain works without a connected worker
 - ✅ Session-start checklist: disk verified before memory accepted as truth
@@ -173,7 +196,7 @@ Junior Worker ──────────────────────
 ## SOUL.md — LYRA Behavior Rules
 
 Rules are written to `~/.openclaw/workspace/SOUL.md` on every install.  
-Update without reinstall: click **"📜 Update SOUL.md"** in the **🖥 Lyra Config** tab.
+Update without reinstall: click **"🛠 Apply fixes + Update SOUL.md"** in the **🖥 Lyra Config** tab.
 
 | Rule | What it prevents | Added |
 |---|---|---|
@@ -206,23 +229,6 @@ $j.agents.defaults.PSObject.Properties.Remove('runTimeoutSeconds')
 $j | ConvertTo-Json -Depth 20 | Set-Content "$HOME\.openclaw\openclaw.json" -Encoding UTF8
 # Then: Gateway restart
 ```
-
-### ❌ `No API provider registered for api: ollama` — NEVER REINTRODUCE
-**Problem:** OpenClaw 2026.3.1 compaction fails after long sessions. Root causes:
-- `meta.lastTouchedVersion` not updated to installed version → config treated as legacy
-- `env` block missing in `openclaw.json` → compaction context has no Ollama ENV
-- `timeoutSeconds: 7200` → orphaned session-write-locks
-
-**Fix:** `write_openclaw_config()` now writes `meta`, `env`, `gateway.mode: "local"` and correct `timeoutSeconds: 3600`. Confirmed 2026-03-03.
-
-**PowerShell hotfix (existing installations):**
-```powershell
-$j = Get-Content "$HOME\.openclaw\openclaw.json" -Raw | ConvertFrom-Json
-$j.meta.lastTouchedVersion = "2026.3.1"
-$j.agents.defaults.timeoutSeconds = 3600
-$j | ConvertTo-Json -Depth 20 | Set-Content "$HOME\.openclaw\openclaw.json" -Encoding UTF8
-```
-Then restart gateway via installer button.
 
 ### ❌ Gateway logs UTC instead of local time — NEVER REINTRODUCE
 **Problem:** Node.js via Scheduled Task does not inherit Windows system timezone → UTC timestamps → 1h offset → timeout debugging misleading.  
@@ -264,23 +270,31 @@ Then restart gateway via installer button.
 **Problem:** `AutoModelForSequenceClassification` returns `NoneType` for models without a classification head. Running the same code three times does not fix it.  
 **Fix:** Use `AutoModel` + `trust_remote_code=True`. Extract embeddings via `last_hidden_state.mean(dim=1)`. After the second identical error: read model card, search Hugging Face Discussions, write `[CORRECTION]`.
 
+### ❌ `gateway.auth.password` missing — NEVER REINTRODUCE
+**Problem:** OpenClaw 2026.3.2 added `password` as a required field in `gateway.auth`. If absent, it auto-fills `__OPENCLAW_REDACTED__` then rejects it: `GatewayRequestError: Sentinel value "__OPENCLAW_REDACTED__" in key gateway.auth.password is not valid as real data`.  
+**Fix:** Always write `"password": ""` explicitly in `gateway.auth`. Correct value for token-auth mode. (DECISION #11)
+
+### ❌ `commands.ownerDisplaySecret` missing — NEVER REINTRODUCE
+**Problem:** OpenClaw 2026.3.x added `ownerDisplaySecret` (HMAC secret for owner-ID obfuscation) as a required field under `commands`. The Web Config Admin Panel corrupts `openclaw.json` by writing the redaction sentinel `__OPENCLAW_REDACTED__` back to disk on every config save (upstream bug #13058). Gateway then rejects it immediately.  
+**Fix:** Generate a stable `uuid4().hex` at install time. Adaptive fix (`🛠 Apply fixes`) regenerates it only if absent or sentinel — never overwrites a valid existing secret. (DECISION #12)
+
 ---
 
 ## Current Models
 
 | Machine | Model | Size | Purpose | Notes |
 |---|---|---|---|---|
-| Lyra (head) | glm-4.7-flash | 30B / 19 GB | **Primary** | GPU+CPU hybrid · 3600s timeout |
+| Lyra (head) | voytas26/openclaw-oss-20b-deterministic | 21B / 14 GB | **Primary** | GPU+CPU hybrid · 3600s timeout |
+| Lyra (head) | glm-4.7-flash | 30B / 19 GB | Primary alt | GPU+CPU hybrid |
 | Lyra (head) | qwen2.5:14b | 15B / 9 GB | Primary alt | Fits in VRAM+shared easily |
 | Lyra (head) | qwen2.5:7b | 8B / 5 GB | Fast fallback | Fits in 6 GB VRAM alone |
 | Lyra (head) | deepseek-r1:8b | 8B / 5 GB | Reasoning tasks | |
-| Lyra (head) | voytas26/openclaw-oss-20b-deterministic | 21B / 14 GB | Fallback | Slower than glm — remove from fallbacks |
 | Junior worker | qwen2.5:0.5b | 0.5B | Only option (no AVX2) | Web search via SearXNG |
 | Senior worker | qwen2.5:1.5b | 1.5B | Primary | AVX2 required |
 
 > **GPU note:** RTX 3050 has 6 GB dedicated VRAM + 26 GB Windows shared RAM = 32 GB GPU-total.  
 > Ollama automatically distributes model layers: VRAM first (fastest), overflow to shared RAM (GPU-assisted).  
-> qwen2.5:7b (5 GB) fits entirely in VRAM → fastest responses. glm-4.7-flash (19 GB) uses hybrid.
+> qwen2.5:7b (5 GB) fits entirely in VRAM → fastest responses. voytas26/openclaw-oss-20b-deterministic (14 GB) uses GPU+CPU hybrid.
 
 ---
 
