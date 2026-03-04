@@ -1,6 +1,6 @@
 # OpenClawWinInstaller
 
-> **Status: v1.0.3 — PRODUCTION READY** · 2026-03-04 → v1.0.3
+> **Status: v1.0.4 — PRODUCTION READY** · 2026-03-04
 
 A fully automated Windows installer that sets up **OpenClaw** with a local LLM (LYRA via Ollama).  
 After running the script, LYRA is immediately ready to use — no manual configuration, no token issues, no approval prompts.
@@ -19,19 +19,24 @@ Unlike other setups that require hours of googling, Stack Overflow deep-dives, a
 - ✅ 50+ components automatically installed
 - ✅ 67+ edge cases fixed and documented
 - ✅ 3-stage fallback strategies
-- ✅ Bidirectional worker communication
+- ✅ Bidirectional worker communication (result stored locally + posted to HEAD)
 - ✅ Worker auto-start on every app launch
+- ✅ Task Server auto-start on Lyra at launch and after every Gateway restart
+- ✅ LYRA knows her workers — persistent registry, direct exec access
 - ✅ LYRA behavioral rules continuously tuned via live session logs
 - ✅ Web search works even without a connected worker
 - ✅ Gateway logs in local time (Europe/Zurich)
 - ✅ GPU-hybrid inference with RTX 3050 + shared RAM
+- ✅ Hardware-aware config: timeout + model from HardwareProfile
 - ✅ Clean two-module architecture: GUI installer + config management separated
 
 ---
 
 ## Table of Contents
 
-- [What's New in v1.0.3](#whats-new-in-v102)
+- [What's New in v1.0.4](#whats-new-in-v104)
+- [What's New in v1.0.3](#whats-new-in-v103)
+- [What's New in v1.0.0](#whats-new-in-v100)
 - [Machines](#machines)
 - [What Works](#what-works)
 - [Machine Role Hierarchy](#machine-role-hierarchy)
@@ -43,6 +48,100 @@ Unlike other setups that require hours of googling, Stack Overflow deep-dives, a
 - [File Paths & Ports](#file-paths)
 - [Running the Installer](#running-the-installer)
 - [Testing Worker Communication](#testing-worker-communication)
+
+---
+
+## What's New in v1.0.4
+
+### 📡 Monitoring Tab (Lyra only)
+
+New **📡 Monitoring** tab in the Lyra GUI — agent monitoring and management without touching the log or config tab.
+
+**Worker Registry:**
+- Add workers with Name, IP, Port, Role (Junior/Senior)
+- `🔍 Check` — instant health check against `/health`
+- `➕ Add & Save` — persists to `workers.json`, regenerates SOUL.md immediately
+- `🗑 Remove selected` — removes and persists
+- Listbox click prefills all fields for editing
+- On startup: loads `workers.json` automatically, prefills Target field with first worker
+
+**Task Sender:**
+- Target IP:port, task type dropdown (`web_search`, `batch_exec`, `summarize`, `validate`)
+- Sends directly to `WorkerTaskServer` on the worker machine
+- task_id auto-prefilled into Result Viewer after send
+
+**Result Viewer:**
+- `📥 Fetch Result` — GET `/result/<task_id>` from worker
+- `📋 All Results` — GET `/results` (last 100)
+- All output in formatted JSON text box
+
+**Auto-poll:**
+- Configurable interval (default 30s), Start/Stop toggle
+- Updates listbox with ✅/❌ per worker
+
+### 🗂 Worker Registry — `workers.json`
+
+Persistent worker registry at `~/.openclaw/workers.json`:
+```json
+[{"ip": "192.168.2.102", "port": 18790, "name": "Junior-PC", "role": "Junior"}]
+```
+Every `Add & Save` and `Remove` writes `workers.json` and immediately regenerates SOUL.md so LYRA sees current workers in the same session.
+
+### 🧠 SOUL.md — Dynamic Worker Registry Section
+
+`## Worker Registry` section dynamically generated from `workers.json` on every SOUL.md write. LYRA gets the exact PowerShell commands to reach each worker directly:
+
+```powershell
+# Schritt 1 — Task senden
+$body = '{"type":"web_search","payload":{"query":"DEINE SUCHANFRAGE"}}'
+$r = Invoke-RestMethod -Method POST -Uri "http://192.168.2.102:18790/tasks" -Body $body -ContentType "application/json"
+$task_id = $r.task_id
+
+# Schritt 2 — Polling max 120s
+$result = $null
+for ($i=0; $i -lt 60; $i++) {
+    Start-Sleep 2
+    try { $result = Invoke-RestMethod "http://192.168.2.102:18790/result/$task_id"; break } catch { }
+}
+
+# Schritt 3 — Summary
+$result.result.summary
+```
+
+### 🔧 WorkerTaskServer — Full Result Roundtrip
+
+`WorkerTaskServer` now stores results locally — enabling direct result retrieval from outside:
+
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | `/result/<task_id>` | Store result for a completed task |
+| GET | `/result/<task_id>` | Retrieve result — `{"status": "success", "result": {...}}` |
+| GET | `/results` | All stored results (max 100) |
+
+`LyraWorkerClient` and `QueuedWorkerClient` write results to `WorkerTaskServer._results` locally **before** attempting to POST to HEAD — result is always retrievable via `GET /result/<id>` even if HEAD is unreachable.
+
+### ⚡ Task Server Auto-Start on Lyra
+
+`LyraHeadServer` (task server) now starts automatically on Lyra — no manual click required:
+- **App launch** (1s after start) — if `machine_role.json` shows Lyra role
+- **Every Gateway restart** (2s after gateway.cmd started) — idempotent, silent if already running
+- Manual `▶ (Re)start Task Server` button remains as fallback
+
+### 🖥 Hardware-Aware Configuration (completed)
+
+`HardwareProfile.detect()` now fully drives config values (previously only logged):
+- `timeoutSeconds` in `openclaw.json` comes from `recommended_timeout`
+- Pull entry in GUI prefilled with `recommended_model` after hardware detection
+- `primary_model` in Step 14 falls back to `recommended_model` if no model pulled
+
+### 🔒 Security Hardening (DECISION #16–19, v1.0.3 carry-forward documented)
+
+| Decision | What | Why |
+|---|---|---|
+| #16 | `gateway.token` → `uuid4().hex` (32 chars) | Passes `token_too_short` audit |
+| #17 | `elevated.allowFrom.webchat` → `["127.0.0.1", "::1"]` | No wildcard on loopback |
+| #18 | `icacls` hardening on config files | Owner+SYSTEM only |
+| #19 | `dangerouslyDisableDeviceAuth=true` — intentional | Loopback-only, no pairing friction |
 
 ---
 
@@ -135,9 +234,13 @@ Version history ballast removed. All critical knowledge preserved as `⚠️ DEC
 - ✅ Error escalation: same error twice → read docs → correct → then execute
 
 ### Worker Communication
-- ✅ Task server auto-starts 1.5s after app launch (no manual start needed)
+- ✅ Task server auto-starts on **Lyra** at app launch + after every Gateway restart (v1.0.4)
+- ✅ Task server auto-starts 1.5s after app launch on **Worker** (no manual start needed)
 - ✅ Dummy task routes directly to Worker-IP:18790/tasks
-- ✅ Bidirectional: worker POSTs result back to HEAD's `/result` endpoint
+- ✅ Bidirectional: result stored locally in `WorkerTaskServer._results` (v1.0.4) + POST to HEAD
+- ✅ `GET /result/<task_id>` on Worker — LYRA can fetch results directly (v1.0.4)
+- ✅ `workers.json` persistent registry — survives restarts (v1.0.4)
+- ✅ SOUL.md Worker Registry section — LYRA knows IPs + exact PowerShell commands (v1.0.4)
 - ✅ `delegate_to_worker.js` re-registered post-Gateway (Gateway overwrites skills.json on startup)
 
 ### Not set / intentionally absent
@@ -301,10 +404,11 @@ $j | ConvertTo-Json -Depth 20 | Set-Content "$HOME\.openclaw\openclaw.json" -Enc
 ## File Paths
 
 ```
-~\.openclaw\openclaw.json                           Main config (timeoutSeconds: 3600, no runTimeoutSeconds!)
+~\.openclaw\openclaw.json                           Main config (timeoutSeconds: from HardwareProfile!)
 ~\.openclaw\gateway.cmd                             Gateway starter (TZ + API keys patched)
 ~\.openclaw\machine_role.json                       Role + head IP + SearXNG URL
-~\.openclaw\workspace\SOUL.md                       LYRA behavior rules
+~\.openclaw\workers.json                            Worker registry (Monitoring Tab) — v1.0.4
+~\.openclaw\workspace\SOUL.md                       LYRA behavior rules (incl. Worker Registry)
 ~\.openclaw\workspace\FORCE-DELEGATE.md             Backup delegation constraint
 ~\.openclaw\workspace\memory\YYYY-MM-DD.md          LYRA's persistent self-learning
 ~\.openclaw\workspace\memory\heartbeat-state.json   Heartbeat tracking state

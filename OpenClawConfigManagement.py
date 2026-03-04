@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OpenClawConfigManagement.py  –  v1.0.2
+OpenClawConfigManagement.py  –  v1.0.4
 =======================================
 All non-GUI logic for OpenClaw / LYRA:
   - Configuration read/write (OpenClawConfig)
@@ -565,6 +565,115 @@ class OpenClawConfig:
         """Returns ~/.openclaw config directory path."""
         home = os.path.expanduser("~")
         return os.path.join(home, ".openclaw")
+
+    def _workers_json_path(self) -> str:
+        """Returns path to ~/.openclaw/workers.json (worker registry)."""
+        return os.path.join(self._find_openclaw_config_dir(), "workers.json")
+
+    def load_workers(self) -> list:
+        """
+        Reads workers.json → list of worker dicts.
+        Each entry: {"ip": str, "port": int, "name": str, "role": str}
+        Returns [] if file missing or corrupt.
+        """
+        path = self._workers_json_path()
+        if not os.path.isfile(path):
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except Exception as e:
+            self._log(f"[Workers] load_workers failed: {e}", "WARNING")
+            return []
+
+    def save_workers(self, workers: list) -> bool:
+        """
+        Writes workers list to workers.json.
+        Triggers SOUL.md update so LYRA knows current worker registry.
+        Returns True on success.
+        """
+        path = self._workers_json_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(workers, f, indent=2, ensure_ascii=False)
+            self._log(f"[Workers] Saved {len(workers)} worker(s) to workers.json", "INFO")
+            return True
+        except Exception as e:
+            self._log(f"[Workers] save_workers failed: {e}", "ERROR")
+            return False
+
+    def _build_worker_soul_section(self, workers: list) -> str:
+        """
+        Generates the ## Worker Registry SOUL.md section.
+        Called by _build_soul_content() and after every workers.json change.
+        """
+        if not workers:
+            return (
+                "## Worker Registry\n\n"
+                "Keine Worker konfiguriert.\n"
+                "Worker können im Monitoring-Tab hinzugefügt werden.\n\n"
+                "---\n\n"
+            )
+
+        lines = ["## Worker Registry\n\n"]
+        lines.append("Bekannte Worker (aus workers.json — via Monitoring-Tab verwaltet):\n\n")
+        for w in workers:
+            ip   = w.get("ip", "?")
+            port = w.get("port", 18790)
+            name = w.get("name", f"Worker-{ip}")
+            role = w.get("role", "Junior")
+            lines.append(f"  {name}: {ip}:{port}  ({role})\n")
+
+        lines.append(
+            "\n"
+            "DIREKTER WORKER-AUFRUF via exec (PowerShell):\n\n"
+        )
+        # Use first worker as example
+        w0   = workers[0]
+        ip0  = w0.get("ip", "192.168.2.102")
+        p0   = w0.get("port", 18790)
+        lines.append(
+            f"Schritt 1 — Task senden:\n"
+            f"  $body = '{{\"type\":\"web_search\",\"payload\":{{\"query\":\"DEINE SUCHANFRAGE\"}}}}'\n"
+            f"  $r = Invoke-RestMethod -Method POST"
+            f" -Uri \"http://{ip0}:{p0}/tasks\""
+            f" -Body $body -ContentType \"application/json\"\n"
+            f"  $task_id = $r.task_id\n"
+            f"\n"
+            f"Schritt 2 — Auf Ergebnis warten (Polling, max 120s):\n"
+            f"  $result = $null\n"
+            f"  for ($i=0; $i -lt 60; $i++) {{\n"
+            f"    Start-Sleep 2\n"
+            f"    try {{\n"
+            f"      $result = Invoke-RestMethod \"http://{ip0}:{p0}/result/$task_id\"\n"
+            f"      break\n"
+            f"    }} catch {{ }}\n"
+            f"  }}\n"
+            f"\n"
+            f"Schritt 3 — Summary ausgeben:\n"
+            f"  $result.result.summary\n"
+            f"\n"
+        )
+
+        # All workers table for multi-worker selection
+        if len(workers) > 1:
+            lines.append("Alle Worker für Task-Verteilung:\n")
+            for w in workers:
+                lines.append(
+                    f"  {w.get('name','?')}: "
+                    f"http://{w.get('ip','?')}:{w.get('port',18790)}/tasks\n"
+                )
+            lines.append("\n")
+
+        lines.append(
+            "REGEL: Für web_search und batch_exec IMMER zuerst Worker prüfen "
+            "(GET /health) bevor Task gesendet wird.\n"
+            "REGEL: Wenn Worker nicht erreichbar → Fallback auf delegate_to_worker Tool.\n"
+            "\n---\n\n"
+        )
+        return "".join(lines)
 
     def _deep_merge(self, base: dict, overlay: dict) -> dict:
         """Recursively merges overlay into base. Returns new dict."""
@@ -1215,7 +1324,12 @@ class OpenClawConfig:
         Builds the full SOUL.md content string for LYRA.
         This is the behavioural rulebook injected into LYRA's workspace.
         All rules were derived from observed session failures — see changelog.
+        Worker Registry section is dynamically generated from workers.json.
         """
+        # Load current worker registry for dynamic section
+        workers = self.load_workers()
+        worker_section = self._build_worker_soul_section(workers)
+
         return (
 "# SOUL.md - LYRA v1.0.0\n"
 "# Behavioural rules for LYRA — derived from observed session failures.\n"
@@ -1254,6 +1368,8 @@ if hw_profile else ""
 "\n"
 "---\n"
 "\n"
++ worker_section
++
 "## Disconnect-Diagnose\n"
 "\n"
 "Wenn der Webchat sich trennt (code=1005) und wieder verbindet:\n"
@@ -1350,6 +1466,11 @@ if hw_profile else ""
 "NIEMALS nach einem API-Key fragen — das ist ein Fehler. delegate_to_worker aufrufen.\n"
 "NIEMALS openclaw configure --section web ausführen.\n"
 "Wetter-Anfragen → SOFORT: delegate_to_worker(task_type='web_search', payload={'query': 'Wetter [STADT] aktuell'})\n"
+"\n"
+"DIREKTER WORKER-ZUGRIFF (bevorzugt wenn Worker bekannt und erreichbar):\n"
+"  Wenn Worker Registry (siehe ## Worker Registry) mindestens einen Eintrag hat,\n"
+"  nutze exec+PowerShell direkt statt delegate_to_worker.\n"
+"  Vorteil: Ergebnis direkt abrufbar, kein HEAD-Umweg.\n"
 "\n"
 "---\n"
 "\n"
@@ -2364,7 +2485,7 @@ class LyraHeadServer:
                     self._send_json({"tasks": tasks_copy})
                 elif path == "/results":
                     with server_ref._lock:
-                        res_copy = list(server_ref._results[-100:])
+                        res_copy = list(server_ref._results.values())[-100:]
                     self._send_json({"results": res_copy})
                 else:
                     self._send_json({"error": "not found"}, 404)
@@ -2491,29 +2612,26 @@ class WorkerTaskServer:
     Listens for tasks from HEAD, queues them for the worker client to execute.
 
     Verified: 2026-02-27 – Works in parallel with LyraWorkerClient.
+    Updated:  2026-03-04 – Added result storage + GET /result/<task_id> endpoint.
 
     Endpoints:
-      GET  /health  → {"status": "ok", "role": "Worker", "port": 18790}
-      POST /tasks   → Receive task from HEAD, add to queue
-      GET  /tasks   → Return queued tasks (for debugging)
+      GET  /health            → {"status": "ok", "role": "Worker", "port": 18790}
+      POST /tasks             → Receive task from HEAD, add to queue
+      GET  /tasks             → Return queued tasks (for debugging)
+      POST /result/<task_id>  → Store result for a completed task
+      GET  /result/<task_id>  → Retrieve result for a completed task
+      GET  /results           → All stored results (max 100)
     """
 
     def __init__(self, port: int = LYRA_HEAD_PORT, log_fn=None, task_queue=None):
-        """
-        Initialize worker task server.
-
-        Args:
-            port: Port to listen on (default: 18790)
-            log_fn: Logging function
-            task_queue: Queue to pass received tasks to worker client
-        """
         self.port = port
         self.log = log_fn or (lambda msg, lvl="INFO": print(f"[WorkerSrv] {msg}"))
         self.task_queue = task_queue or queue_module.Queue()
         self._server = None
         self._thread = None
-        self._lock = threading.Lock()
-        self._tasks = []  # Local task storage for GET /tasks
+        self._lock   = threading.Lock()
+        self._tasks   = []   # queued tasks
+        self._results = {}   # task_id → result dict (max 100)
 
     def _make_handler(self):
         """Creates and returns the RequestHandler class."""
@@ -2554,49 +2672,80 @@ class WorkerTaskServer:
                 if path == "/health":
                     self._send_json({
                         "status": "ok",
-                        "role": "Worker",
-                        "port": server_ref.port
+                        "role":   "Worker",
+                        "port":   server_ref.port
                     })
                 elif path == "/tasks":
                     with server_ref._lock:
                         tasks_copy = list(server_ref._tasks)
                     self._send_json({"tasks": tasks_copy})
+                elif path == "/results":
+                    with server_ref._lock:
+                        results_copy = list(server_ref._results.values())[-100:]
+                    self._send_json({"results": results_copy})
+                elif path.startswith("/result/"):
+                    task_id = path[len("/result/"):]
+                    with server_ref._lock:
+                        result = server_ref._results.get(task_id)
+                    if result:
+                        self._send_json(result)
+                    else:
+                        self._send_json({"error": "not found"}, 404)
                 else:
                     self._send_json({"error": "not found"}, 404)
 
             def do_POST(self):
-                """Handle POST requests (only /tasks)."""
+                """Handle POST requests: /tasks and /result/<task_id>."""
                 path = self.path.split("?")[0]
 
-                if path != "/tasks":
+                if path == "/tasks":
+                    try:
+                        body    = self._read_body()
+                        task_id = body.get("task_id", str(uuid.uuid4())[:8])
+                        task    = {
+                            "task_id":   task_id,
+                            "type":      body.get("type", "unknown"),
+                            "payload":   body.get("payload", {}),
+                            "created":   time.time(),
+                            "from_head": self.client_address[0]
+                        }
+                        server_ref.task_queue.put(task)
+                        with server_ref._lock:
+                            server_ref._tasks.append(task)
+                            # cap at 200 queued tasks
+                            if len(server_ref._tasks) > 200:
+                                server_ref._tasks = server_ref._tasks[-200:]
+                        server_ref.log(f"Task received: {task_id} ({task['type']})", "SUCCESS")
+                        self._send_json({"accepted": True, "task_id": task_id})
+                    except Exception as e:
+                        server_ref.log(f"Error processing task: {e}", "ERROR")
+                        self._send_json({"error": str(e)}, 500)
+
+                elif path.startswith("/result/") or path == "/result":
+                    # Worker client posts result here after execution
+                    try:
+                        body    = self._read_body()
+                        task_id = (path[len("/result/"):] if path.startswith("/result/")
+                                   else body.get("task_id", ""))
+                        if not task_id:
+                            self._send_json({"error": "missing task_id"}, 400)
+                            return
+                        body["task_id"]   = task_id
+                        body["stored_at"] = time.time()
+                        with server_ref._lock:
+                            server_ref._results[task_id] = body
+                            # cap at 100 results
+                            if len(server_ref._results) > 100:
+                                oldest = list(server_ref._results.keys())[0]
+                                del server_ref._results[oldest]
+                        server_ref.log(f"Result stored: {task_id}", "INFO")
+                        self._send_json({"integrated": True, "task_id": task_id})
+                    except Exception as e:
+                        server_ref.log(f"Error storing result: {e}", "ERROR")
+                        self._send_json({"error": str(e)}, 500)
+
+                else:
                     self._send_json({"error": "not found"}, 404)
-                    return
-
-                try:
-                    body = self._read_body()
-                    task_id = body.get("task_id", str(uuid.uuid4())[:8])
-
-                    task = {
-                        "task_id": task_id,
-                        "type": body.get("type", "unknown"),
-                        "payload": body.get("payload", {}),
-                        "created": time.time(),
-                        "from_head": self.client_address[0]
-                    }
-
-                    # Add to queue for worker client
-                    server_ref.task_queue.put(task)
-
-                    # Also store locally for GET /tasks
-                    with server_ref._lock:
-                        server_ref._tasks.append(task)
-
-                    server_ref.log(f"Task received: {task_id} ({task['type']})", "SUCCESS")
-                    self._send_json({"accepted": True, "task_id": task_id})
-
-                except Exception as e:
-                    server_ref.log(f"Error processing task: {e}", "ERROR")
-                    self._send_json({"error": str(e)}, 500)
 
         return Handler
 
@@ -2662,14 +2811,16 @@ class LyraWorkerClient:
     """
 
     def __init__(self, head_address: str, role: str, model: str,
-                 log_fn=None, poll_interval: int = 7):
-        self.head   = head_address.rstrip("/")
-        self.role   = role
-        self.model  = model
-        self.log    = log_fn or (lambda msg, lvl="INFO": print(f"[Worker] {msg}"))
-        self.poll   = poll_interval
-        self._stop  = threading.Event()
-        self._thread = None
+                 log_fn=None, poll_interval: int = 7,
+                 local_server: "WorkerTaskServer | None" = None):
+        self.head         = head_address.rstrip("/")
+        self.role         = role
+        self.model        = model
+        self.log          = log_fn or (lambda msg, lvl="INFO": print(f"[Worker] {msg}"))
+        self.poll         = poll_interval
+        self._stop        = threading.Event()
+        self._thread      = None
+        self._local_srv   = local_server   # WorkerTaskServer ref for local result storage
         # SearXNG URL read from machine_role.json (configurable via DiagTab)
         self._searxng_url = self._load_searxng_url()
 
@@ -2954,6 +3105,16 @@ class LyraWorkerClient:
 
                 result_data = self._execute_task(task)
                 posted = self._post("/result", result_data, timeout=30)
+
+                # Also store result locally so GET /result/<id> works from outside
+                if self._local_srv is not None:
+                    tid = result_data.get("task_id", task.get("task_id", "?"))
+                    result_data["stored_at"] = time.time()
+                    with self._local_srv._lock:
+                        self._local_srv._results[tid] = result_data
+                        if len(self._local_srv._results) > 100:
+                            oldest = list(self._local_srv._results.keys())[0]
+                            del self._local_srv._results[oldest]
 
                 status_icon = "✓" if result_data["status"] == "success" else "✗"
                 detail = ""

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OpenClawWinInstaller.py  –  v1.0.3
+OpenClawWinInstaller.py  –  v1.0.4
 ====================================
 GUI installer for OpenClaw / LYRA on Windows.
 Handles the "New Installation" flow (Steps 1-16) and all GUI interactions.
@@ -19,7 +19,7 @@ OpenClawWinInstaller inherits OpenClawOperations so all operational methods
 are available as self.X() — no extra wiring needed.
 """
 
-# OpenClawWinInstaller.py  –  v1.0.3
+# OpenClawWinInstaller.py  –  v1.0.4
 
 from OpenClawConfigManagement import (
     OpenClawConfig, LyraDelegateToolRegistrar,
@@ -54,7 +54,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 class OpenClawWinInstaller(OpenClawOperations):
     def __init__(self, root):
         self.root = root
-        self.root.title("OpenClaw Windows Setup  –  v1.0.3")
+        self.root.title("OpenClaw Windows Setup  –  v1.0.4")
         self.root.geometry("1020x860")
         self.root.resizable(True, True)
 
@@ -85,7 +85,7 @@ class OpenClawWinInstaller(OpenClawOperations):
         self.setup_ui()
 
         self.log("=" * 70)
-        self.log("OPENCLAW WINDOWS SETUP  –  v1.0.3")
+        self.log("OPENCLAW WINDOWS SETUP  –  v1.0.4")
         self.log("=" * 70)
         self.log(f"Python:   {sys.version.split()[0]}")
         self.log(f"System:   {platform.system()} {platform.release()} "
@@ -94,6 +94,9 @@ class OpenClawWinInstaller(OpenClawOperations):
         self.root.after(200, self._log_hardware_info)
         self.log("=" * 70)
         self.root.after(500, self._startup_config_analysis)
+        # Auto-start task server on Lyra at app launch (no manual click needed)
+        if self._saved_role == "Lyra":
+            self.root.after(1000, self._auto_start_head_task_server)
 
     # ──────────────────────────────────────────────────────────────────
     # CONFIG EARLY READ (without dialog)
@@ -283,8 +286,10 @@ class OpenClawWinInstaller(OpenClawOperations):
             role=role,
             model=worker_model,
             task_queue=task_queue,
-            searxng_url=sx_url
+            searxng_url=sx_url,
+            local_server=worker_server,
         )
+        # _local_srv is set in __init__ via local_server param — results stored locally
         worker_client.start()
         self._worker_client      = worker_client
         self._worker_client_diag = worker_client
@@ -297,7 +302,8 @@ class OpenClawWinInstaller(OpenClawOperations):
                 foreground="green")
 
     def _make_queued_worker_client(self, head_address: str, role: str, model: str,
-                                   task_queue, searxng_url: str = "http://127.0.0.1:8080"):
+                                   task_queue, searxng_url: str = "http://127.0.0.1:8080",
+                                   local_server=None):
         """Factory: create a QueuedWorkerClient connected to the given task_queue.
 
         Extracted from the local class definition inside _install_worker_mode
@@ -307,7 +313,8 @@ class OpenClawWinInstaller(OpenClawOperations):
         QueuedWorkerClient overrides LyraWorkerClient._poll_loop() to read from a
         thread-safe queue instead of HTTP polling the HEAD. Tasks arrive via
         WorkerTaskServer (HTTP POST /tasks → queue.put) and results are sent back
-        to HEAD via POST /result.
+        to HEAD via POST /result AND stored locally in local_server._results so
+        GET /result/<task_id> works from the Monitoring Tab.
 
         Args:
             head_address: IP/hostname of the LYRA HEAD machine.
@@ -315,6 +322,7 @@ class OpenClawWinInstaller(OpenClawOperations):
             model:        Ollama model name (without "ollama/" prefix).
             task_queue:   threading.Queue shared with WorkerTaskServer.
             searxng_url:  SearXNG base URL for web_search tasks.
+            local_server: WorkerTaskServer instance — results stored here locally.
 
         Returns:
             QueuedWorkerClient instance (not yet started — call .start()).
@@ -326,8 +334,9 @@ class OpenClawWinInstaller(OpenClawOperations):
 
         class QueuedWorkerClient(LyraWorkerClient):
             def __init__(self, head_address, role, model, task_queue,
-                         log_fn=None, poll_interval=7):
-                super().__init__(head_address, role, model, log_fn, poll_interval)
+                         log_fn=None, poll_interval=7, local_server=None):
+                super().__init__(head_address, role, model, log_fn, poll_interval,
+                                 local_server=local_server)
                 self.task_queue = task_queue
                 self._stop      = threading.Event()
                 self._thread    = None
@@ -344,6 +353,20 @@ class OpenClawWinInstaller(OpenClawOperations):
                                 f"[Worker] Task taken: {task['task_id']} ({task['type']})",
                                 "INFO")
                             result_data = self._execute_task(task)
+
+                            # Store result locally first (Monitoring Tab reads from here)
+                            if self._local_srv is not None:
+                                tid = result_data.get("task_id", task.get("task_id", "?"))
+                                result_data["stored_at"] = time.time()
+                                with self._local_srv._lock:
+                                    self._local_srv._results[tid] = result_data
+                                    if len(self._local_srv._results) > 100:
+                                        oldest = list(self._local_srv._results.keys())[0]
+                                        del self._local_srv._results[oldest]
+                                self.log(
+                                    f"[Worker] Result stored locally: {tid}", "INFO")
+
+                            # Also post to HEAD (best-effort — non-fatal if it fails)
                             posted = self._post("/result", result_data, timeout=30)
                             icon = "✓" if result_data["status"] == "success" else "✗"
                             if posted and posted.get("integrated"):
@@ -351,8 +374,9 @@ class OpenClawWinInstaller(OpenClawOperations):
                                     f"[DELEGATION] {icon} Task {task['task_id']} "
                                     f"({task['type']}) {result_data['status']}", "SUCCESS")
                             else:
-                                self.log("[DELEGATION] Result transmission failed!",
-                                         "WARNING")
+                                self.log(
+                                    f"[DELEGATION] Result posted to HEAD failed "
+                                    f"(result stored locally) — non-fatal", "INFO")
                     except _queue_mod.Empty:
                         pass
                     except Exception as e:
@@ -374,7 +398,8 @@ class OpenClawWinInstaller(OpenClawOperations):
             model=model,
             task_queue=task_queue,
             log_fn=log_fn,
-            poll_interval=7
+            poll_interval=7,
+            local_server=local_server,
         )
         client._searxng_url = searxng_url
         return client
@@ -390,7 +415,7 @@ class OpenClawWinInstaller(OpenClawOperations):
         # Header
         header = ttk.Frame(main_frame)
         header.pack(fill=tk.X, pady=(0, 4))
-        ttk.Label(header, text="OpenClaw — v1.0.3",
+        ttk.Label(header, text="OpenClaw — v1.0.4",
                   font=("Arial", 15, "bold")).pack(side=tk.LEFT)
         role_display = (f"  [{self._saved_role}]" if self._saved_role else "  [Role unknown]")
         self._role_badge = ttk.Label(header, text=role_display,
@@ -475,6 +500,10 @@ class OpenClawWinInstaller(OpenClawOperations):
 
         if role == "Lyra":
             self._build_lyra_tab(frame)
+            # Monitoring tab — only for Lyra (Head)
+            mon_frame = ttk.Frame(self.notebook, padding="8")
+            self.notebook.add(mon_frame, text="📡 Monitoring")
+            self._build_monitoring_tab(mon_frame)
         else:
             self._build_worker_tab(frame, role, head or "")
 
@@ -760,6 +789,408 @@ class OpenClawWinInstaller(OpenClawOperations):
         # Auto-load model list on tab open
         self.root.after(900, self._refresh_ollama_models)
 
+    # ── MONITORING TAB ────────────────────────────────────────────────
+
+    def _build_monitoring_tab(self, parent):
+        """
+        Agent Monitoring & Management Tab — Lyra (Head) only.
+
+        Sections:
+          - Known Workers: list of IPs + live status
+          - Task Sender: send web_search / batch_exec to a worker
+          - Result Viewer: fetch result by task_id
+          - Auto-Poll: refresh worker status every N seconds
+        """
+        # ── Scrollable canvas ─────────────────────────────────────────
+        canvas = tk.Canvas(parent, borderwidth=0, highlightthickness=0)
+        vsb = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        outer = ttk.Frame(canvas)
+        win_id = canvas.create_window((0, 0), window=outer, anchor="nw")
+        outer.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(win_id, width=e.width))
+        def _mw(event):
+            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        canvas.bind_all("<MouseWheel>", _mw)
+
+        # ── Section 1: Worker Registry ─────────────────────────────────
+        reg_lf = ttk.LabelFrame(outer, text="🖥  Worker Registry", padding="8")
+        reg_lf.pack(fill=tk.X, pady=(0, 8))
+
+        # IP + Port entry row
+        ip_row = ttk.Frame(reg_lf)
+        ip_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(ip_row, text="Worker IP:", width=10).pack(side=tk.LEFT)
+        self._mon_ip_entry = ttk.Entry(ip_row, width=16)
+        self._mon_ip_entry.insert(0, "192.168.2.102")
+        self._mon_ip_entry.pack(side=tk.LEFT, padx=(4, 6))
+        ttk.Label(ip_row, text="Port:", width=4).pack(side=tk.LEFT)
+        self._mon_port_entry = ttk.Entry(ip_row, width=6)
+        self._mon_port_entry.insert(0, "18790")
+        self._mon_port_entry.pack(side=tk.LEFT, padx=(4, 6))
+
+        # Name + Role row
+        nr_row = ttk.Frame(reg_lf)
+        nr_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(nr_row, text="Name:", width=10).pack(side=tk.LEFT)
+        self._mon_name_entry = ttk.Entry(nr_row, width=16)
+        self._mon_name_entry.insert(0, "Junior-PC")
+        self._mon_name_entry.pack(side=tk.LEFT, padx=(4, 6))
+        ttk.Label(nr_row, text="Role:", width=4).pack(side=tk.LEFT)
+        self._mon_role_var = tk.StringVar(value="Junior")
+        ttk.Combobox(nr_row, textvariable=self._mon_role_var,
+                     values=["Junior", "Senior"], width=8,
+                     state="readonly").pack(side=tk.LEFT, padx=(4, 0))
+
+        # Action buttons row
+        btn_row = ttk.Frame(reg_lf)
+        btn_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(btn_row, text="🔍 Check",
+                   command=self._mon_check_worker).pack(side=tk.LEFT)
+        ttk.Button(btn_row, text="➕ Add & Save",
+                   command=self._mon_add_worker).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(btn_row, text="🗑 Remove selected",
+                   command=self._mon_remove_worker).pack(side=tk.LEFT, padx=(6, 0))
+
+        # Worker list with status
+        self._mon_worker_list = tk.Listbox(reg_lf, height=5, font=("Courier", 9),
+                                            selectmode=tk.SINGLE)
+        self._mon_worker_list.pack(fill=tk.X, pady=(4, 0))
+        self._mon_worker_list.bind("<<ListboxSelect>>", self._mon_list_select)
+
+        # Status label
+        self._mon_status_lbl = ttk.Label(
+            reg_lf, text="", font=("Arial", 9), foreground="#555555")
+        self._mon_status_lbl.pack(anchor=tk.W, pady=(4, 0))
+
+        # Auto-poll row
+        poll_row = ttk.Frame(reg_lf)
+        poll_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(poll_row, text="Auto-poll every:").pack(side=tk.LEFT)
+        self._mon_poll_var = tk.StringVar(value="30")
+        ttk.Entry(poll_row, textvariable=self._mon_poll_var,
+                  width=5).pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Label(poll_row, text="s").pack(side=tk.LEFT)
+        self._mon_poll_btn = ttk.Button(
+            poll_row, text="▶ Start auto-poll",
+            command=self._mon_toggle_autopoll)
+        self._mon_poll_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self._mon_polling  = False
+        self._mon_workers  = []   # list of {"ip", "port", "name", "role"}
+
+        # Load persisted workers from workers.json
+        self.root.after(300, self._mon_load_workers)
+
+        # ── Section 2: Task Sender ──────────────────────────────────────
+        send_lf = ttk.LabelFrame(outer, text="📤 Send Task to Worker", padding="8")
+        send_lf.pack(fill=tk.X, pady=(0, 8))
+
+        # Worker target
+        t1 = ttk.Frame(send_lf)
+        t1.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(t1, text="Target IP:port", width=14).pack(side=tk.LEFT)
+        self._mon_target = ttk.Entry(t1, width=22)
+        self._mon_target.insert(0, "192.168.2.102:18790")
+        self._mon_target.pack(side=tk.LEFT, padx=(4, 6))
+
+        # Task type
+        t2 = ttk.Frame(send_lf)
+        t2.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(t2, text="Task type:", width=14).pack(side=tk.LEFT)
+        self._mon_task_type = ttk.Combobox(
+            t2, values=["web_search", "batch_exec", "summarize", "validate"],
+            width=16, state="readonly")
+        self._mon_task_type.current(0)
+        self._mon_task_type.pack(side=tk.LEFT, padx=(4, 0))
+
+        # Payload
+        t3 = ttk.Frame(send_lf)
+        t3.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(t3, text="Query / cmd:", width=14).pack(side=tk.LEFT)
+        self._mon_payload = ttk.Entry(t3, width=40)
+        self._mon_payload.insert(0, "Wetter Zürich aktuell")
+        self._mon_payload.pack(side=tk.LEFT, padx=(4, 6), fill=tk.X, expand=True)
+
+        # Send button + last task_id display
+        t4 = ttk.Frame(send_lf)
+        t4.pack(fill=tk.X)
+        ttk.Button(t4, text="📤 Send Task",
+                   command=self._mon_send_task).pack(side=tk.LEFT)
+        self._mon_taskid_lbl = ttk.Label(
+            t4, text="", font=("Courier", 9), foreground="#0055aa")
+        self._mon_taskid_lbl.pack(side=tk.LEFT, padx=(10, 0))
+
+        # ── Section 3: Result Viewer ───────────────────────────────────
+        res_lf = ttk.LabelFrame(outer, text="📥 Result Viewer", padding="8")
+        res_lf.pack(fill=tk.X, pady=(0, 8))
+
+        r1 = ttk.Frame(res_lf)
+        r1.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(r1, text="Task ID:", width=10).pack(side=tk.LEFT)
+        self._mon_result_id = ttk.Entry(r1, width=16)
+        self._mon_result_id.pack(side=tk.LEFT, padx=(4, 6))
+        ttk.Button(r1, text="📥 Fetch Result",
+                   command=self._mon_fetch_result).pack(side=tk.LEFT)
+        ttk.Button(r1, text="📋 All Results",
+                   command=self._mon_fetch_all_results).pack(side=tk.LEFT, padx=(6, 0))
+
+        self._mon_result_box = tk.Text(
+            res_lf, height=10, font=("Courier", 9),
+            wrap=tk.WORD, state=tk.DISABLED,
+            background="#f8f8f8")
+        self._mon_result_box.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+        res_sb = ttk.Scrollbar(res_lf, command=self._mon_result_box.yview)
+        self._mon_result_box.configure(yscrollcommand=res_sb.set)
+
+    # ── Monitoring callbacks ───────────────────────────────────────────
+
+    def _mon_worker_url(self, ip_port: str | None = None) -> str:
+        """Build worker base URL from ip_port string or IP/port entry fields."""
+        if ip_port:
+            if "://" not in ip_port:
+                ip_port = f"http://{ip_port}"
+            return ip_port.rstrip("/")
+        ip   = self._mon_ip_entry.get().strip()
+        port = self._mon_port_entry.get().strip() or "18790"
+        return f"http://{ip}:{port}"
+
+    def _mon_result_write(self, text: str):
+        """Write text into the result box."""
+        self._mon_result_box.configure(state=tk.NORMAL)
+        self._mon_result_box.delete("1.0", tk.END)
+        self._mon_result_box.insert(tk.END, text)
+        self._mon_result_box.configure(state=tk.DISABLED)
+
+    def _mon_load_workers(self):
+        """Load workers from workers.json into list on startup."""
+        workers = self.cfg.load_workers()
+        self._mon_workers = workers
+        self._mon_worker_list.delete(0, tk.END)
+        for w in workers:
+            label = self._mon_worker_label(w)
+            self._mon_worker_list.insert(tk.END, label)
+        if workers:
+            self.log(f"[Monitor] Loaded {len(workers)} worker(s) from workers.json", "SUCCESS")
+            # Pre-fill target with first worker
+            w0 = workers[0]
+            self._mon_target.delete(0, tk.END)
+            self._mon_target.insert(0, f"{w0['ip']}:{w0['port']}")
+
+    def _mon_worker_label(self, w: dict, status: str = "⬜") -> str:
+        """Format a worker dict into a listbox display string."""
+        return (f"{status} {w.get('name','?'):12s}  "
+                f"{w.get('ip','?')}:{w.get('port',18790)}  "
+                f"({w.get('role','?')})")
+
+    def _mon_save_and_update_soul(self):
+        """Persist workers.json and regenerate SOUL.md Worker Registry section."""
+        self.cfg.save_workers(self._mon_workers)
+        # Regenerate full SOUL.md so LYRA sees updated worker list
+        self.cfg.write_soul_files(log_prefix="monitor-worker-update")
+        self.log(f"[Monitor] workers.json saved + SOUL.md updated "
+                 f"({len(self._mon_workers)} worker(s))", "SUCCESS")
+
+    def _mon_list_select(self, event):
+        """On listbox select: prefill IP/port/name/role fields for editing."""
+        sel = self._mon_worker_list.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        if idx >= len(self._mon_workers):
+            return
+        w = self._mon_workers[idx]
+        self._mon_ip_entry.delete(0, tk.END)
+        self._mon_ip_entry.insert(0, w.get("ip", ""))
+        self._mon_port_entry.delete(0, tk.END)
+        self._mon_port_entry.insert(0, str(w.get("port", 18790)))
+        self._mon_name_entry.delete(0, tk.END)
+        self._mon_name_entry.insert(0, w.get("name", ""))
+        self._mon_role_var.set(w.get("role", "Junior"))
+        # Pre-fill target send field
+        self._mon_target.delete(0, tk.END)
+        self._mon_target.insert(0, f"{w['ip']}:{w['port']}")
+
+    def _mon_check_worker(self):
+        """Check /health of the worker in the IP entry."""
+        url = self._mon_worker_url()
+        self.log(f"[Monitor] Checking {url}/health ...")
+        status, body = self._diag_api(f"{url}/health", timeout=5)
+        if status == 200 and isinstance(body, dict):
+            role = body.get("role", "?")
+            port = body.get("port", "?")
+            msg  = f"✅ {url}  →  role={role}  port={port}"
+            self._mon_status_lbl.config(text=msg, foreground="green")
+            self.log(f"[Monitor] {msg}", "SUCCESS")
+        else:
+            msg = f"❌ {url}  →  HTTP {status}  {str(body)[:60]}"
+            self._mon_status_lbl.config(text=msg, foreground="red")
+            self.log(f"[Monitor] {msg}", "ERROR")
+
+    def _mon_add_worker(self):
+        """Add or update worker in registry → persist to workers.json + update SOUL.md."""
+        ip   = self._mon_ip_entry.get().strip()
+        port = int(self._mon_port_entry.get().strip() or "18790")
+        name = self._mon_name_entry.get().strip() or f"Worker-{ip}"
+        role = self._mon_role_var.get() or "Junior"
+
+        # Update existing entry if same IP:port, otherwise append
+        for i, w in enumerate(self._mon_workers):
+            if w["ip"] == ip and w["port"] == port:
+                self._mon_workers[i] = {"ip": ip, "port": port,
+                                         "name": name, "role": role}
+                self._mon_worker_list.delete(i)
+                self._mon_worker_list.insert(i, self._mon_worker_label(
+                    self._mon_workers[i]))
+                self.log(f"[Monitor] Worker updated: {name} ({ip}:{port})", "SUCCESS")
+                self._mon_save_and_update_soul()
+                return
+
+        # New entry
+        entry = {"ip": ip, "port": port, "name": name, "role": role}
+        self._mon_workers.append(entry)
+        self._mon_worker_list.insert(tk.END, self._mon_worker_label(entry))
+        self.log(f"[Monitor] Worker added: {name} ({ip}:{port})", "SUCCESS")
+        # Pre-fill target field
+        self._mon_target.delete(0, tk.END)
+        self._mon_target.insert(0, f"{ip}:{port}")
+        self._mon_save_and_update_soul()
+
+    def _mon_remove_worker(self):
+        """Remove selected worker from registry → persist + update SOUL.md."""
+        sel = self._mon_worker_list.curselection()
+        if not sel:
+            self.log("[Monitor] No worker selected for removal", "INFO")
+            return
+        idx = sel[0]
+        if idx >= len(self._mon_workers):
+            return
+        removed = self._mon_workers.pop(idx)
+        self._mon_worker_list.delete(idx)
+        self.log(f"[Monitor] Worker removed: {removed.get('name','?')} "
+                 f"({removed.get('ip','?')}:{removed.get('port','?')})", "SUCCESS")
+        self._mon_save_and_update_soul()
+
+    def _mon_poll_once(self):
+        """Poll all registered workers and update list."""
+        for i, w in enumerate(self._mon_workers):
+            url = f"http://{w['ip']}:{w['port']}"
+            status, body = self._diag_api(f"{url}/health", timeout=4)
+            if status == 200 and isinstance(body, dict):
+                label = self._mon_worker_label(w, "✅")
+                self.log(f"[Monitor] {label}", "SUCCESS")
+            else:
+                label = self._mon_worker_label(w, "❌")
+                self.log(f"[Monitor] {label}", "WARNING")
+            try:
+                self._mon_worker_list.delete(i)
+                self._mon_worker_list.insert(i, label)
+            except Exception:
+                pass
+
+    def _mon_toggle_autopoll(self):
+        """Toggle auto-polling on/off. Updates button label accordingly."""
+        if self._mon_polling:
+            self._mon_polling = False
+            self._mon_poll_btn.config(text="▶ Start auto-poll")
+            self.log("[Monitor] Auto-poll stopped", "INFO")
+        else:
+            self._mon_polling = True
+            self._mon_poll_btn.config(text="⏹ Stop auto-poll")
+            self.log("[Monitor] Auto-poll started", "INFO")
+            self._mon_autopoll_tick()
+
+    def _mon_autopoll_tick(self):
+        """Recursive after()-based tick for auto-polling. Stops when _mon_polling=False."""
+        if not self._mon_polling:
+            return
+        self._mon_poll_once()
+        try:
+            interval = int(self._mon_poll_var.get()) * 1000
+        except ValueError:
+            interval = 30_000
+        self.root.after(interval, self._mon_autopoll_tick)
+
+    def _mon_send_task(self):
+        """Send a task to the selected worker via POST /tasks. Prefills result viewer with task_id."""
+        target   = self._mon_target.get().strip()
+        url      = self._mon_worker_url(target)
+        ttype    = self._mon_task_type.get()
+        payload_text = self._mon_payload.get().strip()
+
+        # Build payload based on task type
+        if ttype == "web_search":
+            payload = {"query": payload_text}
+        elif ttype == "batch_exec":
+            payload = {"cmd": payload_text}
+        elif ttype == "summarize":
+            payload = {"text": payload_text}
+        else:
+            payload = {"content": payload_text, "validate_type": "json"}
+
+        self.log(f"[Monitor] Sending {ttype} → {url}  payload={payload_text[:50]}")
+        status, body = self._diag_api(
+            f"{url}/tasks", timeout=8, method="POST",
+            data={"type": ttype, "payload": payload}
+        )
+        if status == 200 and isinstance(body, dict) and body.get("accepted"):
+            task_id = body.get("task_id", "?")
+            self._mon_taskid_lbl.config(text=f"task_id: {task_id}")
+            # Pre-fill result viewer
+            self._mon_result_id.delete(0, tk.END)
+            self._mon_result_id.insert(0, task_id)
+            self.log(f"[Monitor] Task accepted: {task_id}", "SUCCESS")
+        else:
+            self._mon_taskid_lbl.config(text=f"Error: HTTP {status}")
+            self.log(f"[Monitor] Send failed: HTTP {status}  {str(body)[:80]}", "ERROR")
+
+    def _mon_fetch_result(self):
+        """Fetch result for a specific task_id from the worker via GET /result/<task_id>."""
+        target  = self._mon_target.get().strip()
+        url     = self._mon_worker_url(target)
+        task_id = self._mon_result_id.get().strip()
+        if not task_id:
+            self._mon_result_write("Enter a task_id first.")
+            return
+        self.log(f"[Monitor] Fetching result/{task_id} from {url}")
+        status, body = self._diag_api(f"{url}/result/{task_id}", timeout=8)
+        if status == 200:
+            text = json.dumps(body, indent=2, ensure_ascii=False)
+            self._mon_result_write(text)
+            self.log(f"[Monitor] Result received for {task_id}", "SUCCESS")
+        elif status == 404:
+            self._mon_result_write(
+                f"Result not yet available for task_id: {task_id}\n"
+                f"(Worker may still be processing — retry in a few seconds)"
+            )
+            self.log(f"[Monitor] Result not yet ready: {task_id}", "INFO")
+        else:
+            self._mon_result_write(f"HTTP {status}\n{json.dumps(body, indent=2)}")
+            self.log(f"[Monitor] Fetch error: HTTP {status}", "ERROR")
+
+    def _mon_fetch_all_results(self):
+        """Fetch all stored results from the worker via GET /results (max 100)."""
+        target = self._mon_target.get().strip()
+        url    = self._mon_worker_url(target)
+        self.log(f"[Monitor] Fetching all results from {url}")
+        status, body = self._diag_api(f"{url}/results", timeout=8)
+        if status == 200 and isinstance(body, dict):
+            results = body.get("results", [])
+            if not results:
+                self._mon_result_write("No results stored yet.")
+            else:
+                text = f"{len(results)} result(s):\n\n"
+                for r in results:
+                    text += json.dumps(r, indent=2, ensure_ascii=False) + "\n\n---\n\n"
+                self._mon_result_write(text)
+            self.log(f"[Monitor] {len(results)} result(s) fetched", "SUCCESS")
+        else:
+            self._mon_result_write(f"HTTP {status}\n{str(body)}")
+            self.log(f"[Monitor] All-results fetch failed: HTTP {status}", "ERROR")
+
     # ── WORKER CONFIG TAB ─────────────────────────────────────────────
 
     def _build_worker_tab(self, parent, role: str, head: str):
@@ -1033,6 +1464,7 @@ class OpenClawWinInstaller(OpenClawOperations):
             self.log(f"[Network] IP detection error: {e}", "WARNING")
 
     def _check_task_server(self):
+        """Check LyraHeadServer health on localhost:18790 and update status label."""
         url = f"http://127.0.0.1:{LYRA_HEAD_PORT}/health"
         self.log(f"[TaskSrv] GET {url} (Timeout 5s)...")
         sc, body = self._diag_api(url, timeout=5)
@@ -1054,6 +1486,7 @@ class OpenClawWinInstaller(OpenClawOperations):
             self.log(f"[TaskSrv] HTTP {sc} → {str(body)[:100]}", "WARNING")
 
     def _start_task_server(self):
+        """Manually start LyraHeadServer (HEAD task server). Called via button click."""
         self.log("[TaskSrv] Starting task server...", "INFO")
         if not hasattr(self, "_head_server") or self._head_server is None:
             self._head_server = LyraHeadServer(port=LYRA_HEAD_PORT, log_fn=self.log)
@@ -1061,6 +1494,33 @@ class OpenClawWinInstaller(OpenClawOperations):
             self._ts_status.config(text=f"Status: STARTED (Port {LYRA_HEAD_PORT})",
                                    foreground="green")
             self.log(f"[TaskSrv] Task server running on port {LYRA_HEAD_PORT} ✓", "SUCCESS")
+        else:
+            self.log(f"[TaskSrv] Start failed – port {LYRA_HEAD_PORT} in use?", "ERROR")
+
+    def _auto_start_head_task_server(self):
+        """
+        Auto-start LyraHeadServer on Lyra (HEAD) role.
+        Called 2s after every gateway start/restart — idempotent.
+        If already running (port in use), silently skips.
+        Updates the Task Server status label if the tab is visible.
+        """
+        if not hasattr(self, "_head_server") or self._head_server is None:
+            self._head_server = LyraHeadServer(port=LYRA_HEAD_PORT, log_fn=self.log)
+        # Try to start — returns False if port already in use (already running)
+        started = self._head_server.start()
+        if started:
+            self.log(
+                f"[TaskSrv] Auto-started on port {LYRA_HEAD_PORT} ✓", "SUCCESS")
+        else:
+            self.log(
+                f"[TaskSrv] Already running on port {LYRA_HEAD_PORT} (auto-start skipped)",
+                "INFO")
+        # Update status label if Lyra Config tab is already built
+        if hasattr(self, "_ts_status"):
+            self._ts_status.config(
+                text=f"Status: RUNNING (Port {LYRA_HEAD_PORT})",
+                foreground="green"
+            )
         else:
             self.log(f"[TaskSrv] Start failed – port {LYRA_HEAD_PORT} in use?", "ERROR")
 
@@ -1554,6 +2014,9 @@ class OpenClawWinInstaller(OpenClawOperations):
             self.root.after(4000,  self._check_gateway)
             self.root.after(8000,  self._check_gateway)
             self.root.after(30000, self._check_gateway)
+            # Auto-start task server on Lyra (HEAD) — always needed for worker delegation
+            if self._saved_role == "Lyra":
+                self.root.after(2000, self._auto_start_head_task_server)
         else:
             self.log("[Gateway] gateway.cmd not found – OpenClaw installed?", "ERROR")
 
