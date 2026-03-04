@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OpenClawWinInstaller.py  –  v1.0.2
+OpenClawWinInstaller.py  –  v1.0.3
 ====================================
 GUI installer for OpenClaw / LYRA on Windows.
 Handles the "New Installation" flow (Steps 1-16) and all GUI interactions.
@@ -19,7 +19,7 @@ OpenClawWinInstaller inherits OpenClawOperations so all operational methods
 are available as self.X() — no extra wiring needed.
 """
 
-# OpenClawWinInstaller.py  –  v1.0.2
+# OpenClawWinInstaller.py  –  v1.0.3
 
 from OpenClawConfigManagement import (
     OpenClawConfig, LyraDelegateToolRegistrar,
@@ -390,7 +390,7 @@ class OpenClawWinInstaller(OpenClawOperations):
         # Header
         header = ttk.Frame(main_frame)
         header.pack(fill=tk.X, pady=(0, 4))
-        ttk.Label(header, text="OpenClaw — v1.0.2",
+        ttk.Label(header, text="OpenClaw — v1.0.3",
                   font=("Arial", 15, "bold")).pack(side=tk.LEFT)
         role_display = (f"  [{self._saved_role}]" if self._saved_role else "  [Role unknown]")
         self._role_badge = ttk.Label(header, text=role_display,
