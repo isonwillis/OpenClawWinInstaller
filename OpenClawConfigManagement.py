@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OpenClawConfigManagement.py  –  v1.0.1
+OpenClawConfigManagement.py  –  v1.0.2
 =======================================
 All non-GUI logic for OpenClaw / LYRA:
   - Configuration read/write (OpenClawConfig)
@@ -74,6 +74,30 @@ ARCHITECTURAL DECISIONS  (read before changing anything)
     schema rejects it → "Unrecognized key: lastChecks" → Gateway cannot start.
     Fix: write_openclaw_config() and _write_llm_to_config() strip known
     rejected keys before writing. No doctor --fix needed. Confirmed 2026-03-03.
+
+11. gateway.auth.password sentinel value in OpenClaw 2026.3.2
+    OpenClaw 2026.3.2 added a required "password" field to the gateway.auth schema.
+    If the field is absent, OpenClaw auto-fills the sentinel "__OPENCLAW_REDACTED__"
+    and then immediately rejects it as invalid real data:
+      GatewayRequestError: Sentinel value "__OPENCLAW_REDACTED__" in key
+      gateway.auth.password is not valid as real data
+    Fix: Always write "password": "" explicitly in gateway.auth when mode is "token".
+    An empty string is the correct value for token-auth mode (no password needed).
+    Also bump oc_version fallback to "2026.3.2". Confirmed 2026-03-04.
+
+12. commands.ownerDisplaySecret sentinel — Web Config Admin Panel corruption
+    OpenClaw 2026.3.x added "ownerDisplaySecret" as a required HMAC secret under
+    "commands" (owner-ID obfuscation, decoupled from gateway token). The Web Config
+    Admin Panel reads openclaw.json, redacts sensitive fields for UI display
+    (__OPENCLAW_REDACTED__), then writes that redacted content back to disk —
+    a destructive read-modify-write cycle (upstream GitHub #13058).
+    When ownerDisplaySecret is absent, OpenClaw fills in the sentinel and rejects it:
+      GatewayRequestError: Sentinel value "__OPENCLAW_REDACTED__" in key
+      commands.ownerDisplaySecret is not valid as real data
+    Fix: write a random hex secret (uuid4 no hyphens) in write_openclaw_config().
+    Adaptive fix in _apply_fixes_and_update() generates a new secret only if absent
+    or sentinel — NEVER overwrites a valid existing secret (invalidates owner-ID history).
+    Confirmed 2026-03-04.
 """
 
 import os
@@ -454,7 +478,7 @@ class OpenClawConfig:
         # ── OpenClaw version for meta block ─────────────────────────────────
         # DECISION #9: meta.lastTouchedVersion must match installed version.
         # We read it from the existing config if present to avoid downgrade.
-        oc_version = "2026.3.1"
+        oc_version = "2026.3.2"
         if os.path.isfile(cfg_path):
             try:
                 with open(cfg_path, "r", encoding="utf-8") as f:
@@ -492,10 +516,16 @@ class OpenClawConfig:
                 },
             },
             "commands": {
-                "native":       "auto",
-                "nativeSkills": "auto",
-                "restart":      True,
-                "ownerDisplay": "raw",
+                "native":           "auto",
+                "nativeSkills":     "auto",
+                "restart":          True,
+                "ownerDisplay":     "raw",
+                # DECISION #12: ownerDisplaySecret required by 2026.3.x for owner-ID
+                # obfuscation via HMAC. Must be a stable random hex string — written
+                # once at install time and never overwritten (changing it invalidates
+                # owner-ID history). Web Config Admin Panel corrupts openclaw.json by
+                # writing __OPENCLAW_REDACTED__ back (upstream bug #13058).
+                "ownerDisplaySecret": uuid.uuid4().hex,
             },
             "hooks": {
                 "internal": {
@@ -511,8 +541,14 @@ class OpenClawConfig:
                 "mode": "local",        # DECISION #9: required by 2026.3.1
                 "bind": "loopback",
                 "auth": {
-                    "mode":  "token",
-                    "token": "lyra-local-token",
+                    "mode":     "token",
+                    "token":    "lyra-local-token",
+                    "password": "",     # DECISION #11: must be explicit empty string.
+                    # OpenClaw 2026.3.2 added this required field. If absent, it
+                    # auto-fills sentinel "__OPENCLAW_REDACTED__" then rejects it:
+                    #   GatewayRequestError: Sentinel value "__OPENCLAW_REDACTED__"
+                    #   in key gateway.auth.password is not valid as real data
+                    # Empty string = correct value for token-auth mode.
                 },
                 "controlUi": {
                     "dangerouslyDisableDeviceAuth": True,
@@ -1193,10 +1229,70 @@ class OpenClawConfig:
 "\n"
 "PowerShell Sofortfix:\n"
 "  $j = Get-Content \"$HOME\\.openclaw\\openclaw.json\" -Raw | ConvertFrom-Json\n"
-"  $j.meta.lastTouchedVersion = \"2026.3.1\"\n"
+"  $j.meta.lastTouchedVersion = \"2026.3.2\"\n"
 "  $j.agents.defaults.timeoutSeconds = 3600\n"
 "  $j | ConvertTo-Json -Depth 20 | Set-Content \"$HOME\\.openclaw\\openclaw.json\" -Encoding UTF8\n"
 "  Dann: Gateway-Neustart ueber den Installer-Button\n"
+"\n"
+"---\n"
+"\n"
+"## OpenClaw 2026.3.2 — GatewayRequestError: Sentinel value __OPENCLAW_REDACTED__\n"
+"\n"
+"Symptom: Gateway startet nicht, Fehlermeldung:\n"
+"  GatewayRequestError: Sentinel value \"__OPENCLAW_REDACTED__\" in key\n"
+"  gateway.auth.password is not valid as real data\n"
+"\n"
+"Ursache: OpenClaw 2026.3.2 hat 'password' als Pflichtfeld im gateway.auth Schema\n"
+"  eingefuehrt. Fehlt das Feld in openclaw.json, fuellt OpenClaw automatisch den\n"
+"  internen Sentinel '__OPENCLAW_REDACTED__' ein und lehnt diesen dann als\n"
+"  ungueltige echte Daten ab. Eigener Bug in 2026.3.2.\n"
+"\n"
+"PowerShell Sofortfix:\n"
+"  $j = Get-Content \"$HOME\\.openclaw\\openclaw.json\" -Raw | ConvertFrom-Json\n"
+"  if (-not $j.gateway.auth.PSObject.Properties['password']) {\n"
+"    $j.gateway.auth | Add-Member -NotePropertyName 'password' -NotePropertyValue '' -Force\n"
+"  } else {\n"
+"    $j.gateway.auth.password = ''\n"
+"  }\n"
+"  $j.meta.lastTouchedVersion = \"2026.3.2\"\n"
+"  $j | ConvertTo-Json -Depth 20 | Set-Content \"$HOME\\.openclaw\\openclaw.json\" -Encoding UTF8\n"
+"  Dann: Gateway-Neustart ueber den Installer-Button\n"
+"\n"
+"Fix im Installer: write_openclaw_config() schreibt nun explizit 'password': ''\n"
+"  in den gateway.auth Block (DECISION #11, v1.0.2).\n"
+"\n"
+"---\n"
+"\n"
+"## OpenClaw 2026.3.x — GatewayRequestError: Sentinel value __OPENCLAW_REDACTED__ in commands.ownerDisplaySecret\n"
+"\n"
+"Symptom: Sobald im Web Config Admin Panel etwas geaendert wird:\n"
+"  GatewayRequestError: Sentinel value \"__OPENCLAW_REDACTED__\" in key\n"
+"  commands.ownerDisplaySecret is not valid as real data\n"
+"\n"
+"Ursache (upstream Bug #13058): Das Web Config Admin Panel liest openclaw.json,\n"
+"  ersetzt sensitive Felder fuer die UI-Anzeige mit '__OPENCLAW_REDACTED__',\n"
+"  und schreibt diesen redaktierten Inhalt zurueck auf die Disk.\n"
+"  Destruktiver read-modify-write Zyklus.\n"
+"  commands.ownerDisplaySecret ist ein HMAC-Secret fuer Owner-ID-Obfuskation\n"
+"  (neu in 2026.3.x, entkoppelt vom Gateway-Token).\n"
+"  Fehlt es, fuellt OpenClaw den Sentinel ein und lehnt ihn sofort ab.\n"
+"\n"
+"PowerShell Sofortfix:\n"
+"  $secret = [System.Guid]::NewGuid().ToString('N')  # 32 hex chars, no hyphens\n"
+"  $j = Get-Content \"$HOME\\.openclaw\\openclaw.json\" -Raw | ConvertFrom-Json\n"
+"  if (-not $j.commands.PSObject.Properties['ownerDisplaySecret'] -or\n"
+"      $j.commands.ownerDisplaySecret -eq '__OPENCLAW_REDACTED__') {\n"
+"    $j.commands | Add-Member -NotePropertyName 'ownerDisplaySecret' -NotePropertyValue $secret -Force\n"
+"  }\n"
+"  $j | ConvertTo-Json -Depth 20 | Set-Content \"$HOME\\.openclaw\\openclaw.json\" -Encoding UTF8\n"
+"  Dann: Gateway-Neustart ueber den Installer-Button\n"
+"\n"
+"WICHTIG: Niemals ein vorhandenes gueltiges ownerDisplaySecret ueberschreiben.\n"
+"  Aendern invalidiert die Owner-ID-Historie.\n"
+"\n"
+"Fix im Installer: write_openclaw_config() generiert uuid4().hex beim Neuinstall.\n"
+"  Adaptiver Fix-Button ('Apply fixes') setzt Secret nur wenn absent oder Sentinel.\n"
+"  (DECISION #12, v1.0.2)\n"
 "\n"
 "---\n"
 "\n"
@@ -1556,6 +1652,47 @@ ASKING FOR API KEY = ERROR. NEVER DO. Call delegate_to_worker.
 
         # ── Browser config ────────────────────────────────────────────────────
         self._apply_browser_config_fn()
+
+        # ── Adaptive config fixes (post-gateway) ─────────────────────────────
+        # Run the same sentinel fixes that _apply_fixes_and_update() does.
+        # Gateway may have written sentinel values during startup; fix them now
+        # before the first session starts. Idempotent — never overwrites valid values.
+        cfg_path = os.path.join(cfg_dir, "openclaw.json")
+        if os.path.isfile(cfg_path):
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg_live = json.load(f)
+                sentinel   = "__OPENCLAW_REDACTED__"
+                fixes_done = []
+
+                # DECISION #11: gateway.auth.password
+                cfg_live.setdefault("gateway", {}).setdefault("auth", {})
+                if cfg_live["gateway"]["auth"].get("password", sentinel) in ("", sentinel, None):
+                    if cfg_live["gateway"]["auth"].get("password", "__NOT_SET__") != "":
+                        cfg_live["gateway"]["auth"]["password"] = ""
+                        fixes_done.append("gateway.auth.password")
+
+                # DECISION #12: commands.ownerDisplaySecret
+                cfg_live.setdefault("commands", {})
+                cur_secret = cfg_live["commands"].get("ownerDisplaySecret", sentinel)
+                if cur_secret in (sentinel, "__NOT_SET__", ""):
+                    cfg_live["commands"]["ownerDisplaySecret"] = uuid.uuid4().hex
+                    fixes_done.append("commands.ownerDisplaySecret")
+
+                if fixes_done:
+                    shutil.copy2(cfg_path, cfg_path + f".bak_{int(time.time())}")
+                    with open(cfg_path, "w", encoding="utf-8", newline="\n") as f:
+                        json.dump(cfg_live, f, indent=2)
+                    self._log(
+                        f"  [Fix] Adaptive sentinel fixes applied: {fixes_done}  ✓",
+                        "SUCCESS"
+                    )
+                else:
+                    self._log(
+                        "  [Fix] openclaw.json sentinel check — all values valid  ✓", "INFO"
+                    )
+            except Exception as e:
+                self._log(f"  [Fix] Adaptive fix failed (non-fatal): {e}", "WARNING")
 
         # ── SOUL.md + skill file (post-gateway) ──────────────────────────────
         # ⚠️  DECISION #5: Register skill AFTER gateway start.
