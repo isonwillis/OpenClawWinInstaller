@@ -137,6 +137,12 @@ class OpenClawWinInstaller(OpenClawOperations):
                     f"{profile['recommended_timeout']}s on next install/config-write",
                     "SUCCESS"
                 )
+            # Update pull entry default with HW-recommended model
+            rec_model = profile.get("recommended_model", "glm-4.7-flash")
+            if hasattr(self, "_pull_entry"):
+                self._pull_entry.delete(0, tk.END)
+                self._pull_entry.insert(0, rec_model)
+                self.log(f"  Pull entry prefilled: {rec_model} (from HW profile)", "INFO")
         except Exception as e:
             self.log(f"  Hardware detection failed (non-fatal): {e}", "WARNING")
             self._hw_profile = None
@@ -3089,7 +3095,13 @@ class OpenClawWinInstaller(OpenClawOperations):
             else:
                 pulled_list, cpu_primary = pulled_models, "qwen2.5:1.5b"
             primary_model = cpu_primary if cpu_primary else (pulled_list[0] if pulled_list else "qwen2.5:1.5b")
-            self.log(f"  Primary model (CPU-optimized): {primary_model}", "SUCCESS")
+            # v1.0.3: if HardwareProfile recommends a different model and nothing
+            # was explicitly pulled, prefer the HW recommendation over the hardcoded fallback.
+            if not cpu_primary and not pulled_list and self._hw_profile:
+                primary_model = self._hw_profile.get("recommended_model", primary_model)
+                self.log(f"  Primary model (from HW profile): {primary_model}", "SUCCESS")
+            else:
+                self.log(f"  Primary model (CPU-optimized): {primary_model}", "SUCCESS")
 
             # Check Ollama state after model pull
             # (Model pull can sometimes destabilize Ollama)
