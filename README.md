@@ -101,7 +101,7 @@ Version history ballast removed. All critical knowledge preserved as `⚠️ DEC
 
 | Machine | CPU | RAM | GPU | Role | Status |
 |---|---|---|---|---|---|
-| **Lyra machine** (192.168.2.107) | i7-8700, AVX2 ✓ | 64 GB | RTX 3050 · 6 GB VRAM + 26 GB shared | **LYRA (head)** | ✅ Production · voytas26/openclaw-oss-20b-deterministic |
+| **Lyra machine** (192.168.2.107) | i7-8700, AVX2 ✓ | 64 GB | RTX 3050 · 6 GB VRAM + 26 GB shared | **LYRA (head)** | ✅ Production · glm-4.7-flash hybrid |
 | **Junior worker machine** (192.168.2.102) | i5-2500, no AVX2 | ~32 GB | — | **Junior** | ✅ Auto-starts · qwen2.5:0.5b |
 
 ---
@@ -284,8 +284,8 @@ $j | ConvertTo-Json -Depth 20 | Set-Content "$HOME\.openclaw\openclaw.json" -Enc
 
 | Machine | Model | Size | Purpose | Notes |
 |---|---|---|---|---|
-| Lyra (head) | voytas26/openclaw-oss-20b-deterministic | 21B / 14 GB | **Primary** | GPU+CPU hybrid · 3600s timeout |
-| Lyra (head) | glm-4.7-flash | 30B / 19 GB | Primary alt | GPU+CPU hybrid |
+| Lyra (head) | glm-4.7-flash | 30B / 19 GB | **Primary** | GPU+CPU hybrid · 3600s timeout |
+| Lyra (head) | voytas26/openclaw-oss-20b-deterministic | 21B / 14 GB | Alt / Test | Slower than glm |
 | Lyra (head) | qwen2.5:14b | 15B / 9 GB | Primary alt | Fits in VRAM+shared easily |
 | Lyra (head) | qwen2.5:7b | 8B / 5 GB | Fast fallback | Fits in 6 GB VRAM alone |
 | Lyra (head) | deepseek-r1:8b | 8B / 5 GB | Reasoning tasks | |
@@ -294,7 +294,7 @@ $j | ConvertTo-Json -Depth 20 | Set-Content "$HOME\.openclaw\openclaw.json" -Enc
 
 > **GPU note:** RTX 3050 has 6 GB dedicated VRAM + 26 GB Windows shared RAM = 32 GB GPU-total.  
 > Ollama automatically distributes model layers: VRAM first (fastest), overflow to shared RAM (GPU-assisted).  
-> qwen2.5:7b (5 GB) fits entirely in VRAM → fastest responses. voytas26/openclaw-oss-20b-deterministic (14 GB) uses GPU+CPU hybrid.
+> qwen2.5:7b (5 GB) fits entirely in VRAM → fastest responses. glm-4.7-flash (19 GB) uses GPU+CPU hybrid.
 
 ---
 

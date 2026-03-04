@@ -1852,6 +1852,37 @@ class OpenClawWinInstaller(OpenClawOperations):
                     label = "absent → generated" if current_secret == "__NOT_SET__" else "sentinel → regenerated"
                     fixes_applied.append(f"commands.ownerDisplaySecret ({label})")
 
+                # DECISION #13: tools.exec.allowlist — schema rejected, strip if present
+                # (may have been written by a previous v1.0.2 installer run)
+                exec_cfg = cfg.get("tools", {}).get("exec", {})
+                if "allowlist" in exec_cfg:
+                    del cfg["tools"]["exec"]["allowlist"]
+                    fixes_applied.append("tools.exec.allowlist (stripped — schema rejected)")
+                if exec_cfg.get("security") == "allowlist":
+                    cfg["tools"]["exec"]["security"] = "full"
+                    fixes_applied.append("tools.exec.security (allowlist → full)")
+
+                # DECISION #14: tools.web.fetch.allowPrivateIPs — schema rejected, strip if present
+                fetch_cfg = cfg.get("tools", {}).get("web", {}).get("fetch", {})
+                if "allowPrivateIPs" in fetch_cfg:
+                    del cfg["tools"]["web"]["fetch"]["allowPrivateIPs"]
+                    fixes_applied.append("tools.web.fetch.allowPrivateIPs (stripped — schema rejected)")
+
+                # DECISION #15: memorySearch — provider="local" + fallback="none"
+                mem = cfg.get("agents", {}).get("defaults", {}).get("memorySearch", {})
+                mem_fixed = False
+                if "remote" in mem:
+                    del cfg["agents"]["defaults"]["memorySearch"]["remote"]
+                    mem_fixed = True
+                if mem.get("provider", "") not in ("local", ""):
+                    cfg["agents"]["defaults"]["memorySearch"]["provider"] = "local"
+                    mem_fixed = True
+                if mem.get("fallback", "") != "none":
+                    cfg["agents"]["defaults"]["memorySearch"]["fallback"] = "none"
+                    mem_fixed = True
+                if mem_fixed:
+                    fixes_applied.append("memorySearch (provider=local, fallback=none, remote removed)")
+
                 # ── Future fixes go here, same pattern ────────────────────────
                 # Example:
                 #   current = cfg.get("some", {}).get("key", "__NOT_SET__")
@@ -1872,6 +1903,10 @@ class OpenClawWinInstaller(OpenClawOperations):
                 self.log(f"[Fix] openclaw.json error: {e}", "ERROR")
         else:
             self.log("[Fix] openclaw.json not found — skipping config fixes", "WARNING")
+
+        # ── File permission hardening (DECISION #18) ───────────────────────────
+        self.log("[Fix] Hardening file permissions (icacls)...")
+        self.cfg.harden_file_permissions()
 
         # ── SOUL.md + BOOTSTRAP.md update ─────────────────────────────────────
         soul_content = self.cfg._build_soul_content()

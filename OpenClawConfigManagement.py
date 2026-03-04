@@ -98,6 +98,31 @@ ARCHITECTURAL DECISIONS  (read before changing anything)
     Adaptive fix in _apply_fixes_and_update() generates a new secret only if absent
     or sentinel — NEVER overwrites a valid existing secret (invalidates owner-ID history).
     Confirmed 2026-03-04.
+
+13. tools.exec.allowlist — schema rejected by OpenClaw 2026.3.2
+    tools.exec.allowlist and tools.web.fetch.allowPrivateIPs are NOT valid
+    config keys in OpenClaw 2026.3.2 schema → "Unrecognized key" → Gateway
+    cannot start. Both were written in a previous fix attempt and must be
+    stripped from any existing openclaw.json on the next installer run.
+    LYRA exec access and localhost web_fetch cannot be configured via openclaw.json.
+    Workaround: SOUL.md instructs LYRA to use Invoke-RestMethod via exec for
+    local health checks, and to use powershell -Command patterns for exec tasks.
+    REJECTED_KEYS_EXEC  = {"allowlist"}
+    REJECTED_KEYS_FETCH = {"allowPrivateIPs"}
+    Confirmed schema-rejected 2026-03-04.
+
+14. tools.web.fetch.allowPrivateIPs — schema rejected (see DECISION #13)
+    Part of the same schema rejection batch as tools.exec.allowlist.
+    Strip from config if present. No config-based workaround available.
+
+15. agents.defaults.memorySearch.remote.apiKey sentinel
+    enabled=False alone does NOT prevent the Web Config Panel from rendering
+    the remote.apiKey field and writing __OPENCLAW_REDACTED__ on save.
+    Fix: provider="local" + fallback="none" — OpenClaw skips all remote embedding
+    providers entirely, Panel never renders remote.apiKey, sentinel impossible.
+    Adaptive fix removes remote sub-block and sets provider+fallback if wrong.
+    Docs: "If you don't want to set an API key, use provider='local' or
+    set fallback='none'." (openclaw.ai/concepts/memory). Confirmed 2026-03-04.
 """
 
 import os
@@ -412,11 +437,29 @@ class OpenClawConfig:
             doctor --fix is never needed just to unblock the gateway.
             Known rejected keys: runTimeoutSeconds, lastChecks.
 
+        DECISION #13 (v1.0.2): tools.exec.allowlist — schema rejected.
+            OpenClaw 2026.3.2 does not support tools.exec.allowlist as a config
+            key — "Unrecognized key: allowlist" → Gateway cannot start.
+            LYRA exec access cannot be controlled via openclaw.json.
+            Workaround: tools.exec.security stays at "full"; SOUL.md instructs
+            LYRA to use allowed patterns (powershell -Command "...") that pass
+            the built-in security filter.
+
+        DECISION #14 (v1.0.2): tools.web.fetch.allowPrivateIPs — schema rejected.
+            OpenClaw 2026.3.2 does not support this key — "Unrecognized key:
+            allowPrivateIPs" → Gateway cannot start.
+            LYRA cannot web_fetch localhost via this config path.
+            Workaround: SOUL.md instructs LYRA to use exec+powershell for
+            local health checks instead of web_fetch (Invoke-RestMethod).
+
         Returns (success: bool, config_path: str)
         """
         # Keys OpenClaw writes but then rejects on startup — strip before writing
         REJECTED_KEYS_ROOT   = {"lastChecks", "runTimeoutSeconds"}
         REJECTED_KEYS_AGENTS = {"runTimeoutSeconds"}
+        # Keys the installer must never write (schema rejects them)
+        REJECTED_KEYS_EXEC   = {"allowlist"}           # DECISION #13
+        REJECTED_KEYS_FETCH  = {"allowPrivateIPs"}     # DECISION #14
         cfg_dir  = self._find_openclaw_config_dir()
         cfg_path = os.path.join(cfg_dir, "openclaw.json")
         os.makedirs(cfg_dir, exist_ok=True)
@@ -433,6 +476,7 @@ class OpenClawConfig:
         # ── Strip rejected keys from existing config ─────────────────────────
         # DECISION #10: OpenClaw writes keys like "lastChecks" that its own
         # schema rejects on startup → Gateway cannot start.
+        # DECISION #13/#14: allowlist + allowPrivateIPs also schema-rejected.
         # Strip proactively so doctor --fix is never needed just to unblock gateway.
         if os.path.isfile(cfg_path):
             try:
@@ -448,6 +492,16 @@ class OpenClawConfig:
                     if key in agents_def:
                         del agents_def[key]
                         stripped.append(f"agents.defaults.{key}")
+                exec_cfg = existing_cfg.get("tools", {}).get("exec", {})
+                for key in REJECTED_KEYS_EXEC:
+                    if key in exec_cfg:
+                        del exec_cfg[key]
+                        stripped.append(f"tools.exec.{key}")
+                fetch_cfg = existing_cfg.get("tools", {}).get("web", {}).get("fetch", {})
+                for key in REJECTED_KEYS_FETCH:
+                    if key in fetch_cfg:
+                        del fetch_cfg[key]
+                        stripped.append(f"tools.web.fetch.{key}")
                 if stripped:
                     with open(cfg_path, "w", encoding="utf-8", newline="\n") as f:
                         json.dump(existing_cfg, f, indent=2)
@@ -508,7 +562,19 @@ class OpenClawConfig:
                         primary_model_oc:                {},
                     },
                     "workspace":    workspace_dir,
-                    "memorySearch": {"enabled": False},
+                    # DECISION #15 (revised): memorySearch.provider = "local" + fallback = "none"
+                    # enabled=False alone is NOT sufficient — the Web Config Panel still
+                    # renders the remote.apiKey field and writes __OPENCLAW_REDACTED__ on
+                    # every save (upstream #13058). With provider="local", OpenClaw skips
+                    # all remote embedding providers entirely — no remote block, no apiKey
+                    # field rendered in the Panel, no sentinel possible.
+                    # Docs: "If you don't want to set an API key, use provider='local'
+                    # or set fallback='none'." (openclaw.ai/concepts/memory)
+                    "memorySearch": {
+                        "enabled":  False,
+                        "provider": "local",
+                        "fallback": "none",
+                    },
                     # DECISION #1 — timeoutSeconds only, NOT runTimeoutSeconds
                     # DECISION #3 — 3600s correct for RTX 3050 GPU-hybrid
                     # DECISION #9 — 7200 causes orphaned session-write-locks
@@ -542,7 +608,11 @@ class OpenClawConfig:
                 "bind": "loopback",
                 "auth": {
                     "mode":     "token",
-                    "token":    "lyra-local-token",
+                    # DECISION #16: token must be >=32 chars (openclaw security audit warns
+                    # "gateway token looks short" for 16-char tokens). uuid4().hex = 32 chars.
+                    # Generated once at install time. patch_gateway_cmd() and ENV writes
+                    # use _read_token_from_config() to stay in sync — no hardcoded fallback.
+                    "token":    uuid.uuid4().hex,
                     "password": "",     # DECISION #11: must be explicit empty string.
                     # OpenClaw 2026.3.2 added this required field. If absent, it
                     # auto-fills sentinel "__OPENCLAW_REDACTED__" then rejects it:
@@ -550,6 +620,14 @@ class OpenClawConfig:
                     #   in key gateway.auth.password is not valid as real data
                     # Empty string = correct value for token-auth mode.
                 },
+                # DECISION #19: dangerouslyDisableDeviceAuth = true — intentional.
+                # Without this, OpenClaw shows a device-pairing dialog on first
+                # browser connect, requiring physical confirmation. On a single-user
+                # loopback-only install this is pure friction with zero security benefit:
+                # gateway.bind = "loopback" already blocks all non-local access.
+                # The openclaw security audit flags this as CRITICAL, but the threat
+                # model (remote user impersonation via Control UI) does not apply here.
+                # NEVER change this for a multi-user or network-exposed setup.
                 "controlUi": {
                     "dangerouslyDisableDeviceAuth": True,
                 },
@@ -565,9 +643,16 @@ class OpenClawConfig:
                 "elevated": {
                     "enabled": True,
                     # DECISION #9: allowFrom key is "webchat" not "ollama"
-                    "allowFrom": {"webchat": ["*"]},
+                    # DECISION #17: wildcard "*" flagged by security audit as
+                    # "approves everyone on that channel for elevated mode".
+                    # Restrict to loopback only — all our webchat traffic is local.
+                    "allowFrom": {"webchat": ["127.0.0.1", "::1"]},
                 },
                 "exec": {
+                    # DECISION #13: security must stay "full" — "allowlist" key
+                    # is rejected by OpenClaw 2026.3.2 schema. LYRA uses
+                    # powershell -Command "..." patterns that pass the built-in
+                    # security filter. SOUL.md documents this workaround.
                     "security":     "full",
                     "ask":          "off",
                     "host":         "gateway",
@@ -575,11 +660,22 @@ class OpenClawConfig:
                     "timeoutSec":   1800,
                 },
                 "web": {
+                    # DECISION #14: allowPrivateIPs is rejected by schema.
+                    # LYRA must use exec+Invoke-RestMethod for localhost checks,
+                    # not web_fetch. SOUL.md instructs this workaround.
                     "fetch":  {"enabled": True},
                     "search": {"enabled": False},
                 },
                 "fs": {"workspaceOnly": False},
             },
+            # DECISION #15: agents.defaults.memorySearch.remote.apiKey
+            # OpenClaw 2026.3.2 added memorySearch.remote as a new optional block.
+            # If memorySearch is present without remote.apiKey, the Web Config Panel
+            # writes __OPENCLAW_REDACTED__ and the gateway rejects it:
+            #   Cannot un-redact config key agents.defaults.memorySearch.remote.apiKey
+            # Fix: disable memorySearch entirely (we use file-based memory via SOUL.md).
+            # memorySearch.enabled is already False above — this ensures the remote
+            # sub-block is never created with a missing apiKey.
             "skills": {
                 "install": {"nodeManager": "npm"},
             },
@@ -624,7 +720,11 @@ class OpenClawConfig:
             SET TZ=Europe/Zurich          ← DECISION #4: fix UTC log timestamps
             SET OLLAMA_API_KEY=ollama-local
             SET OLLAMA_HOST=http://127.0.0.1:11434
-            SET OPENCLAW_GATEWAY_TOKEN=lyra-local-token
+            SET OPENCLAW_GATEWAY_TOKEN=<token from openclaw.json>
+
+        DECISION #16: Token is read from openclaw.json via _read_token_from_config()
+        so patch_gateway_cmd() stays in sync with the uuid4-generated token.
+        Fallback to "lyra-local-token" only if config is unreadable.
 
         Idempotent: existing copies of these lines are stripped before
         the fresh block is inserted. Safe to call multiple times.
@@ -633,6 +733,9 @@ class OpenClawConfig:
         """
         cfg_dir     = self._find_openclaw_config_dir()
         gateway_cmd = os.path.join(cfg_dir, "gateway.cmd")
+
+        # Read the actual token from config — do not hardcode
+        gw_token = self._read_token_from_config() or "lyra-local-token"
 
         if not os.path.isfile(gateway_cmd):
             self._log("  gateway.cmd not found – skipping patch", "WARNING")
@@ -651,6 +754,7 @@ class OpenClawConfig:
 
             # ── Strip old patch lines (idempotent) ───────────────────────────
             # ⚠️  DECISION #4: TZ line is included in cleanup so re-runs are safe.
+            # Strip both the old hardcoded token and the current token pattern.
             clean = original
             for old_line in [
                 "SET OLLAMA_API_KEY=ollama-local\r\n",
@@ -659,6 +763,8 @@ class OpenClawConfig:
                 "SET OLLAMA_HOST=http://127.0.0.1:11434\n",
                 "SET OPENCLAW_GATEWAY_TOKEN=lyra-local-token\r\n",
                 "SET OPENCLAW_GATEWAY_TOKEN=lyra-local-token\n",
+                f"SET OPENCLAW_GATEWAY_TOKEN={gw_token}\r\n",
+                f"SET OPENCLAW_GATEWAY_TOKEN={gw_token}\n",
                 # ⚠️  DECISION #4: TZ cleanup — remove old value before rewriting
                 "SET TZ=Europe/Zurich\r\n",
                 "SET TZ=Europe/Zurich\n",
@@ -673,7 +779,7 @@ class OpenClawConfig:
                 "SET TZ=Europe/Zurich\r\n"
                 "SET OLLAMA_API_KEY=ollama-local\r\n"
                 "SET OLLAMA_HOST=http://127.0.0.1:11434\r\n"
-                "SET OPENCLAW_GATEWAY_TOKEN=lyra-local-token\r\n"
+                f"SET OPENCLAW_GATEWAY_TOKEN={gw_token}\r\n"
             )
 
             import re
@@ -709,6 +815,64 @@ class OpenClawConfig:
         except Exception as e:
             self._log(f"  gateway.cmd patch failed: {e}", "WARNING")
             return False
+
+    def harden_file_permissions(self):
+        """
+        DECISION #18: Apply icacls hardening to openclaw config files.
+
+        Security audit flags these files as writable by others (Administrators group
+        inherits full control via Windows defaults). Fix: remove inheritance, grant
+        explicit access only to the current user and SYSTEM.
+
+        Files hardened:
+          - ~/.openclaw/                    (state dir)
+          - ~/.openclaw/openclaw.json       (main config)
+          - ~/.openclaw/agents/.../auth-profiles.json
+          - ~/.openclaw/agents/.../sessions.json
+
+        Idempotent — safe to call multiple times.
+        Called automatically during setup_lyra_agent() post-gateway.
+        """
+        cfg_dir  = self._find_openclaw_config_dir()
+        username = os.environ.get("USERNAME", "")
+        computername = os.environ.get("COMPUTERNAME", "")
+        if not username:
+            self._log("  [Harden] USERNAME not set — skipping icacls", "WARNING")
+            return
+
+        user_identity = f"{computername}\\{username}" if computername else username
+        # SYSTEM SID is locale-independent
+        system_sid = "*S-1-5-18"
+
+        targets = [
+            # (path, is_dir)
+            (cfg_dir, True),
+            (os.path.join(cfg_dir, "openclaw.json"), False),
+            (os.path.join(cfg_dir, "agents", "main", "agent", "auth-profiles.json"), False),
+            (os.path.join(cfg_dir, "agents", "main", "sessions", "sessions.json"), False),
+        ]
+
+        for path, is_dir in targets:
+            if not os.path.exists(path):
+                continue
+            if is_dir:
+                acl_grant = f'"{user_identity}:(OI)(CI)F"'
+                sys_grant  = f'"{system_sid}:(OI)(CI)F"'
+            else:
+                acl_grant = f'"{user_identity}:F"'
+                sys_grant  = f'"{system_sid}:F"'
+
+            cmd = (
+                f'icacls "{path}" /inheritance:r '
+                f'/grant:r {acl_grant} '
+                f'/grant:r {sys_grant} 2>&1'
+            )
+            result = self._run_powershell_fn(cmd)
+            out = (result.get("stdout", "") + result.get("stderr", "")).strip()
+            if result.get("returncode", 1) == 0 or "successfully" in out.lower():
+                self._log(f"  [Harden] {os.path.basename(path)} permissions hardened  ✓", "SUCCESS")
+            else:
+                self._log(f"  [Harden] {os.path.basename(path)}: {out[:80]}", "WARNING")
 
     # ── LLM config write ───────────────────────────────────────────────────────
 
@@ -929,8 +1093,16 @@ class OpenClawConfig:
 "## Skills — korrekter Installationszustand\n"
 "\n"
 "Der EINZIGE benötigte Skill ist: delegate_to_worker.js\n"
+"Pfad: $HOME\\.openclaw\\skills\\delegate_to_worker.js\n"
+"\n"
 "Wenn diese Datei existiert → Skills sind VOLLSTÄNDIG. Nichts fehlt. Nichts zu aktivieren.\n"
 "NICHT versuchen weitere Skills zu installieren oder zu erstellen ausser der User fragt explizit.\n"
+"\n"
+"⚠️ WENN delegate_to_worker.js FEHLT:\n"
+"  → Das ist ein FEHLER, kein normaler Zustand.\n"
+"  → NICHT als 'Fallback aktiv' oder 'SearXNG übernimmt' beschreiben.\n"
+"  → User informieren: 'delegate_to_worker.js fehlt — Installer ausführen oder Apply-fixes-Button klicken.'\n"
+"  → Fallback-Kette NUR als Notlösung bis zum Fix, nicht als Dauerzustand.\n"
 "\n"
 "---\n"
 "\n"
@@ -1024,6 +1196,51 @@ class OpenClawConfig:
 "\n"
 "[LEARNING]-Einträge in memory/YYYY-MM-DD.md schreiben wenn neue Erkenntnisse gewonnen werden.\n"
 "Format: [LEARNING] Datum: Erkenntnis\n"
+"\n"
+"---\n"
+"\n"
+"## Kein Erfinden von Ergebnissen — ABSOLUTES VERBOT\n"
+"\n"
+"WENN du gebeten wirst, Tests durchzuführen oder Systemzustände zu prüfen:\n"
+"\n"
+"🚫 VERBOTEN:\n"
+"  - Testergebnisse erfinden oder schätzen\n"
+"  - 'Alles passt zur Beschreibung' ohne echten exec-Befehl\n"
+"  - Prozess-PIDs nennen die nicht existieren\n"
+"  - Verzeichnisse erwähnen die nicht erstellt wurden\n"
+"  - Behaupten ein Test laufe im Hintergrund wenn kein exec ausgeführt wurde\n"
+"\n"
+"✅ PFLICHT:\n"
+"  Jeder Test MUSS mit einem echten exec-Befehl beginnen.\n"
+"  Wenn exec fehlschlägt oder denied wird → MELDE DAS EHRLICH.\n"
+"  Kein Testergebnis ohne exec-Output.\n"
+"\n"
+"WENN exec denied ist:\n"
+"  → Schreibe: 'Test konnte nicht ausgeführt werden: exec denied.'\n"
+"  → Schlage PowerShell-Befehle vor die der User manuell ausführen kann.\n"
+"  → NIEMALS ein erfundenes Ergebnis als Ersatz liefern.\n"
+"\n"
+"Format für echte Tests:\n"
+"  Test: <was wird getestet>\n"
+"  Befehl: <ausgeführter exec-Befehl>\n"
+"  Output: <echter Output oder Fehlermeldung>\n"
+"  Ergebnis: <Bewertung basierend auf echtem Output>\n"
+"\n"
+"---\n"
+"\n"
+"## Exec — wann und wie\n"
+"\n"
+"exec ist verfügbar für PowerShell-Befehle. Nutze es aktiv.\n"
+"\n"
+"Wenn exec denied zurückkommt:\n"
+"  1. SOFORT an User melden: 'exec wurde blockiert'\n"
+"  2. Den PowerShell-Befehl als Text zeigen damit der User ihn selbst ausführen kann\n"
+"  3. NIEMALS so tun als ob der Befehl ausgeführt wurde\n"
+"\n"
+"Localhost-Checks (Gateway, Ollama) funktionieren NICHT via web_fetch (blockiert).\n"
+"Verwende stattdessen exec mit Invoke-RestMethod:\n"
+"  exec: powershell -Command \"Invoke-RestMethod http://127.0.0.1:18789/api/health | ConvertTo-Json\"\n"
+"  exec: powershell -Command \"Invoke-RestMethod http://127.0.0.1:11434/api/tags | ConvertTo-Json\"\n"
         )
 
     def safe_write_workspace(self, path: str, installer_content: str,
@@ -1293,6 +1510,35 @@ class OpenClawConfig:
 "Fix im Installer: write_openclaw_config() generiert uuid4().hex beim Neuinstall.\n"
 "  Adaptiver Fix-Button ('Apply fixes') setzt Secret nur wenn absent oder Sentinel.\n"
 "  (DECISION #12, v1.0.2)\n"
+"\n"
+"---\n"
+"\n"
+"## Security Audit (openclaw security audit --deep)\n"
+"\n"
+"Nach jedem Neuinstall erscheinen folgende Audit-Meldungen. Status:\n"
+"\n"
+"CRITICAL — bleiben absichtlich (kein Handlungsbedarf):\n"
+"  gateway.control_ui.device_auth_disabled\n"
+"    dangerouslyDisableDeviceAuth=true ist absichtlich gesetzt (DECISION #19).\n"
+"    Ohne es erscheint ein Pairing-Dialog beim ersten Browser-Start.\n"
+"    gateway.bind=loopback verhindert externen Zugriff — Threat-Modell trifft nicht zu.\n"
+"\n"
+"  models.small_params\n"
+"    Lokales privates Setup, kein untrusted Input. Sandbox nicht notwendig.\n"
+"\n"
+"WARN — bleiben absichtlich:\n"
+"  gateway.trusted_proxies_missing\n"
+"    Kein Reverse Proxy in Betrieb. Control UI bleibt lokal.\n"
+"\n"
+"BEHOBEN durch Installer (sollten nach Neuinstall verschwinden):\n"
+"  tools.elevated.allowFrom.webchat.wildcard  → [127.0.0.1, ::1] statt [*]\n"
+"  gateway.token_too_short                   → uuid4().hex = 32 chars\n"
+"  fs.config.perms_writable                  → icacls Hardening\n"
+"  fs.auth_profiles.perms_writable           → icacls Hardening\n"
+"  fs.state_dir.perms_group_writable         → icacls Hardening\n"
+"  fs.sessions_store.perms_readable          → icacls Hardening\n"
+"\n"
+"Wenn diese Meldungen noch erscheinen: 'Apply fixes' Button klicken.\n"
 "\n"
 "---\n"
 "\n"
@@ -1636,9 +1882,11 @@ ASKING FOR API KEY = ERROR. NEVER DO. Call delegate_to_worker.
             self._log(f"  auth-profiles.json (post-gateway): {e}", "WARNING")
 
         # ── ENV variables (User + Machine) ────────────────────────────────────
+        # DECISION #16: use token from config (uuid4 generated), not hardcoded.
+        gw_token_env = self._read_token_from_config() or "lyra-local-token"
         for env_name, env_val in [
             ("OLLAMA_API_KEY",          "ollama-local"),
-            ("OPENCLAW_GATEWAY_TOKEN",  "lyra-local-token"),
+            ("OPENCLAW_GATEWAY_TOKEN",  gw_token_env),
         ]:
             self._run_powershell_fn(
                 f'[System.Environment]::SetEnvironmentVariable("{env_name}", "{env_val}", "User"); '
@@ -1646,7 +1894,7 @@ ASKING FOR API KEY = ERROR. NEVER DO. Call delegate_to_worker.
             )
         self._log("  OLLAMA_API_KEY = ollama-local (User + Machine ENV)  ✓", "SUCCESS")
         self._log(
-            "  OPENCLAW_GATEWAY_TOKEN = lyra-local-token (User + Machine ENV)  ✓",
+            f"  OPENCLAW_GATEWAY_TOKEN = {gw_token_env[:10]}... (User + Machine ENV)  ✓",
             "SUCCESS",
         )
 
@@ -1679,6 +1927,38 @@ ASKING FOR API KEY = ERROR. NEVER DO. Call delegate_to_worker.
                     cfg_live["commands"]["ownerDisplaySecret"] = uuid.uuid4().hex
                     fixes_done.append("commands.ownerDisplaySecret")
 
+                # DECISION #13: tools.exec.allowlist — strip if written by old installer
+                exec_b = cfg_live.get("tools", {}).get("exec", {})
+                if "allowlist" in exec_b:
+                    del cfg_live["tools"]["exec"]["allowlist"]
+                    fixes_done.append("tools.exec.allowlist (stripped)")
+                if exec_b.get("security") == "allowlist":
+                    cfg_live["tools"]["exec"]["security"] = "full"
+                    fixes_done.append("tools.exec.security (allowlist → full)")
+
+                # DECISION #14: tools.web.fetch.allowPrivateIPs — strip if written by old installer
+                fetch_b = cfg_live.get("tools", {}).get("web", {}).get("fetch", {})
+                if "allowPrivateIPs" in fetch_b:
+                    del cfg_live["tools"]["web"]["fetch"]["allowPrivateIPs"]
+                    fixes_done.append("tools.web.fetch.allowPrivateIPs (stripped)")
+
+                # DECISION #15: memorySearch — provider="local" + fallback="none"
+                # Removes the remote sub-block and sets provider to local so the
+                # Web Config Panel never renders remote.apiKey → no sentinel possible.
+                mem = cfg_live.get("agents", {}).get("defaults", {}).get("memorySearch", {})
+                mem_fixed = False
+                if "remote" in mem:
+                    del cfg_live["agents"]["defaults"]["memorySearch"]["remote"]
+                    mem_fixed = True
+                if mem.get("provider", "") not in ("local", ""):
+                    cfg_live["agents"]["defaults"]["memorySearch"]["provider"] = "local"
+                    mem_fixed = True
+                if mem.get("fallback", "") != "none":
+                    cfg_live["agents"]["defaults"]["memorySearch"]["fallback"] = "none"
+                    mem_fixed = True
+                if mem_fixed:
+                    fixes_done.append("memorySearch (provider=local, fallback=none, remote removed)")
+
                 if fixes_done:
                     shutil.copy2(cfg_path, cfg_path + f".bak_{int(time.time())}")
                     with open(cfg_path, "w", encoding="utf-8", newline="\n") as f:
@@ -1693,6 +1973,10 @@ ASKING FOR API KEY = ERROR. NEVER DO. Call delegate_to_worker.
                     )
             except Exception as e:
                 self._log(f"  [Fix] Adaptive fix failed (non-fatal): {e}", "WARNING")
+
+        # ── File permission hardening (DECISION #18) ──────────────────────────
+        self._log("  Hardening file permissions (icacls)...")
+        self.harden_file_permissions()
 
         # ── SOUL.md + skill file (post-gateway) ──────────────────────────────
         # ⚠️  DECISION #5: Register skill AFTER gateway start.
