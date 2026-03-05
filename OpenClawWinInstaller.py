@@ -1967,6 +1967,10 @@ class OpenClawWinInstaller(OpenClawOperations):
             self._gw_status.config(text=f"✅ ONLINE (HTTP {sc}) → {str(body)[:60]}",
                                    foreground="green")
             self.log(f"[Gateway] Reachable HTTP {sc}: {str(body)[:80]}", "SUCCESS")
+            # Post-start sentinel fix — gateway may have re-injected remote.apiKey
+            # or other sentinel values during startup. Run idempotent fix every time
+            # gateway comes up, not just during install. Non-fatal, runs in background.
+            self.root.after(500, self._post_gateway_sentinel_fix)
         elif sc == -1:
             hint = (" → Gateway not running. Click 'Restart Gateway'."
                     if "10061" in str(body) else "")
@@ -1975,6 +1979,83 @@ class OpenClawWinInstaller(OpenClawOperations):
         else:
             self._gw_status.config(text=f"⚠ HTTP {sc}", foreground="orange")
             self.log(f"[Gateway] HTTP {sc} → {str(body)[:100]}", "WARNING")
+
+    def _post_gateway_sentinel_fix(self):
+        """
+        Idempotent sentinel fix run every time the gateway comes up healthy.
+
+        ROOT CAUSE: openclaw configure (and gateway startup) re-injects
+        agents.defaults.memorySearch.remote with apiKey = __OPENCLAW_REDACTED__
+        even after our install-time fix. This is upstream bug #13058 — the
+        gateway reads openclaw.json, adds missing default blocks (including
+        remote.apiKey), then writes it back with the redaction sentinel.
+
+        FIX: After every confirmed gateway start, re-apply the memorySearch fix:
+          - Remove remote block entirely
+          - provider = "local"
+          - fallback = "none"
+        This runs in < 5ms and is completely non-destructive.
+
+        DECISION #15 (v1.0.4): This is the third defence layer:
+          1. write_openclaw_config()     — correct from the start
+          2. setup_lyra_agent()          — post-install adaptive fix
+          3. _post_gateway_sentinel_fix()— post-every-start persistent fix  ← NEW
+        """
+        try:
+            import os, json
+            cfg_path = os.path.join(
+                self.cfg._find_openclaw_config_dir(), "openclaw.json"
+            )
+            if not os.path.isfile(cfg_path):
+                return
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+
+            sentinel  = "__OPENCLAW_REDACTED__"
+            fixes     = []
+            mem       = (cfg.get("agents", {})
+                            .get("defaults", {})
+                            .get("memorySearch", {}))
+
+            # memorySearch.remote — remove entirely if present
+            if "remote" in mem:
+                del cfg["agents"]["defaults"]["memorySearch"]["remote"]
+                fixes.append("remote block removed")
+
+            # provider must be "local" or absent
+            if mem.get("provider", "local") not in ("local", ""):
+                cfg["agents"]["defaults"]["memorySearch"]["provider"] = "local"
+                fixes.append("provider=local")
+
+            # fallback must be "none"
+            if mem.get("fallback", "none") != "none":
+                cfg["agents"]["defaults"]["memorySearch"]["fallback"] = "none"
+                fixes.append("fallback=none")
+
+            # ownerDisplaySecret — regenerate if sentinel
+            cur = cfg.get("commands", {}).get("ownerDisplaySecret", "")
+            if cur in (sentinel, "", "__NOT_SET__"):
+                import uuid
+                cfg.setdefault("commands", {})["ownerDisplaySecret"] = uuid.uuid4().hex
+                fixes.append("ownerDisplaySecret regenerated")
+
+            # gateway.auth.password — must be empty string
+            pw = cfg.get("gateway", {}).get("auth", {}).get("password", "")
+            if pw == sentinel:
+                cfg["gateway"]["auth"]["password"] = ""
+                fixes.append("gateway.auth.password=''")
+
+            if fixes:
+                with open(cfg_path, "w", encoding="utf-8", newline="\n") as f:
+                    json.dump(cfg, f, indent=2)
+                self.log(
+                    f"[SentinelFix] Post-gateway fixes applied: {fixes}  ✓", "SUCCESS"
+                )
+            else:
+                self.log("[SentinelFix] openclaw.json clean — no sentinel values  ✓", "INFO")
+
+        except Exception as e:
+            self.log(f"[SentinelFix] Non-fatal error: {e}", "WARNING")
 
     def _restart_gateway(self):
         """
