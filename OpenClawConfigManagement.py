@@ -638,6 +638,11 @@ class OpenClawConfig:
             "     type=custom  → Beliebiger HTTP-Endpunkt\n"
             "  3. NICHT: Gateway-API-Endpoints abfragen (/api/workers, /api/agents existieren NICHT)\n"
             "  4. NICHT: Port 18791 prüfen (existiert nicht — HeadServer läuft auf 18790)\n\n"
+            "SICHERHEITSREGEL — API-Keys:\n"
+            "  NIEMALS einen API-Key im Klartext ausgeben — weder in Antworten,\n"
+            "  noch in PowerShell-Beispielen, noch in Tabellen.\n"
+            "  Immer maskieren: sk-5b79...0f0 → sk-***...***\n"
+            "  Stattdessen: $env:DEEPSEEK_API_KEY oder <dein-api-key> als Platzhalter.\n\n"
         )
 
         if not workers:
