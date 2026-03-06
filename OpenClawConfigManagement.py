@@ -168,12 +168,12 @@ class HardwareProfile:
 
     # VRAM tiers → (recommended_primary_model, timeoutSeconds, role)
     VRAM_TIERS = [
-        (24 * 1024,  "glm-4.7-flash",   600,  "head"),    # > 24 GB — full VRAM
-        (16 * 1024,  "glm-4.7-flash",   900,  "head"),    # 16–24 GB — full VRAM
-        ( 8 * 1024,  "glm-4.7-flash",  2400,  "head"),    # 8–16 GB — hybrid
-        ( 6 * 1024,  "glm-4.7-flash",  3600,  "head"),    # 6–8 GB  — hybrid (default)
-        ( 4 * 1024,  "qwen2.5:7b",     3600,  "senior"),  # 4–6 GB
-        (     0,     "qwen2.5:3b",     7200,  "junior"),  # < 4 GB
+        (24 * 1024,  "glm-4.7-flash",   3600,  "head"),    # > 24 GB — full VRAM, 1h
+        (16 * 1024,  "glm-4.7-flash",   7200,  "head"),    # 16–24 GB — full VRAM, 2h
+        ( 8 * 1024,  "glm-4.7-flash",   7200,  "head"),    # 8–16 GB — hybrid, 2h
+        ( 6 * 1024,  "glm-4.7-flash",   7200,  "head"),    # 6–8 GB  — hybrid (RTX 3050), 2h
+        ( 4 * 1024,  "qwen2.5:7b",      7200,  "senior"),  # 4–6 GB, 2h
+        (     0,     "qwen2.5:3b",      7200,  "junior"),  # < 4 GB, 2h
     ]
 
     def __init__(self, log_fn=None):
@@ -926,10 +926,11 @@ class OpenClawConfig:
 
         # ── Hardware-based config values (v1.0.3) ───────────────────────────
         # hw_profile comes from HardwareProfile.detect() when available.
-        # Falls back to safe defaults (RTX 3050 / 6 GB VRAM baseline).
+        # Falls back to 7200s (2h) — glm-4.7-flash on CPU offloading needs > 1h.
+        # DECISION #3 updated v1.0.4: Default raised from 3600 to 7200.
         timeout_seconds = (
-            hw_profile.get("recommended_timeout", 3600)
-            if hw_profile else 3600
+            hw_profile.get("recommended_timeout", 7200)
+            if hw_profile else 7200
         )
         self._log(
             f"  Config: timeoutSeconds={timeout_seconds} "
@@ -1114,10 +1115,19 @@ class OpenClawConfig:
             SET OLLAMA_API_KEY=ollama-local
             SET OLLAMA_HOST=http://127.0.0.1:11434
             SET OPENCLAW_GATEWAY_TOKEN=<token from openclaw.json>
+            SET NODE_OPTIONS=--require <preload>  ← DECISION #20: undici 300s fix
 
         DECISION #16: Token is read from openclaw.json via _read_token_from_config()
         so patch_gateway_cmd() stays in sync with the uuid4-generated token.
         Fallback to "lyra-local-token" only if config is unreadable.
+
+        DECISION #20: undici hardcoded 300s headersTimeout fix.
+        OpenClaw uses Node.js undici HTTP client which has a hardcoded 300-second
+        (5-minute) headersTimeout. The @mariozechner/pi-ai library resets any custom
+        dispatcher via setGlobalDispatcher() — monkey-patch preload script prevents
+        this reset and raises the timeout to 30 minutes.
+        Preload script written to ~/.openclaw/undici-timeout-preload.cjs on every
+        patch run (idempotent). NODE_OPTIONS injected into gateway.cmd.
 
         Idempotent: existing copies of these lines are stripped before
         the fresh block is inserted. Safe to call multiple times.
@@ -1133,6 +1143,82 @@ class OpenClawConfig:
         if not os.path.isfile(gateway_cmd):
             self._log("  gateway.cmd not found – skipping patch", "WARNING")
             return False
+
+        # ── DECISION #20: Write undici timeout preload script ─────────────
+        preload_path = os.path.join(cfg_dir, "undici-timeout-preload.cjs")
+        preload_content = (
+            "// undici-timeout-preload.cjs\n"
+            "// DECISION #20: Fix OpenClaw/undici hardcoded 300s headersTimeout.\n"
+            "// Reads timeoutSeconds from openclaw.json — stays in sync with GUI setting.\n"
+            "// Written by OpenClawWinInstaller patch_gateway_cmd() — do not edit.\n"
+            "'use strict';\n"
+            "const path = require('path');\n"
+            "const fs   = require('fs');\n"
+            "\n"
+            "function readTimeoutMs() {\n"
+            "  try {\n"
+            "    const cfgPath = path.join(\n"
+            "      process.env.USERPROFILE || process.env.HOME || '',\n"
+            "      '.openclaw', 'openclaw.json'\n"
+            "    );\n"
+            "    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));\n"
+            "    const sec = cfg?.agents?.defaults?.timeoutSeconds;\n"
+            "    if (typeof sec === 'number' && sec > 0) {\n"
+            "      return sec * 1000; // convert to ms, add 60s buffer\n"
+            "    }\n"
+            "  } catch (_) {}\n"
+            "  return 2 * 60 * 60 * 1000; // fallback: 2h\n"
+            "}\n"
+            "\n"
+            "function findUndici() {\n"
+            "  const candidates = [\n"
+            "    path.join(process.env.APPDATA || '', 'npm', 'node_modules', 'openclaw', 'node_modules', 'undici'),\n"
+            "    path.join(process.env.APPDATA || '', 'npm', 'node_modules', 'undici'),\n"
+            "    path.join(process.env.NVM_HOME || '', 'nodejs', 'node_modules', 'undici'),\n"
+            "    'undici',\n"
+            "  ];\n"
+            "  for (const c of candidates) {\n"
+            "    try { const m = require(c); if (m && m.setGlobalDispatcher) return m; } catch (_) {}\n"
+            "  }\n"
+            "  let search = process.cwd();\n"
+            "  for (let i = 0; i < 8; i++) {\n"
+            "    const candidate = path.join(search, 'node_modules', 'undici');\n"
+            "    if (fs.existsSync(candidate)) {\n"
+            "      try { const m = require(candidate); if (m && m.setGlobalDispatcher) return m; } catch(_) {}\n"
+            "    }\n"
+            "    const parent = path.dirname(search);\n"
+            "    if (parent === search) break;\n"
+            "    search = parent;\n"
+            "  }\n"
+            "  return null;\n"
+            "}\n"
+            "\n"
+            "try {\n"
+            "  const undici = findUndici();\n"
+            "  if (!undici) {\n"
+            "    process.stderr.write('[undici-preload] undici not found — skipping patch\\n');\n"
+            "  } else {\n"
+            "    const timeoutMs = readTimeoutMs();\n"
+            "    const { EnvHttpProxyAgent } = undici;\n"
+            "    const OPTS = { headersTimeout: timeoutMs, bodyTimeout: 0 };\n"
+            "    const realSet = undici.setGlobalDispatcher.bind(undici);\n"
+            "    function enforce() { realSet(new EnvHttpProxyAgent(OPTS)); }\n"
+            "    enforce();\n"
+            "    undici.setGlobalDispatcher = function () { enforce(); };\n"
+            "    const hStr = Math.round(timeoutMs / 3600000 * 10) / 10;\n"
+            "    process.stderr.write('[undici-preload] headersTimeout patched to ' + hStr + 'h OK\\n');\n"
+            "  }\n"
+            "} catch (e) {\n"
+            "  process.stderr.write('[undici-preload] patch skipped: ' + e.message + '\\n');\n"
+            "}\n"
+        )
+        try:
+            with open(preload_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(preload_content)
+            self._log(f"  undici-timeout-preload.cjs written: {preload_path}  ✓", "SUCCESS")
+        except Exception as e:
+            self._log(f"  undici-timeout-preload.cjs write failed: {e}", "WARNING")
+            preload_path = None
 
         try:
             with open(gateway_cmd, "r", encoding="utf-8", errors="replace") as f:
@@ -1161,10 +1247,25 @@ class OpenClawConfig:
                 # ⚠️  DECISION #4: TZ cleanup — remove old value before rewriting
                 "SET TZ=Europe/Zurich\r\n",
                 "SET TZ=Europe/Zurich\n",
+                # ⚠️  DECISION #20: NODE_OPTIONS cleanup — strip old preload line
+                *[f"SET NODE_OPTIONS={x}\r\n" for x in [
+                    f"--require {preload_path}",
+                    f"--require {preload_path.replace(os.sep, '/')}",
+                ] if preload_path],
+                *[f"SET NODE_OPTIONS={x}\n" for x in [
+                    f"--require {preload_path}",
+                    f"--require {preload_path.replace(os.sep, '/')}",
+                ] if preload_path],
             ]:
                 clean = clean.replace(old_line, "")
 
             # ── Insert fresh ENV block after @echo off ───────────────────────
+            node_opts_line = ""
+            if preload_path:
+                # Use forward slashes — Node.js --require handles them on Windows
+                preload_fwd = preload_path.replace(os.sep, "/")
+                node_opts_line = f"SET NODE_OPTIONS=--require {preload_fwd}\r\n"
+
             env_block = (
                 "@echo off\r\n"
                 # ⚠️  DECISION #4: Node.js via Scheduled Task does not inherit
@@ -1173,6 +1274,8 @@ class OpenClawConfig:
                 "SET OLLAMA_API_KEY=ollama-local\r\n"
                 "SET OLLAMA_HOST=http://127.0.0.1:11434\r\n"
                 f"SET OPENCLAW_GATEWAY_TOKEN={gw_token}\r\n"
+                # ⚠️  DECISION #20: undici 300s timeout fix
+                f"{node_opts_line}"
             )
 
             import re
@@ -1192,12 +1295,14 @@ class OpenClawConfig:
             with open(gateway_cmd, "r", encoding="utf-8", errors="replace") as f:
                 verify = f.read()
 
+            node_ok = ("NODE_OPTIONS" in verify) if preload_path else True
             if ("OLLAMA_API_KEY=ollama-local" in verify
                     and "OPENCLAW_GATEWAY_TOKEN" in verify
-                    and "TZ=Europe/Zurich" in verify):
+                    and "TZ=Europe/Zurich" in verify
+                    and node_ok):
                 self._log(
                     "  gateway.cmd: TZ + OLLAMA_API_KEY + OPENCLAW_GATEWAY_TOKEN "
-                    "injected  ✓", "SUCCESS"
+                    "+ NODE_OPTIONS (undici fix) injected  ✓", "SUCCESS"
                 )
                 self._log(f"  First 4 lines: {verify[:200]!r}", "INFO")
                 return True
@@ -1343,12 +1448,15 @@ class OpenClawConfig:
 
         if changed:
             # DECISION #9 (v1.0.1): ensure critical fields are always correct,
-            # even when only the model is being updated via the GUI button.
-            # Without this, timeoutSeconds stays at 7200 (orphaned lock risk)
-            # and meta.lastTouchedVersion stays at an old value (compaction fails).
+            # DECISION #3 updated v1.0.4: Default timeoutSeconds = 7200 (2h).
+            # glm-4.7-flash on RTX 3050 with CPU offloading needs > 1h for complex tasks.
+            # Only lower to 7200 if currently above 28800 (8h) — never override
+            # a user-set value that's within reasonable bounds.
             try:
                 cfg.setdefault("agents", {}).setdefault("defaults", {})
-                cfg["agents"]["defaults"]["timeoutSeconds"] = 3600
+                current_to = cfg["agents"]["defaults"].get("timeoutSeconds", 0)
+                if current_to == 0 or current_to > 28800:
+                    cfg["agents"]["defaults"]["timeoutSeconds"] = 7200
             except Exception:
                 pass
             try:
@@ -2111,6 +2219,41 @@ if hw_profile else ""
 "   Wenn glm-4.7-flash (19 GB) instabil: qwen2.5:7b (5 GB) waehlen.\n"
 "   qwen2.5:7b passt vollstaendig in 6 GB VRAM → stabiler, schneller.\n"
 "   Model-Wechsel im Installer: Reiter 'Lyra Config' → Primary LLM Dropdown.\n"
+"\n"
+"---\n"
+"\n"
+"## OpenClaw: LLM request timed out — exakt nach 5 Minuten (undici 300s Bug)\n"
+"\n"
+"Symptom:\n"
+"  [agent/embedded] embedded run agent end: isError=true error=LLM request timed out.\n"
+"  Fehler tritt exakt nach 300 Sekunden auf — bei jeder Anfrage.\n"
+"  Gleiches Problem auf Windows UND Linux → liegt nicht an Ollama.\n"
+"  OpenClaw retried dieselbe Generation 3x → alle scheitern an derselben Wand.\n"
+"\n"
+"Root Cause (DECISION #20):\n"
+"  OpenClaw verwendet Node.js undici HTTP-Client mit hardcodiertem headersTimeout=300s.\n"
+"  Die @mariozechner/pi-ai Library ruft setGlobalDispatcher() auf — das setzt jeden\n"
+"  custom Timeout zurück auf 300s. timeoutSeconds in openclaw.json wird ignoriert.\n"
+"  Streaming deaktiviert fuer Ollama (SDK-Bug bei Tool-Calling-Modellen) → gesamte\n"
+"  Antwort muss in einem Stueck zurueckkommen → trifft immer den 300s-Limit.\n"
+"\n"
+"Fix (automatisch via 'Apply fixes + Update SOUL.md' Button):\n"
+"  1. undici-timeout-preload.cjs in ~/.openclaw/ geschrieben\n"
+"     Monkey-patcht setGlobalDispatcher → headersTimeout=30min, bodyTimeout=0\n"
+"  2. gateway.cmd: SET NODE_OPTIONS=--require <preload.cjs> eingefuegt\n"
+"  3. openclaw.json: models.providers.ollama.retry.attempts=1\n"
+"     Verhindert automatisches Retry (infinite loop)\n"
+"\n"
+"Diagnose (ob Fix aktiv):\n"
+"  Get-Content $env:USERPROFILE\\.openclaw\\gateway.cmd | Select-String NODE_OPTIONS\n"
+"  Test-Path $env:USERPROFILE\\.openclaw\\undici-timeout-preload.cjs\n"
+"\n"
+"Manuelle Verifikation (ob Ollama schneller als 300s antwortet):\n"
+"  $body = '{\"model\":\"glm-4.7-flash:latest\",\"messages\":[{\"role\":\"user\",\"content\":\"Schreib 500 Woerter ueber KI\"}],\"stream\":false}'\n"
+"  $t = [System.Diagnostics.Stopwatch]::StartNew()\n"
+"  Invoke-RestMethod http://127.0.0.1:11434/api/chat -Method POST -Body $body -ContentType application/json -TimeoutSec 600\n"
+"  Write-Host \"Ollama: $($t.Elapsed.TotalSeconds)s\"\n"
+"  Wenn <300s → Ollama ist nicht das Problem → undici Fix loest es.\n"
 "\n"
 "---\n"
 "\n"

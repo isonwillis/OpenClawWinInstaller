@@ -726,12 +726,23 @@ class OpenClawWinInstaller(OpenClawOperations):
         ttk.Button(row_s, text="✅ Set",
                    command=self._set_secondary_llm).pack(side=tk.LEFT)
 
-        # Timeout indicator
+        # Timeout selector
+        row_t = ttk.Frame(sec_llm)
+        row_t.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(row_t, text="⏱ Timeout:", width=14).pack(side=tk.LEFT)
+        self._timeout_var = tk.StringVar(value="2h")
+        timeout_cb = ttk.Combobox(
+            row_t, textvariable=self._timeout_var,
+            values=["30 min", "1h", "2h", "4h", "8h", "Unbegrenzt"],
+            state="readonly", width=12)
+        timeout_cb.pack(side=tk.LEFT, padx=(4, 6))
+        ttk.Button(row_t, text="✅ Set",
+                   command=self._set_agent_timeout).pack(side=tk.LEFT)
         self._timeout_info = ttk.Label(
             sec_llm,
             text="⏱  timeoutSeconds: —",
             font=("Consolas", 8), foreground="#888888")
-        self._timeout_info.pack(anchor=tk.W, pady=(4, 0))
+        self._timeout_info.pack(anchor=tk.W, pady=(2, 0))
 
         # Status label
         self._llm_set_status = ttk.Label(sec_llm, text="", font=("Consolas", 9),
@@ -974,12 +985,24 @@ class OpenClawWinInstaller(OpenClawOperations):
         ttk.Button(row_s, text="✅ Set",
                    command=self._set_secondary_llm).pack(side=tk.LEFT)
 
-        # Timeout indicator (reuse same label attribute – worker has it too)
+        # Timeout selector (worker tab — shared _timeout_var with Lyra tab)
+        row_t = ttk.Frame(sec_llm)
+        row_t.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(row_t, text="⏱ Timeout:", width=14).pack(side=tk.LEFT)
+        if not hasattr(self, "_timeout_var"):
+            self._timeout_var = tk.StringVar(value="2h")
+        timeout_cb = ttk.Combobox(
+            row_t, textvariable=self._timeout_var,
+            values=["30 min", "1h", "2h", "4h", "8h", "Unbegrenzt"],
+            state="readonly", width=12)
+        timeout_cb.pack(side=tk.LEFT, padx=(4, 6))
+        ttk.Button(row_t, text="✅ Set",
+                   command=self._set_agent_timeout).pack(side=tk.LEFT)
         self._timeout_info = ttk.Label(
             sec_llm,
             text="⏱  timeoutSeconds: —",
             font=("Consolas", 8), foreground="#888888")
-        self._timeout_info.pack(anchor=tk.W, pady=(4, 0))
+        self._timeout_info.pack(anchor=tk.W, pady=(2, 0))
 
         # Status label
         self._llm_set_status = ttk.Label(sec_llm, text="", font=("Consolas", 9),
@@ -1683,6 +1706,47 @@ class OpenClawWinInstaller(OpenClawOperations):
             foreground="green")
         self.log(f"[LLM] {len(models)} model(s): {', '.join(models)}", "SUCCESS")
 
+    def _set_agent_timeout(self):
+        """Write the selected agent timeout to openclaw.json and restart gateway."""
+        TIMEOUT_MAP = {
+            "30 min":      1800,
+            "1h":          3600,
+            "2h":          7200,
+            "4h":         14400,
+            "8h":         28800,
+            "Unbegrenzt": 86400,   # 24h — OpenClaw rejects 0 as invalid
+        }
+        selection = self._timeout_var.get()
+        seconds   = TIMEOUT_MAP.get(selection, 7200)
+
+        cfg_dir  = self.cfg._find_openclaw_config_dir()
+        cfg_path = os.path.join(cfg_dir, "openclaw.json")
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            cfg.setdefault("agents", {}).setdefault("defaults", {})
+            cfg["agents"]["defaults"]["timeoutSeconds"] = seconds
+            shutil.copy2(cfg_path, cfg_path + f".bak_{int(time.time())}")
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+            label = f"{seconds}s" if seconds != 86400 else "86400s (24h — max)"
+            self.log(f"[Timeout] agents.defaults.timeoutSeconds = {label}  ✓", "SUCCESS")
+            if hasattr(self, "_timeout_info"):
+                self._timeout_info.config(
+                    text=f"⏱  timeoutSeconds: {label}",
+                    foreground="#1a7f1a")
+            if hasattr(self, "_llm_set_status"):
+                self._llm_set_status.config(
+                    text=f"✅ Timeout gesetzt: {selection} ({label}) — Gateway neu starten.",
+                    foreground="green")
+            # Trigger gateway restart
+            self._restart_gateway()
+        except Exception as e:
+            self.log(f"[Timeout] Fehler: {e}", "ERROR")
+            if hasattr(self, "_llm_set_status"):
+                self._llm_set_status.config(text=f"❌ {e}", foreground="red")
+
     def _set_primary_llm(self):
         """Write the selected primary model to openclaw.json and show restart hint."""
         model = self._llm_primary_var.get().strip()
@@ -1935,6 +1999,23 @@ class OpenClawWinInstaller(OpenClawOperations):
                     fixes_applied.append("memorySearch (provider=local, fallback=none, remote removed)")
 
                 # ── Future fixes go here, same pattern ────────────────────────
+
+                # CLEANUP #20a: models.providers.ollama — schema rejected
+                # Installer v1.0.4 accidentally wrote models.providers.ollama.retry
+                # which OpenClaw 2026.3.2 rejects (unrecognized key + missing required
+                # fields baseUrl/models). Remove the entire providers.ollama block
+                # if it was written by us (contains only "retry", no baseUrl).
+                providers = cfg.get("models", {}).get("providers", {})
+                if "ollama" in providers:
+                    ollama_prov = providers["ollama"]
+                    # Only strip if it's our accidental entry (no baseUrl = not user-configured)
+                    if "baseUrl" not in ollama_prov:
+                        del cfg["models"]["providers"]["ollama"]
+                        if not cfg["models"]["providers"]:
+                            del cfg["models"]["providers"]
+                        if not cfg.get("models"):
+                            del cfg["models"]
+                        fixes_applied.append("models.providers.ollama (removed — schema rejected, was accidental installer entry)")
                 # Example:
                 #   current = cfg.get("some", {}).get("key", "__NOT_SET__")
                 #   if current == "__NOT_SET__":
@@ -1958,6 +2039,10 @@ class OpenClawWinInstaller(OpenClawOperations):
         # ── File permission hardening (DECISION #18) ───────────────────────────
         self.log("[Fix] Hardening file permissions (icacls)...")
         self.cfg.harden_file_permissions()
+
+        # ── DECISION #20: gateway.cmd undici timeout patch ─────────────────────
+        self.log("[Fix] Patching gateway.cmd (undici timeout preload + ENV)...")
+        self.cfg.patch_gateway_cmd()
 
         # ── SOUL.md + BOOTSTRAP.md update ─────────────────────────────────────
         soul_content = self.cfg._build_soul_content()
