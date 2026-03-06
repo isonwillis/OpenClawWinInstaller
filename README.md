@@ -6,7 +6,7 @@ A fully automated Windows installer that sets up **OpenClaw** with a local LLM (
 After running the script, LYRA is immediately ready to use — no manual configuration, no token issues, no approval prompts.
 
 From v1.0.0 the system supports a **machine role hierarchy**: a LYRA head orchestrates any number of Junior/Senior workers via an integrated HTTP task server with **bidirectional communication**.  
-From v1.0.4 the system also supports **external LLM agents** (OpenAI-compatible APIs, remote Ollama) in a unified monitoring interface.
+From v1.0.4 the system also supports **external LLM agents** (OpenAI-compatible APIs, remote Ollama) in a unified monitoring interface — including per-agent delegation rules that tell LYRA exactly when to use each agent.
 
 **Stack:** `Python (tkinter GUI)` → `PowerShell` → `OpenClaw (npm)` + `Ollama (Windows-native / Docker / WSL)`
 
@@ -20,11 +20,14 @@ From v1.0.4 the system also supports **external LLM agents** (OpenAI-compatible 
 - ✅ 67+ edge cases fixed and documented
 - ✅ 3-stage fallback strategies
 - ✅ Unified agent registry: workers + external LLMs in one interface
+- ✅ Per-agent delegation rules — LYRA knows when to use which agent
 - ✅ Bidirectional worker communication — result stored locally + posted to HEAD
 - ✅ Auto-display of worker results — no manual polling needed
 - ✅ Worker + Task Server auto-start on every app launch
 - ✅ LYRA knows her agents — persistent registry, direct exec access
 - ✅ External LLM delegation: DeepSeek, OpenAI-compatible APIs
+- ✅ Dynamic agent timeout — GUI dropdown 30min · 1h · 2h · 4h · 8h · 24h
+- ✅ undici 300s hardcoded timeout patched — synced to GUI setting
 - ✅ Hardware-aware config: timeout + model from HardwareProfile
 - ✅ Clean three-module architecture: Installer · Config · Monitoring
 
@@ -75,7 +78,80 @@ The Monitoring Tab has been completely rewritten. The old Worker-only registry i
 
 **Auto-switch task type** — clicking an agent switches the Task Sender dropdown automatically: `openai` → `chat (openai)`, `ollama` → `chat (ollama)`, `worker` → `web_search`.
 
-### 📊 Color-Coded Health Status
+### 📋 Delegation Rules — Per-Agent
+
+Each agent has a `delegation_rules` field that tells LYRA **when to use it**. Edited via `📋 Edit Rules` button — opens a dedicated editor window pre-filled with editable examples:
+
+```
+- Delegate all web_search tasks to this agent
+- Use for reasoning tasks (math, logic, code review)
+- Prefer this agent when query contains: weather, news, current events
+- Only use when local Ollama is unavailable
+- Priority: 1 (highest) — use before other agents of the same type
+- Max task size: any / only short queries (<200 words)
+- Language preference: German queries
+```
+
+Rules are written to SOUL.md `## Agent Registry` section — LYRA reads and applies them each session. The editor opens pre-filled with working examples so the user only adjusts what applies, no need to think about what fields exist.
+
+**workers.json schema with delegation_rules:**
+```json
+[
+  {
+    "type": "worker", "ip": "192.168.2.102", "port": 18790,
+    "name": "Junior-PC", "role": "Junior", "protocol": "openclaw",
+    "model": "", "api_key": "",
+    "delegation_rules": "- Delegate all web_search tasks to this agent\n- Priority: 1"
+  },
+  {
+    "type": "openai", "url": "https://api.deepseek.com/v1", "port": 443,
+    "name": "DeepSeek", "role": "External", "protocol": "openai",
+    "model": "deepseek-chat", "api_key": "sk-...",
+    "delegation_rules": "- Use for reasoning tasks (math, logic, code review)\n- Only use when local Ollama is unavailable"
+  }
+]
+```
+
+### ⏱ Dynamic Agent Timeout — GUI Dropdown
+
+New timeout selector in **Lyra Config Tab** (and Worker Config Tab):
+
+```
+⏱ Timeout:  [4h ▼]   ✅ Set
+⏱  timeoutSeconds: 14400s
+```
+
+| Option | Seconds | Use case |
+|---|---|---|
+| 30 min | 1800 | Fast models, full VRAM |
+| 1h | 3600 | Standard |
+| **2h** | **7200** | **Default — glm-4.7-flash on RTX 3050** |
+| 4h | 14400 | Complex tasks, heavy CPU offloading |
+| 8h | 28800 | Overnight / batch jobs |
+| Unbegrenzt | 86400 | Maximum OpenClaw accepts (24h) |
+
+`✅ Set` writes `agents.defaults.timeoutSeconds` to `openclaw.json` and restarts the gateway immediately. VRAM_TIERS updated — all tiers default to 7200s (2h).
+
+### 🔧 undici 300s Hardcoded Timeout Fix
+
+**Root cause:** OpenClaw uses Node.js `undici` HTTP client with a hardcoded 300-second `headersTimeout`. The `@mariozechner/pi-ai` library resets any custom dispatcher via `setGlobalDispatcher()` — overriding attempts to raise the timeout. OpenClaw also disables streaming for Ollama (SDK bug with tool-calling models), meaning the entire response must complete before any data is returned — always hitting the 300s wall for complex outputs.
+
+**Symptoms:** `error=LLM request timed out` at exactly 5 minutes, reproducible on Windows and Linux (it's Node.js-internal, not Ollama).
+
+**Fix:** A monkey-patch preload script (`~/.openclaw/undici-timeout-preload.cjs`) is written automatically by `patch_gateway_cmd()` and injected via `NODE_OPTIONS` in `gateway.cmd`. The script:
+- Reads `timeoutSeconds` from `openclaw.json` at gateway start — always in sync with the GUI
+- Sets `headersTimeout` to that value, `bodyTimeout` to 0
+- Overrides `setGlobalDispatcher` to prevent pi-ai from resetting the timeout
+
+```
+[undici-preload] headersTimeout patched to 4h OK   ← appears in gateway log
+```
+
+If undici is not found the script exits silently — gateway always starts normally.
+
+> **Note:** `models.providers.ollama.retry` is a **rejected schema key** in OpenClaw 2026.3.2. The `Apply fixes` button removes it automatically if accidentally present.
+
+
 
 Background poller (30s daemon thread, no log spam). Status via `itemconfig(foreground=...)` — emoji render black on Windows, colored text does not:
 
@@ -84,8 +160,6 @@ Background poller (30s daemon thread, no log spam). Status via `itemconfig(foreg
 | `[??]` | Grey | Not yet polled |
 | `[OK]` | Green | Online |
 | `[!!]` | Red | Unreachable |
-
-Health check endpoint per type: `worker` → GET /health · `ollama` → GET /api/tags · `openai` → GET /models
 
 ### 📥 Result Viewer — Auto-Display
 
@@ -130,34 +204,18 @@ Any OpenAI-compatible API works. **DeepSeek** setup:
 2. `setup_lyra_agent()` — adaptive post-install fix
 3. `_post_gateway_sentinel_fix()` — fires after **every** gateway start ← NEW
 
-### 🗂 workers.json — Extended Schema
+### 🧠 SOUL.md — Agent Awareness Fixes
 
-```json
-[
-  {
-    "type": "worker", "ip": "192.168.2.102", "port": 18790,
-    "name": "Junior-PC", "role": "Junior", "protocol": "openclaw",
-    "model": "", "api_key": ""
-  },
-  {
-    "type": "openai", "url": "https://api.deepseek.com/v1", "port": 443,
-    "name": "DeepSeek", "role": "External", "protocol": "openai",
-    "model": "deepseek-chat", "api_key": "sk-..."
-  }
-]
-```
+LYRA now correctly identifies and uses her agent registry:
 
-SOUL.md `## Agent Registry` section dynamically generated from `workers.json`. API keys masked (`abc***…***xyz`).
-
-### 📖 SOUL.md — New Sections (v1.0.4)
-
-| Section | Content |
+| Rule | Detail |
 |---|---|
-| LLM Timeout Fallback | 3x timeout → switch to `qwen2.5:7b` · VRAM diagnosis |
-| Ollama exit status 2 | 3 causes: VRAM pressure · corrupt blob · version bug |
-| memorySearch sentinel | Three defense layers documented |
-| PowerShell `${var}:` | `$date:` = drive reference → always use `${date}:` |
-| Agent Registry | All agent types, masked API keys, PS commands for LYRA |
+| Agent Registry source | `workers.json` only — never Gateway API endpoints |
+| `/api/workers`, `/api/agents` | Do not exist — LYRA must not query them |
+| Skill check | Only when delegation is planned — not a session blocker |
+| Task priority | Execute user task first — diagnostics are secondary |
+| `delegate_to_worker.js` missing | One-line note at end of answer — never blocks other tasks |
+| API keys | Never output in plaintext — always masked or use `$env:` variable |
 
 ---
 
@@ -200,10 +258,10 @@ The original 9005-line monolith split into three focused files:
 
 ```
 OpenClawWinInstaller.py        3 454 lines   GUI + installation flow
-OpenClawConfigManagement.py    5 759 lines   All logic, servers, config
-OpenClawAgentMonitoring.py       957 lines   Monitoring Tab (self-contained)
+OpenClawConfigManagement.py    5 801 lines   All logic, servers, config
+OpenClawAgentMonitoring.py     1 081 lines   Monitoring Tab (self-contained)
 ─────────────────────────────────────────
-Total                         10 170 lines
+Total                         10 336 lines
 ```
 
 ---
@@ -224,6 +282,8 @@ Total                         10 170 lines
 - ✅ Unified registry: OpenClaw workers + external LLMs in one list
 - ✅ workers.json persistent — survives restarts
 - ✅ Inline edit — click agent → fields prefill → modify → save
+- ✅ Per-agent delegation rules — `📋 Edit Rules` editor with pre-filled examples
+- ✅ Delegation rules written to SOUL.md — LYRA reads and applies them
 - ✅ Auto-switch task type on agent select
 - ✅ Color-coded health status (green/red/grey via itemconfig)
 - ✅ Silent background polling every 30s
@@ -236,7 +296,18 @@ Total                         10 170 lines
 - ✅ `GET /result/<task_id>` on HeadServer — fixed v1.0.4
 - ✅ `GET /results` on HeadServer — fixed v1.0.4
 - ✅ Auto-display: result appears without manual fetch
-- ✅ SOUL.md Agent Registry — LYRA knows all agents + exact PS commands
+- ✅ SOUL.md Agent Registry — LYRA knows all agents + delegation rules
+
+### LYRA Behavior
+- ✅ Agent registry read from `workers.json` — never from Gateway APIs
+- ✅ Delegation rules applied per agent per session
+- ✅ Task-first: user task always executed before diagnostics
+- ✅ API keys never output in plaintext
+- ✅ Skill check only when delegation is planned — never a session blocker
+- ✅ SOUL.md written on every install + `🛠 Apply fixes + Update SOUL.md`
+- ✅ FORCE-DELEGATE.md prevents Brave Search API requests
+- ✅ Error escalation: same error twice → read docs → `[CORRECTION]`
+- ✅ Persistent self-learning: `[LEARNING]` entries to `memory/YYYY-MM-DD.md`
 
 ### Core Infrastructure
 - ✅ Gateway auto-starts at Windows login
@@ -244,13 +315,6 @@ Total                         10 170 lines
 - ✅ Ollama model discovery via REST API — WSL, Docker, Windows-native
 - ✅ GPU-hybrid inference: RTX 3050 (6 GB VRAM + 26 GB shared)
 - ✅ `sessions.json` deleted before gateway start — fresh agent state
-
-### LYRA Behavior
-- ✅ SOUL.md written on every install + `🛠 Apply fixes + Update SOUL.md`
-- ✅ FORCE-DELEGATE.md prevents Brave Search API requests
-- ✅ Session-start checklist: disk verified before memory accepted as truth
-- ✅ Error escalation: same error twice → read docs → `[CORRECTION]`
-- ✅ Persistent self-learning: `[LEARNING]` entries to `memory/YYYY-MM-DD.md`
 
 ---
 
@@ -262,17 +326,19 @@ LYRA (head) ──────────────────────�
   Model: glm-4.7-flash (30B, 19 GB) — GPU+CPU hybrid
   Runs: OpenClaw Gateway (18789) + LyraHeadServer (18790)
   
-  ↓ delegates via HTTP POST /tasks
+  ↓ delegates via HTTP POST /tasks  (rule: web_search → Junior)
   
 Junior Worker ─────────────────────────────────────────────────
   i5-2500 · no AVX2 · qwen2.5:0.5b
   Handles: web search via SearXNG, simple tasks
+  Delegation rule: web_search · weather · news · Priority 1
   
   ↑ result POSTed back to HEAD /result
 
 External LLM ──────────────────────────────────────────────────
   OpenAI-compatible API (DeepSeek, OpenAI, LM Studio, ...)
   Accessed via Monitoring Tab → chat (openai) / chat (ollama)
+  Delegation rule: reasoning tasks · fallback when Ollama unavailable
   Synchronous — no task_id, response inline
 ```
 
@@ -319,7 +385,12 @@ External LLM ──────────────────────�
 | Ollama exit status 2 | VRAM · corrupt blob · version bug | v1.0.4 |
 | memorySearch sentinel | Three defense layers | v1.0.4 |
 | PowerShell `${var}:` | `$date:` = drive reference | v1.0.4 |
-| Agent Registry | All types, masked keys, PS commands | v1.0.4 |
+| Agent Registry source | `workers.json` only — no Gateway API calls | v1.0.4 |
+| Task priority | User task first — diagnostics secondary | v1.0.4 |
+| Skill check scope | Only when delegating — never a session blocker | v1.0.4 |
+| API key security | Never output plaintext keys | v1.0.4 |
+| Delegation rules | Per-agent rules read from `workers.json` via SOUL.md | v1.0.4 |
+| undici timeout | Gateway start log confirms active timeout value | v1.0.4 |
 | Persistent self-learning | `[LEARNING]` + `[SOUL-UPDATE-VORSCHLAG]` | v1.0.4 |
 
 ---
@@ -336,13 +407,24 @@ Worker POSTs result to `LyraHeadServer` immediately after completion — result 
 
 ### ❌ IP address loses port when stored as `url` field — NEVER REINTRODUCE
 `_collect_form` stored bare IPs in the `url` field → `_agent_base_url` returned `http://192.168.x.x` without port.  
-**Fix:** IPs → `ip` field. Real URLs → `url` field. `_agent_base_url` uses `ip:port` for IPs.
+**Fix:** IPs → `ip` field. Real URLs → `url` field.
 
 ### ❌ DeepSeek base_url without `/v1` — NEVER REINTRODUCE
 Use `https://api.deepseek.com/v1` as base_url. Code appends `/chat/completions` → identical to OpenAI. No provider detection needed.
 
+### ❌ LYRA queries `/api/workers` or `/api/agents` — NEVER REINTRODUCE
+These Gateway endpoints do not exist. Agent registry is in `workers.json` only.  
+**Fix:** SOUL.md explicit rule + recognition checklist for agent queries.
+
+### ❌ LYRA outputs API key in plaintext — NEVER REINTRODUCE
+API keys must never appear in answers, tables, or PowerShell examples.  
+**Fix:** SOUL.md security rule. Always use `$env:DEEPSEEK_API_KEY` or `<your-api-key>` as placeholder.
+
+### ❌ `delegate_to_worker.js` missing blocks all tasks — NEVER REINTRODUCE
+Skill check was a session blocker. Only delegation via that tool is affected when missing.  
+**Fix:** SOUL.md — task first, one-line note at end, skill check only when delegating.
+
 ### ❌ `memorySearch` sentinel returns after every Gateway start — NEVER REINTRODUCE
-Gateway re-injects sentinel on every start (upstream bug [#13058](https://github.com/openclaw/openclaw/issues/13058)).  
 **Fix:** `_post_gateway_sentinel_fix()` runs 500ms after every health-check.
 
 ### ❌ `runTimeoutSeconds` in openclaw.json — NEVER REINTRODUCE
@@ -352,7 +434,10 @@ Schema rejected → Gateway cannot start. Only `agents.defaults.timeoutSeconds` 
 **Fix:** `SET TZ=Europe/Zurich` in `gateway.cmd`.
 
 ### ❌ `timeoutSeconds` wrong value — NEVER REINTRODUCE
-`86400` rejected · `7200` too short · `28800` too long · **`3600`** ← correct for RTX 3050
+`0` rejected (gateway closes immediately) · `86400` = max 24h ("Unbegrenzt") · **`7200`** ← new default (2h, RTX 3050 with CPU offloading)
+
+### ❌ `models.providers.ollama.retry` — NEVER REINTRODUCE
+Schema rejected — unrecognized key in OpenClaw 2026.3.2. Writing `models.providers.ollama` without required `baseUrl` + `models` array also fails validation. `Apply fixes` removes accidental entries automatically.
 
 ### ❌ `ollama/` prefix in auth-profiles.json — NEVER REINTRODUCE
 `openclaw.json` uses `ollama/model`. `auth-profiles.json` uses bare model name only.
@@ -364,7 +449,6 @@ Gateway overwrites `skills.json` on startup. **Fix:** `_write_skill_file()` call
 **Fix:** Use `;` or separate lines.
 
 ### ❌ `$date:` PowerShell drive reference — NEVER REINTRODUCE
-`"[LEARNING] $date: text"` — PS interprets `$date:` as a drive reference.  
 **Fix:** Always `${date}:` when a variable directly precedes a colon.
 
 ---
@@ -373,7 +457,7 @@ Gateway overwrites `skills.json` on startup. **Fix:** `_write_skill_file()` call
 
 | Machine | Model | Size | Notes |
 |---|---|---|---|
-| Lyra (head) | glm-4.7-flash | 30B / 19 GB | Primary · GPU+CPU hybrid · 3600s timeout |
+| Lyra (head) | glm-4.7-flash | 30B / 19 GB | Primary · GPU+CPU hybrid · 7200s timeout (2h default) |
 | Lyra (head) | qwen2.5:14b | 9 GB | Primary alt |
 | Lyra (head) | qwen2.5:7b | 5 GB | Fits in VRAM alone — fastest fallback |
 | Lyra (head) | deepseek-r1:8b | 5 GB | Reasoning tasks |
@@ -391,8 +475,9 @@ Gateway overwrites `skills.json` on startup. **Fix:** `_write_skill_file()` call
 ~\.openclaw\openclaw.json                           Main config
 ~\.openclaw\gateway.cmd                             Gateway starter (TZ + tokens)
 ~\.openclaw\machine_role.json                       Role + head IP + SearXNG URL
-~\.openclaw\workers.json                            Unified agent registry (all types)
-~\.openclaw\workspace\SOUL.md                       LYRA behavior rules + Agent Registry
+~\.openclaw\undici-timeout-preload.cjs             undici 300s timeout patch (auto-written by Apply fixes)
+~\.openclaw\workers.json                            Unified agent registry (all types + delegation rules)
+~\.openclaw\workspace\SOUL.md                       LYRA behavior rules + Agent Registry + Delegation Rules
 ~\.openclaw\workspace\BOOTSTRAP.md                  Diagnostic knowledge base
 ~\.openclaw\workspace\FORCE-DELEGATE.md             Delegation constraints
 ~\.openclaw\workspace\memory\YYYY-MM-DD.md          LYRA self-learning entries
@@ -454,6 +539,9 @@ $entry = "[LEARNING] ${date}: text"
 
 # Variable before colon — WRONG (drive reference)
 $entry = "[LEARNING] $date: text"                     # ← FAILS
+
+# Read agent registry
+Get-Content $env:USERPROFILE\.openclaw\workers.json -Raw | ConvertFrom-Json
 ```
 
 ---
