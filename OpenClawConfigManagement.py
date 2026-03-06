@@ -611,15 +611,6 @@ class OpenClawConfig:
         API keys are masked (first 3 + last 3 chars visible).
         Called by _build_soul_content() and after every workers.json change.
         """
-        if not workers:
-            return (
-                "## Agent Registry\n\n"
-                "Keine Agenten konfiguriert.\n"
-                "Agenten können im Monitoring-Tab (📡) hinzugefügt werden.\n"
-                "Unterstützte Typen: worker (OpenClaw), ollama, openai, custom\n\n"
-                "---\n\n"
-            )
-
         def _mask(key: str) -> str:
             if not key or len(key) < 8:
                 return "***" if key else "(leer)"
@@ -628,29 +619,55 @@ class OpenClawConfig:
         def _base(a: dict) -> str:
             url = a.get("url", "").strip()
             if url:
-                return url if "://" in url else f"http://{url}"
+                return url if "://" in url else f"https://{url}"
             return f"http://{a.get('ip','?')}:{a.get('port', 18790)}"
 
         lines = ["## Agent Registry\n\n"]
+
+        # ── ERKENNUNGSREGEL (kritisch) ─────────────────────────────────────
         lines.append(
-            "Bekannte Agenten (aus workers.json — via Monitoring-Tab 📡 verwaltet):\n\n")
+            "WICHTIG: Externe Agenten und Worker werden NICHT über Gateway-APIs verwaltet.\n"
+            "Die Agent-Registry befindet sich ausschliesslich in:\n"
+            "  C:\\Users\\<user>\\.openclaw\\workers.json\n\n"
+            "REGEL: Wenn jemand fragt 'Prüfe deine Worker / Agenten / DeepSeek' —\n"
+            "  1. LESE workers.json (exec: Get-Content $env:USERPROFILE\\.openclaw\\workers.json)\n"
+            "  2. INTERPRETIERE den Typ-Eintrag:\n"
+            "     type=worker  → OpenClaw WorkerTaskServer (lokales Netzwerk, async)\n"
+            "     type=openai  → OpenAI-kompatibler API-Agent (extern, sync, API-Key nötig)\n"
+            "     type=ollama  → Remote Ollama (sync, kein API-Key)\n"
+            "     type=custom  → Beliebiger HTTP-Endpunkt\n"
+            "  3. NICHT: Gateway-API-Endpoints abfragen (/api/workers, /api/agents existieren NICHT)\n"
+            "  4. NICHT: Port 18791 prüfen (existiert nicht — HeadServer läuft auf 18790)\n\n"
+        )
+
+        if not workers:
+            lines.append(
+                "Keine Agenten konfiguriert.\n"
+                "Agenten können im Monitoring-Tab (📡) hinzugefügt werden.\n"
+                "Unterstützte Typen: worker (OpenClaw), ollama, openai, custom\n\n"
+                "---\n\n"
+            )
+            return "".join(lines)
+
+        lines.append(
+            f"Bekannte Agenten (aus workers.json — via Monitoring-Tab 📡 verwaltet):\n\n")
 
         # ── Per-agent summary ──────────────────────────────────────────────
-        workers_list   = [a for a in workers if a.get("type", "worker") == "worker"]
-        ollama_list    = [a for a in workers if a.get("type") == "ollama"]
-        openai_list    = [a for a in workers if a.get("type") == "openai"]
-        custom_list    = [a for a in workers if a.get("type") == "custom"]
+        workers_list = [a for a in workers if a.get("type", "worker") == "worker"]
+        ollama_list  = [a for a in workers if a.get("type") == "ollama"]
+        openai_list  = [a for a in workers if a.get("type") == "openai"]
+        custom_list  = [a for a in workers if a.get("type") == "custom"]
 
         for a in workers:
-            atype    = a.get("type", "worker")
-            name     = a.get("name", "?")
-            base     = _base(a)
-            role     = a.get("role", "?")
-            model    = a.get("model", "")
-            api_key  = a.get("api_key", "")
-            proto    = a.get("protocol", "openclaw")
-            model_str   = f"  model={model}"  if model   else ""
-            key_str     = f"  key={_mask(api_key)}" if api_key else ""
+            atype   = a.get("type", "worker")
+            name    = a.get("name", "?")
+            base    = _base(a)
+            role    = a.get("role", "?")
+            model   = a.get("model", "")
+            api_key = a.get("api_key", "")
+            proto   = a.get("protocol", "openclaw")
+            model_str = f"  model={model}" if model   else ""
+            key_str   = f"  key={_mask(api_key)}" if api_key else ""
             lines.append(
                 f"  [{atype}] {name}: {base}  ({role})"
                 f"  proto={proto}{model_str}{key_str}\n"
@@ -660,8 +677,8 @@ class OpenClawConfig:
 
         # ── PowerShell Beispiele — nur für OpenClaw worker ────────────────
         if workers_list:
-            w0  = workers_list[0]
-            b0  = _base(w0)
+            w0 = workers_list[0]
+            b0 = _base(w0)
             lines.append(
                 "DIREKTER WORKER-AUFRUF via exec (PowerShell, nur OpenClaw worker):\n\n"
                 f"Schritt 1 — Task senden:\n"
@@ -671,15 +688,9 @@ class OpenClawConfig:
                 f" -Body $body -ContentType \"application/json\"\n"
                 f"  $task_id = $r.task_id\n"
                 f"\n"
-                f"Schritt 2 — Auf Ergebnis warten (Polling, max 120s):\n"
-                f"  $result = $null\n"
-                f"  for ($i=0; $i -lt 60; $i++) {{\n"
-                f"    Start-Sleep 2\n"
-                f"    try {{\n"
-                f"      $result = Invoke-RestMethod \"{b0}/result/$task_id\"\n"
-                f"      break\n"
-                f"    }} catch {{ }}\n"
-                f"  }}\n"
+                f"Schritt 2 — Ergebnis wird automatisch an HEAD geliefert.\n"
+                f"  Worker postet Ergebnis an: http://127.0.0.1:18790/result\n"
+                f"  Abruf: Invoke-RestMethod \"http://127.0.0.1:18790/result/$task_id\"\n"
                 f"\n"
                 f"Schritt 3 — Summary ausgeben:\n"
                 f"  $result.result.summary\n\n"
@@ -687,40 +698,58 @@ class OpenClawConfig:
             if len(workers_list) > 1:
                 lines.append("Alle OpenClaw Worker:\n")
                 for w in workers_list:
-                    lines.append(
-                        f"  {w.get('name','?')}: {_base(w)}/tasks\n")
+                    lines.append(f"  {w.get('name','?')}: {_base(w)}/tasks\n")
                 lines.append("\n")
 
         # ── OpenAI-kompatible Agenten ─────────────────────────────────────
         if openai_list:
-            lines.append("OPENAI-KOMPATIBLE AGENTEN (POST /v1/chat/completions):\n")
+            lines.append("OPENAI-KOMPATIBLE AGENTEN:\n")
             for a in openai_list:
                 b   = _base(a)
-                mdl = a.get("model", "gpt-4o-mini")
+                mdl = a.get("model", "")
+                # base_url already contains /v1 if set correctly
+                chat_url = f"{b}/chat/completions"
                 lines.append(
-                    f"  {a.get('name','?')}: {b}/v1/chat/completions"
-                    f"  model={mdl}\n"
+                    f"  {a.get('name','?')}: {chat_url}  model={mdl}\n"
+                    f"    Health-Check: GET {b}/models\n"
+                    f"    Auth: Authorization: Bearer <api_key>\n"
                 )
             lines.append(
-                "  → Im Monitoring-Tab: Task type = 'chat (openai)'\n\n")
+                "  → Delegation: exec per PowerShell ODER Monitoring-Tab → 'chat (openai)'\n"
+                "  → NICHT über Gateway-API — direkt per HTTP an den Agenten\n\n"
+            )
 
         # ── Ollama-Agenten ────────────────────────────────────────────────
         if ollama_list:
-            lines.append("OLLAMA-AGENTEN (POST /api/chat):\n")
+            lines.append("OLLAMA-AGENTEN:\n")
             for a in ollama_list:
                 b   = _base(a)
                 mdl = a.get("model", "qwen2.5:7b")
                 lines.append(
-                    f"  {a.get('name','?')}: {b}/api/chat  model={mdl}\n")
+                    f"  {a.get('name','?')}: {b}/api/chat  model={mdl}\n"
+                    f"    Health-Check: GET {b}/api/tags\n"
+                )
             lines.append(
-                "  → Im Monitoring-Tab: Task type = 'chat (ollama)'\n\n")
+                "  → Monitoring-Tab → 'chat (ollama)'\n\n")
+
+        # ── Custom ────────────────────────────────────────────────────────
+        if custom_list:
+            lines.append("CUSTOM-AGENTEN:\n")
+            for a in custom_list:
+                lines.append(
+                    f"  {a.get('name','?')}: {_base(a)}  "
+                    f"model={a.get('model','')}  proto={a.get('protocol','?')}\n"
+                )
+            lines.append("\n")
 
         lines.append(
             "REGEL: Vor Task-Delegation immer Health-Check:\n"
-            "  worker → GET /health  (erwartet: {role, port})\n"
-            "  ollama → GET /api/tags (erwartet: {models:[...]})\n"
-            "  openai → GET /v1/models (erwartet: {data:[...]})\n"
-            "REGEL: Wenn Agent nicht erreichbar → Fallback auf delegate_to_worker Tool.\n"
+            "  worker → GET <ip:port>/health         erwartet: {role, port}\n"
+            "  ollama → GET <url>/api/tags            erwartet: {models:[...]}\n"
+            "  openai → GET <base_url>/models         erwartet: {data:[...]}\n"
+            "REGEL: Agent nicht erreichbar → Fallback auf delegate_to_worker Tool.\n"
+            "REGEL: workers.json ist die einzige Quelle für Agent-Information.\n"
+            "       Gateway-Endpoints /api/workers, /api/agents existieren NICHT.\n"
             "\n---\n\n"
         )
         return "".join(lines)
