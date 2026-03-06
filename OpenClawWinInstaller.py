@@ -508,7 +508,9 @@ class OpenClawWinInstaller(OpenClawOperations):
                 log_fn   = self.log,
                 root     = self.root,
             )
-            self.monitoring.build()
+            self.monitoring.build(
+                head_server = getattr(self, "_head_server", None)
+            )
         else:
             self._build_worker_tab(frame, role, head or "")
 
@@ -1087,6 +1089,9 @@ class OpenClawWinInstaller(OpenClawOperations):
             self.log(
                 f"[TaskSrv] Already running on port {LYRA_HEAD_PORT} (auto-start skipped)",
                 "INFO")
+        # Register on_result_callback with MonitoringTab (idempotent)
+        if hasattr(self, "monitoring"):
+            self.monitoring.register_head_server(self._head_server)
         # Update status label if Lyra Config tab is already built
         if hasattr(self, "_ts_status"):
             self._ts_status.config(
@@ -1095,6 +1100,25 @@ class OpenClawWinInstaller(OpenClawOperations):
             )
         else:
             self.log(f"[TaskSrv] Start failed – port {LYRA_HEAD_PORT} in use?", "ERROR")
+
+    def _load_searxng_url_from_role(self) -> str:
+        """
+        Read searxng_url from machine_role.json.
+        Used by _build_worker_tab() to pre-fill the SearXNG URL field.
+        Returns default 'http://127.0.0.1:8080' if not found.
+        """
+        try:
+            role_file = os.path.join(
+                os.path.expanduser("~"), ".openclaw", "machine_role.json")
+            if os.path.isfile(role_file):
+                with open(role_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                url = data.get("searxng_url", "")
+                if url:
+                    return url
+        except Exception:
+            pass
+        return "http://127.0.0.1:8080"
 
     def _check_searxng(self, status_label, base_url: str = "http://127.0.0.1:8080"):
         base_url = base_url.rstrip("/").replace("//localhost:", "//127.0.0.1:")

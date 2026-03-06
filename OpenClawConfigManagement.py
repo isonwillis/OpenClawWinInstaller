@@ -606,71 +606,121 @@ class OpenClawConfig:
 
     def _build_worker_soul_section(self, workers: list) -> str:
         """
-        Generates the ## Worker Registry SOUL.md section.
+        Generates the ## Agent Registry SOUL.md section.
+        Handles unified agent list: worker, ollama, openai, custom types.
+        API keys are masked (first 3 + last 3 chars visible).
         Called by _build_soul_content() and after every workers.json change.
         """
         if not workers:
             return (
-                "## Worker Registry\n\n"
-                "Keine Worker konfiguriert.\n"
-                "Worker können im Monitoring-Tab hinzugefügt werden.\n\n"
+                "## Agent Registry\n\n"
+                "Keine Agenten konfiguriert.\n"
+                "Agenten können im Monitoring-Tab (📡) hinzugefügt werden.\n"
+                "Unterstützte Typen: worker (OpenClaw), ollama, openai, custom\n\n"
                 "---\n\n"
             )
 
-        lines = ["## Worker Registry\n\n"]
-        lines.append("Bekannte Worker (aus workers.json — via Monitoring-Tab verwaltet):\n\n")
-        for w in workers:
-            ip   = w.get("ip", "?")
-            port = w.get("port", 18790)
-            name = w.get("name", f"Worker-{ip}")
-            role = w.get("role", "Junior")
-            lines.append(f"  {name}: {ip}:{port}  ({role})\n")
+        def _mask(key: str) -> str:
+            if not key or len(key) < 8:
+                return "***" if key else "(leer)"
+            return f"{key[:3]}***\u2026***{key[-3:]}"
 
-        lines.append(
-            "\n"
-            "DIREKTER WORKER-AUFRUF via exec (PowerShell):\n\n"
-        )
-        # Use first worker as example
-        w0   = workers[0]
-        ip0  = w0.get("ip", "192.168.2.102")
-        p0   = w0.get("port", 18790)
-        lines.append(
-            f"Schritt 1 — Task senden:\n"
-            f"  $body = '{{\"type\":\"web_search\",\"payload\":{{\"query\":\"DEINE SUCHANFRAGE\"}}}}'\n"
-            f"  $r = Invoke-RestMethod -Method POST"
-            f" -Uri \"http://{ip0}:{p0}/tasks\""
-            f" -Body $body -ContentType \"application/json\"\n"
-            f"  $task_id = $r.task_id\n"
-            f"\n"
-            f"Schritt 2 — Auf Ergebnis warten (Polling, max 120s):\n"
-            f"  $result = $null\n"
-            f"  for ($i=0; $i -lt 60; $i++) {{\n"
-            f"    Start-Sleep 2\n"
-            f"    try {{\n"
-            f"      $result = Invoke-RestMethod \"http://{ip0}:{p0}/result/$task_id\"\n"
-            f"      break\n"
-            f"    }} catch {{ }}\n"
-            f"  }}\n"
-            f"\n"
-            f"Schritt 3 — Summary ausgeben:\n"
-            f"  $result.result.summary\n"
-            f"\n"
-        )
+        def _base(a: dict) -> str:
+            url = a.get("url", "").strip()
+            if url:
+                return url if "://" in url else f"http://{url}"
+            return f"http://{a.get('ip','?')}:{a.get('port', 18790)}"
 
-        # All workers table for multi-worker selection
-        if len(workers) > 1:
-            lines.append("Alle Worker für Task-Verteilung:\n")
-            for w in workers:
+        lines = ["## Agent Registry\n\n"]
+        lines.append(
+            "Bekannte Agenten (aus workers.json — via Monitoring-Tab 📡 verwaltet):\n\n")
+
+        # ── Per-agent summary ──────────────────────────────────────────────
+        workers_list   = [a for a in workers if a.get("type", "worker") == "worker"]
+        ollama_list    = [a for a in workers if a.get("type") == "ollama"]
+        openai_list    = [a for a in workers if a.get("type") == "openai"]
+        custom_list    = [a for a in workers if a.get("type") == "custom"]
+
+        for a in workers:
+            atype    = a.get("type", "worker")
+            name     = a.get("name", "?")
+            base     = _base(a)
+            role     = a.get("role", "?")
+            model    = a.get("model", "")
+            api_key  = a.get("api_key", "")
+            proto    = a.get("protocol", "openclaw")
+            model_str   = f"  model={model}"  if model   else ""
+            key_str     = f"  key={_mask(api_key)}" if api_key else ""
+            lines.append(
+                f"  [{atype}] {name}: {base}  ({role})"
+                f"  proto={proto}{model_str}{key_str}\n"
+            )
+
+        lines.append("\n")
+
+        # ── PowerShell Beispiele — nur für OpenClaw worker ────────────────
+        if workers_list:
+            w0  = workers_list[0]
+            b0  = _base(w0)
+            lines.append(
+                "DIREKTER WORKER-AUFRUF via exec (PowerShell, nur OpenClaw worker):\n\n"
+                f"Schritt 1 — Task senden:\n"
+                f"  $body = '{{\"type\":\"web_search\",\"payload\":{{\"query\":\"DEINE SUCHANFRAGE\"}}}}'\n"
+                f"  $r = Invoke-RestMethod -Method POST"
+                f" -Uri \"{b0}/tasks\""
+                f" -Body $body -ContentType \"application/json\"\n"
+                f"  $task_id = $r.task_id\n"
+                f"\n"
+                f"Schritt 2 — Auf Ergebnis warten (Polling, max 120s):\n"
+                f"  $result = $null\n"
+                f"  for ($i=0; $i -lt 60; $i++) {{\n"
+                f"    Start-Sleep 2\n"
+                f"    try {{\n"
+                f"      $result = Invoke-RestMethod \"{b0}/result/$task_id\"\n"
+                f"      break\n"
+                f"    }} catch {{ }}\n"
+                f"  }}\n"
+                f"\n"
+                f"Schritt 3 — Summary ausgeben:\n"
+                f"  $result.result.summary\n\n"
+            )
+            if len(workers_list) > 1:
+                lines.append("Alle OpenClaw Worker:\n")
+                for w in workers_list:
+                    lines.append(
+                        f"  {w.get('name','?')}: {_base(w)}/tasks\n")
+                lines.append("\n")
+
+        # ── OpenAI-kompatible Agenten ─────────────────────────────────────
+        if openai_list:
+            lines.append("OPENAI-KOMPATIBLE AGENTEN (POST /v1/chat/completions):\n")
+            for a in openai_list:
+                b   = _base(a)
+                mdl = a.get("model", "gpt-4o-mini")
                 lines.append(
-                    f"  {w.get('name','?')}: "
-                    f"http://{w.get('ip','?')}:{w.get('port',18790)}/tasks\n"
+                    f"  {a.get('name','?')}: {b}/v1/chat/completions"
+                    f"  model={mdl}\n"
                 )
-            lines.append("\n")
+            lines.append(
+                "  → Im Monitoring-Tab: Task type = 'chat (openai)'\n\n")
+
+        # ── Ollama-Agenten ────────────────────────────────────────────────
+        if ollama_list:
+            lines.append("OLLAMA-AGENTEN (POST /api/chat):\n")
+            for a in ollama_list:
+                b   = _base(a)
+                mdl = a.get("model", "qwen2.5:7b")
+                lines.append(
+                    f"  {a.get('name','?')}: {b}/api/chat  model={mdl}\n")
+            lines.append(
+                "  → Im Monitoring-Tab: Task type = 'chat (ollama)'\n\n")
 
         lines.append(
-            "REGEL: Für web_search und batch_exec IMMER zuerst Worker prüfen "
-            "(GET /health) bevor Task gesendet wird.\n"
-            "REGEL: Wenn Worker nicht erreichbar → Fallback auf delegate_to_worker Tool.\n"
+            "REGEL: Vor Task-Delegation immer Health-Check:\n"
+            "  worker → GET /health  (erwartet: {role, port})\n"
+            "  ollama → GET /api/tags (erwartet: {models:[...]})\n"
+            "  openai → GET /v1/models (erwartet: {data:[...]})\n"
+            "REGEL: Wenn Agent nicht erreichbar → Fallback auf delegate_to_worker Tool.\n"
             "\n---\n\n"
         )
         return "".join(lines)
@@ -2579,6 +2629,11 @@ class LyraHeadServer:
         self._results = []      # completed tasks (max 100)
         self._server  = None
         self._thread  = None
+        # Optional callback: called with result dict when a worker posts a result.
+        # Used by MonitoringTab for auto-display without polling.
+        # Signature: on_result_callback(result: dict) — called from server thread,
+        # so GUI code must schedule via root.after(0, ...).
+        self.on_result_callback = None
 
     def add_task(self, task_type: str, payload: dict) -> str:
         """Adds a task to the queue. Returns task_id."""
@@ -2655,7 +2710,7 @@ class LyraHeadServer:
                     return {}
 
             def do_GET(self):
-                """Handle GET requests: /health, /tasks, /results"""
+                """Handle GET requests: /health, /tasks, /result/<id>, /results"""
                 path = self.path.split("?")[0]
                 if path == "/health":
                     self._send_json({"status": "ok", "role": "Lyra",
@@ -2666,8 +2721,19 @@ class LyraHeadServer:
                     self._send_json({"tasks": tasks_copy})
                 elif path == "/results":
                     with server_ref._lock:
-                        res_copy = list(server_ref._results.values())[-100:]
+                        # _results is a list — NOT a dict, no .values()
+                        res_copy = list(server_ref._results)[-100:]
                     self._send_json({"results": res_copy})
+                elif path.startswith("/result/"):
+                    task_id = path[len("/result/"):]
+                    with server_ref._lock:
+                        match = next(
+                            (r for r in server_ref._results
+                             if r.get("task_id") == task_id), None)
+                    if match:
+                        self._send_json(match)
+                    else:
+                        self._send_json({"error": "not found"}, 404)
                 else:
                     self._send_json({"error": "not found"}, 404)
 
@@ -2736,6 +2802,15 @@ class LyraHeadServer:
                         f"[HeadSrv] Result received: {task_id} "
                         f"({result['status']}) from {self.client_address[0]} "
                         f"(removed {removed_count} tasks)", "SUCCESS")
+
+                    # Notify MonitoringTab (or any listener) — non-blocking
+                    cb = server_ref.on_result_callback
+                    if cb is not None:
+                        try:
+                            cb(result)
+                        except Exception as e:
+                            server_ref.log(
+                                f"[HeadSrv] on_result_callback error: {e}", "WARNING")
 
                     try:
                         self._send_json({"integrated": True})
