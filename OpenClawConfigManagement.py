@@ -671,12 +671,19 @@ class OpenClawConfig:
             model   = a.get("model", "")
             api_key = a.get("api_key", "")
             proto   = a.get("protocol", "openclaw")
+            rules   = a.get("delegation_rules", "").strip()
             model_str = f"  model={model}" if model   else ""
             key_str   = f"  key={_mask(api_key)}" if api_key else ""
             lines.append(
                 f"  [{atype}] {name}: {base}  ({role})"
                 f"  proto={proto}{model_str}{key_str}\n"
             )
+            if rules:
+                for rule_line in rules.splitlines():
+                    if rule_line.strip():
+                        lines.append(f"    DELEGATION-REGEL: {rule_line.strip()}\n")
+            else:
+                lines.append(f"    DELEGATION-REGEL: (keine definiert — immer verfügbar)\n")
 
         lines.append("\n")
 
@@ -1506,22 +1513,23 @@ if hw_profile else ""
 "\n"
 "## Session-Start-Checkliste\n"
 "\n"
-"PFLICHT vor dem Akzeptieren von Memory als Wahrheit:\n"
+"PRIORITÄT: Zuerst den Task des Users ausführen. Diagnose ist sekundär.\n"
+"\n"
+"REIHENFOLGE:\n"
+"  1. Task des Users verstehen und ausführen\n"
+"  2. Gateway/Ollama-Status prüfen (nur wenn relevant für den Task)\n"
+"  3. delegate_to_worker.js NUR prüfen wenn eine Delegation geplant ist\n"
 "\n"
 "```powershell\n"
-"# 1. Skills auf Disk prüfen (NICHT Memory vertrauen)\n"
-"Get-ChildItem \"$HOME/.openclaw/skills\" -Filter \"*.js\"\n"
-"# Erwartetes Ergebnis: delegate_to_worker.js\n"
-"# Wenn fehlend: Installer ausführen oder Skill manuell kopieren.\n"
-"\n"
-"# 2. Gateway-Status prüfen\n"
+"# Gateway-Status (nur wenn relevant)\n"
 "Invoke-RestMethod http://127.0.0.1:18789/api/health | ConvertTo-Json\n"
 "\n"
-"# 3. Ollama-Status prüfen\n"
+"# Ollama-Status (nur wenn relevant)\n"
 "Invoke-RestMethod http://127.0.0.1:11434/api/tags | ConvertTo-Json\n"
 "```\n"
 "\n"
-"Reihenfolge: Memory lesen (nur als Kontext) → Disk verifizieren → [CORRECTION] schreiben wenn Abweichung → Aufgabe beginnen.\n"
+"Disk vs. Memory: exec output > Memory. Bei Abweichung [CORRECTION] schreiben.\n"
+"NIEMALS: Checkliste als Grund verwenden den Task des Users zu blockieren oder zu verschieben.\n"
 "\n"
 "---\n"
 "\n"
@@ -1533,11 +1541,11 @@ if hw_profile else ""
 "Wenn diese Datei existiert → Skills sind VOLLSTÄNDIG. Nichts fehlt. Nichts zu aktivieren.\n"
 "NICHT versuchen weitere Skills zu installieren oder zu erstellen ausser der User fragt explizit.\n"
 "\n"
-"⚠️ WENN delegate_to_worker.js FEHLT:\n"
-"  → Das ist ein FEHLER, kein normaler Zustand.\n"
-"  → NICHT als 'Fallback aktiv' oder 'SearXNG übernimmt' beschreiben.\n"
-"  → User informieren: 'delegate_to_worker.js fehlt — Installer ausführen oder Apply-fixes-Button klicken.'\n"
-"  → Fallback-Kette NUR als Notlösung bis zum Fix, nicht als Dauerzustand.\n"
+"⚠️ WENN delegate_to_worker.js FEHLT — und eine Delegation geplant ist:\n"
+"  → Zuerst den aktuellen Task ausführen (lesen, analysieren, berichten, chatten — alles normal).\n"
+"  → Am Ende der Antwort EINZEILIG vermerken: '⚠️ delegate_to_worker.js fehlt — Apply-fixes klicken.'\n"
+"  → KEIN separater Fehlerbericht. KEIN Blockieren. KEIN 'ich kann nicht'.\n"
+"  → NUR Delegation via delegate_to_worker Tool ist eingeschränkt — nichts sonst.\n"
 "\n"
 "---\n"
 "\n"

@@ -1,5 +1,5 @@
 """
-OpenClawAgentMonitoring.py  –  v1.0.4
+OpenClawAgentMonitoring.py  –  v1.0.5
 ======================================
 Agent Monitoring & Management Module — Lyra (Head) only.
 
@@ -82,11 +82,11 @@ def _diag_api(url: str, timeout: int = 8,
     for _ in range(5):
         try:
             body_bytes = json.dumps(data).encode("utf-8") if data else None
-            headers = ({"User-Agent": "LyraMonitor/1.0.4",
+            headers = ({"User-Agent": "LyraMonitor/1.0.5",
                         "Accept": "application/json, text/html, */*"}
                        if method == "GET" else
                        {"Content-Type": "application/json",
-                        "User-Agent": "LyraMonitor/1.0.4"})
+                        "User-Agent": "LyraMonitor/1.0.5"})
             if api_key:
                 headers["Authorization"] = f"Bearer {api_key}"
             req = urllib.request.Request(
@@ -406,6 +406,8 @@ class MonitoringTab:
         self._reg_save_btn = ttk.Button(r7, text="💾 Save / Update",
                    command=self._add_agent)
         self._reg_save_btn.pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(r7, text="📋 Edit Rules",
+                   command=self._open_rules_editor).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(r7, text="🗑 Remove selected",
                    command=self._remove_agent).pack(side=tk.LEFT, padx=(6, 0))
 
@@ -693,6 +695,127 @@ class MonitoringTab:
         if hasattr(self, "_reg_save_btn"):
             self._reg_save_btn.config(text="💾 Update Agent")
 
+    def _open_rules_editor(self):
+        """
+        Opens a Toplevel editor for the selected agent's delegation_rules.
+
+        delegation_rules is a free-text field stored in workers.json that tells
+        LYRA WHEN to automatically delegate to this agent:
+          - Trigger conditions (e.g. "when user asks about weather")
+          - Priority / preference over other agents
+          - Task types this agent is best suited for
+          - Constraints (e.g. "only for tasks > 500 tokens")
+
+        The field is written to SOUL.md Agent Registry so LYRA reads it
+        on every session start and applies it as a delegation policy.
+        """
+        sel = self._reg_list.curselection()
+        if not sel:
+            import tkinter.messagebox as mb
+            mb.showwarning("No agent selected",
+                           "Please select an agent from the list first.",
+                           parent=self._root)
+            return
+        idx = sel[0]
+        if idx >= len(self._agents):
+            return
+        agent = self._agents[idx]
+        name  = agent.get("name", "Agent")
+
+        # ── Toplevel window ───────────────────────────────────────────────
+        win = tk.Toplevel(self._root)
+        win.title(f"📋 Delegation Rules — {name}")
+        win.geometry("620x480")
+        win.resizable(True, True)
+        win.grab_set()  # modal
+
+        # Header
+        ttk.Label(win,
+                  text=f"Delegation Rules for: {name}",
+                  font=("Arial", 11, "bold")).pack(anchor=tk.W, padx=12, pady=(12, 2))
+        ttk.Label(win,
+                  text="Define WHEN LYRA should automatically delegate tasks to this agent.\n"
+                       "Written to SOUL.md — LYRA reads and applies these rules each session.",
+                  font=("Arial", 9), foreground="#555555",
+                  wraplength=590, justify=tk.LEFT).pack(anchor=tk.W, padx=12, pady=(0, 8))
+
+        # Agent info strip
+        info_frame = ttk.Frame(win, relief="groove", padding="6")
+        info_frame.pack(fill=tk.X, padx=12, pady=(0, 8))
+        atype = agent.get("type", "worker")
+        model = agent.get("model", "")
+        base  = _agent_base_url(agent)
+        info_text = (f"Type: {atype}  |  Protocol: {agent.get('protocol','?')}  |  "
+                     f"URL: {base}")
+        if model:
+            info_text += f"  |  Model: {model}"
+        ttk.Label(info_frame, text=info_text,
+                  font=("Courier", 9), foreground="#333333").pack(anchor=tk.W)
+
+        # Placeholder hint
+        placeholder = (
+            "Examples:\n"
+            "- Delegate all web_search tasks to this agent\n"
+            "- Use for reasoning tasks (math, logic, code review)\n"
+            "- Prefer this agent when query contains: weather, news, current events\n"
+            "- Only use when local Ollama is unavailable\n"
+            "- Priority: 1 (highest) — use before other agents of the same type\n"
+            "- Max task size: any / only short queries (<200 words)\n"
+            "- Language preference: German queries"
+        )
+
+        # Rules text area
+        text_frame = ttk.Frame(win)
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 8))
+        rules_box = tk.Text(text_frame, font=("Arial", 10), wrap=tk.WORD,
+                            relief="solid", borderwidth=1)
+        rules_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb = ttk.Scrollbar(text_frame, command=rules_box.yview)
+        rules_box.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Load existing rules or show placeholder
+        existing = agent.get("delegation_rules", "")
+        if existing:
+            rules_box.insert("1.0", existing)
+        else:
+            rules_box.insert("1.0", placeholder)
+            rules_box.config(foreground="#aaaaaa")
+
+            def _clear_placeholder(event):
+                if rules_box.cget("foreground") == "#aaaaaa":
+                    rules_box.delete("1.0", tk.END)
+                    rules_box.config(foreground="#000000")
+            rules_box.bind("<FocusIn>", _clear_placeholder)
+
+        # Buttons
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(fill=tk.X, padx=12, pady=(0, 12))
+
+        def _save_rules():
+            rules_text = rules_box.get("1.0", tk.END).strip()
+            # Don't save the placeholder text
+            if rules_text == placeholder.strip():
+                rules_text = ""
+            self._agents[idx]["delegation_rules"] = rules_text
+            self._cfg.save_workers(self._agents)
+            self._save_and_update_soul()
+            self._log(
+                f"[Monitor] Delegation rules saved for {name} "
+                f"({len(rules_text)} chars)", "SUCCESS")
+            win.destroy()
+
+        def _clear_rules():
+            rules_box.delete("1.0", tk.END)
+            rules_box.config(foreground="#000000")
+
+        ttk.Button(btn_frame, text="💾 Save Rules",
+                   command=_save_rules).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text="🗑 Clear",
+                   command=_clear_rules).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(btn_frame, text="✖ Cancel",
+                   command=win.destroy).pack(side=tk.RIGHT)
+
     def _check_agent(self):
         a       = self._collect_form()
         atype   = a["type"]
@@ -732,6 +855,8 @@ class MonitoringTab:
         base  = _agent_base_url(entry)
         for i, a in enumerate(self._agents):
             if _agent_base_url(a) == base:
+                # Preserve delegation_rules — not in the form, only editable via Edit Rules
+                entry["delegation_rules"] = a.get("delegation_rules", "")
                 self._agents[i] = entry
                 label = self._agent_label(entry, "??")
                 self._set_list_item(i, label, None)
