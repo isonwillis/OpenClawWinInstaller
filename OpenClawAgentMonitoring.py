@@ -725,7 +725,7 @@ class MonitoringTab:
         # ── Toplevel window ───────────────────────────────────────────────
         win = tk.Toplevel(self._root)
         win.title(f"📋 Delegation Rules — {name}")
-        win.geometry("620x480")
+        win.geometry("580x340")
         win.resizable(True, True)
         win.grab_set()  # modal
 
@@ -753,8 +753,7 @@ class MonitoringTab:
                   font=("Courier", 9), foreground="#333333").pack(anchor=tk.W)
 
         # Placeholder hint
-        placeholder = (
-            "Examples:\n"
+        default_rules = (
             "- Delegate all web_search tasks to this agent\n"
             "- Use for reasoning tasks (math, logic, code review)\n"
             "- Prefer this agent when query contains: weather, news, current events\n"
@@ -764,39 +763,12 @@ class MonitoringTab:
             "- Language preference: German queries"
         )
 
-        # Rules text area
-        text_frame = ttk.Frame(win)
-        text_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 8))
-        rules_box = tk.Text(text_frame, font=("Arial", 10), wrap=tk.WORD,
-                            relief="solid", borderwidth=1)
-        rules_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        sb = ttk.Scrollbar(text_frame, command=rules_box.yview)
-        rules_box.configure(yscrollcommand=sb.set)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # Load existing rules or show placeholder
-        existing = agent.get("delegation_rules", "")
-        if existing:
-            rules_box.insert("1.0", existing)
-        else:
-            rules_box.insert("1.0", placeholder)
-            rules_box.config(foreground="#aaaaaa")
-
-            def _clear_placeholder(event):
-                if rules_box.cget("foreground") == "#aaaaaa":
-                    rules_box.delete("1.0", tk.END)
-                    rules_box.config(foreground="#000000")
-            rules_box.bind("<FocusIn>", _clear_placeholder)
-
-        # Buttons
+        # Buttons — packed BEFORE text area so always visible regardless of window height
         btn_frame = ttk.Frame(win)
-        btn_frame.pack(fill=tk.X, padx=12, pady=(0, 12))
+        btn_frame.pack(fill=tk.X, padx=12, pady=(0, 10), side=tk.BOTTOM)
 
         def _save_rules():
             rules_text = rules_box.get("1.0", tk.END).strip()
-            # Don't save the placeholder text
-            if rules_text == placeholder.strip():
-                rules_text = ""
             self._agents[idx]["delegation_rules"] = rules_text
             self._cfg.save_workers(self._agents)
             self._save_and_update_soul()
@@ -815,6 +787,20 @@ class MonitoringTab:
                    command=_clear_rules).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(btn_frame, text="✖ Cancel",
                    command=win.destroy).pack(side=tk.RIGHT)
+
+        # Rules text area — expands to fill remaining space
+        text_frame = ttk.Frame(win)
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 4))
+        rules_box = tk.Text(text_frame, font=("Arial", 10), wrap=tk.WORD,
+                            relief="solid", borderwidth=1)
+        rules_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb = ttk.Scrollbar(text_frame, command=rules_box.yview)
+        rules_box.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Load existing rules — if none yet, pre-fill with editable example
+        existing = agent.get("delegation_rules", "").strip()
+        rules_box.insert("1.0", existing if existing else default_rules)
 
     def _check_agent(self):
         a       = self._collect_form()
