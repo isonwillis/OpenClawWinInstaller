@@ -546,6 +546,20 @@ Get-Content $env:USERPROFILE\.openclaw\workers.json -Raw | ConvertFrom-Json
 
 ---
 
+## 🧬 LYRA Creates — DNARusher
+
+LYRA independently conceived and fully implemented her first open-source project: **DNARusher**, a Python library for DNA pattern recognition in noisy sequences.
+
+No template. No step-by-step instruction. From the project name to the finished GitHub README — her work.
+
+She chose a meaningful name that was still available, selected a real scientific domain (bioinformatics / DNA sequence analysis), designed a clean two-class architecture with full type annotations, and authored both the library and its documentation consistently and completely.
+
+She signed it herself: *"Made with ❤️ by Lyra AI"*
+
+→ **[github.com/isonwillis/dnarusher](https://github.com/isonwillis/dnarusher)**
+
+---
+
 ## License
 
 Private, non-commercial hobby project.
