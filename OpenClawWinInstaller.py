@@ -1769,15 +1769,38 @@ class OpenClawWinInstaller(OpenClawOperations):
         self.cfg._status_cb = lambda **kw: None  # reset after use
 
     def _set_secondary_llm(self):
-        """Write the selected secondary (fallback) model to openclaw.json."""
+        """Write the selected secondary (fallback) model to openclaw.json.
+        
+        The secondary model is stored as the first entry in the fallbacks list.
+        If the selected model equals the primary model, an error is shown
+        because primary and secondary must be different models.
+        
+        After successfully setting the model, the model list is refreshed
+        to show the updated configuration.
+        """
         model = self._llm_secondary_var.get().strip()
         if not model:
             self._llm_set_status.config(text="⚠ No model selected.", foreground="orange")
             return
+        
+        # Check if secondary equals primary (not allowed)
+        primary = self._llm_primary_var.get().strip()
+        if model == primary:
+            self._llm_set_status.config(
+                text="⚠ Secondary cannot be the same as Primary model!", 
+                foreground="orange"
+            )
+            return
+        
         # Inject status callback so cfg can update the label directly (v1.0.1)
         self.cfg._status_cb = self._llm_set_status.config
         self.cfg._write_llm_to_config(secondary=model)
-        self.cfg._status_cb = lambda **kw: None  # reset after use
+        
+        # Refresh the model list to show updated configuration
+        self._refresh_ollama_models()
+        
+        # Reset status callback
+        self.cfg._status_cb = lambda **kw: None
 
     def _pull_ollama_model(self):
         """Pull an Ollama model in a background thread with live log output.

@@ -1451,12 +1451,16 @@ class OpenClawConfig:
 
         Role detection (v1.0.0 fix):
           is_head is read from machine_role.json at call time — NOT from the
-          attribute self.machine_role.  The RAM attribute is unreliable because
-          _install_worker_mode() sets self.machine_role.  Reading the file directly
+          attribute self.machine_role. The RAM attribute is unreliable because
+          _install_worker_mode() sets self.machine_role. Reading the file directly
           ensures the correct value even when called from nested callbacks.
 
         ⚠️  DECISION #2: auth-profiles.json model field must NOT have "ollama/" prefix.
         Strip it here before writing.
+        
+        ⚠️  DECISION #22: Secondary model is stored as the first fallback in
+        agents.defaults.model.fallbacks[0]. The list is limited to 3 entries max
+        and duplicates are automatically removed.
         """
         cfg_dir = self._find_openclaw_config_dir()
 
@@ -1496,26 +1500,57 @@ class OpenClawConfig:
             changed = True
             self._log("  Stripped rejected key: agents.defaults.runTimeoutSeconds", "INFO")
 
+        # ── Set primary model ─────────────────────────────────────────────────
         if primary:
             p = primary if primary.startswith("ollama/") else f"ollama/{primary}"
             try:
+                cfg.setdefault("agents", {}).setdefault("defaults", {})
+                cfg["agents"]["defaults"].setdefault("model", {})
                 cfg["agents"]["defaults"]["model"]["primary"] = p
                 changed = True
                 self._log(f"  Primary LLM → {p}", "INFO")
             except (KeyError, TypeError) as e:
                 self._log(f"  Primary LLM set failed: {e}", "WARNING")
 
+        # ── Set secondary model (as first fallback) ───────────────────────────
         if secondary:
             s = secondary if secondary.startswith("ollama/") else f"ollama/{secondary}"
             try:
-                fallbacks = cfg["agents"]["defaults"]["model"].setdefault("fallbacks", [])
-                if s not in fallbacks:
-                    fallbacks.insert(0, s)
+                # Ensure the nested structure exists
+                cfg.setdefault("agents", {}).setdefault("defaults", {})
+                cfg["agents"]["defaults"].setdefault("model", {})
+                
+                # Get current fallbacks or create new list
+                fallbacks = cfg["agents"]["defaults"]["model"].get("fallbacks", [])
+                
+                # If fallbacks exist, replace the first one (secondary)
+                # otherwise create new list with the secondary
+                if fallbacks and len(fallbacks) > 0:
+                    fallbacks[0] = s
+                else:
+                    fallbacks = [s]
+                
+                # Remove duplicates (keep only the first occurrence)
+                # This prevents the same model appearing multiple times
+                unique_fallbacks = []
+                for f in fallbacks:
+                    if f not in unique_fallbacks:
+                        unique_fallbacks.append(f)
+                
+                # Limit to maximum 3 fallbacks (OpenClaw best practice)
+                if len(unique_fallbacks) > 3:
+                    unique_fallbacks = unique_fallbacks[:3]
+                    self._log(f"  Limited fallbacks to 3 entries (OpenClaw best practice)", "INFO")
+                
+                # Save back to config
+                cfg["agents"]["defaults"]["model"]["fallbacks"] = unique_fallbacks
                 changed = True
-                self._log(f"  Secondary LLM → {s}", "INFO")
+                self._log(f"  Secondary LLM → {s} (fallbacks: {unique_fallbacks})", "INFO")
+                
             except (KeyError, TypeError) as e:
                 self._log(f"  Secondary LLM set failed: {e}", "WARNING")
 
+        # ── Apply additional fixes if anything changed ────────────────────────
         if changed:
             # DECISION #9 (v1.0.1): ensure critical fields are always correct,
             # DECISION #3 updated v1.0.4: Default timeoutSeconds = 7200 (2h).
@@ -1543,6 +1578,7 @@ class OpenClawConfig:
             except Exception:
                 pass
 
+            # Create backup and write updated config
             backup = cfg_path + f".bak_{int(time.time())}"
             shutil.copy2(cfg_path, backup)
             with open(cfg_path, "w", encoding="utf-8", newline="\n") as f:
