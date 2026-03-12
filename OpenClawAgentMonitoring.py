@@ -134,6 +134,12 @@ def _agent_base_url(agent: dict) -> str:
         → always includes port to avoid http://192.168.x.x (portless) bug
 
     Backward-compatible with old-format entries that only have 'ip' + 'port'.
+    
+    WICHTIG für Worker-Tasks:
+    - Tasks senden:   http://<worker-ip>:<port>/tasks
+    - Ergebnisse:     http://127.0.0.1:18790/result/<task_id>
+                      (NICHT beim Worker abrufen! Der Worker sendet Ergebnisse
+                      automatisch an den HEAD zurück, wo sie lokal gespeichert werden)
     """
     url  = agent.get("url", "").strip()
     ip   = agent.get("ip",  "").strip()

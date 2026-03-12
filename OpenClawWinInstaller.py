@@ -953,6 +953,16 @@ class OpenClawWinInstaller(OpenClawOperations):
                        "appear in the Log tab (Tab 0 \u2190).",
                   font=("Arial", 9), justify=tk.LEFT).pack(anchor=tk.W)
 
+        # ── Ergebnis-Hinweis für Worker ───────────────────────────────────
+        hint_result = ttk.LabelFrame(left, text="📥  Worker-Ergebnisse abrufen", padding="6")
+        hint_result.pack(fill=tk.X, **pad)
+        ttk.Label(hint_result,
+                  text="❌ NICHT beim Worker abrufen: http://<worker-ip>/result/<id> (gibt 404)\n"
+                       "✅ RICHTIG: http://127.0.0.1:18790/result/<task_id> (lokal im HEAD)\n\n"
+                       "Der Worker sendet Ergebnisse automatisch an den HEAD zurück!\n"
+                       "Nach dem Task-Senden 45 Sekunden warten, dann lokal abrufen.",
+                  font=("Arial", 9), justify=tk.LEFT, wraplength=350).pack(anchor=tk.W)
+
         # ── Right column — LLM Model Manager (Worker) — v1.0.0 ──────
         right = ttk.Frame(outer)
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))

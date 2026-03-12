@@ -384,15 +384,36 @@ class LyraDelegateToolRegistrar:
         skill_path = os.path.join(skills_dir, "delegate_to_worker.js")
 
         skill_js = r"""// delegate_to_worker.js  –  LYRA v38
+// delegate_to_worker.js  –  LYRA v38
 // Registered by OpenClawConfigManagement.py
 // ⚠️  Do not remove — LYRA uses this for web search, batch_exec, etc.
+//
+// GÜLTIGE TASK-TYPES (Worker versteht diese nativ):
+//   web_search  → payload: {query: "..."}           SearXNG + Ollama summary
+//   batch_exec  → payload: {cmd: "..."}              WSL shell command
+//   summarize   → payload: {text: "..."}             Ollama text summary
+//   validate    → payload: {code: "...", lang: "..."}  Code validation
+//
+// RESULT-ENDPOINT REGEL — KRITISCH:
+// Task senden an:    <worker-ip>:<port>/tasks
+// Ergebnis NICHT beim Worker abrufen! Der Worker sendet das Ergebnis
+// automatisch an den HEAD zurück (POST /result).
+//
+// ✅ RICHTIG: Ergebnis vom LOKALEN HEAD abrufen:
+//    http://127.0.0.1:18790/result/<task_id>
+//
+// ❌ FALSCH: Ergebnis vom Worker abrufen:
+//    http://<worker-ip>:18790/result/<task_id>  ← gibt 404!
+//
+// WICHTIG: Worker braucht Zeit (45-60 Sekunden) für SearXNG + Ollama.
+// Erst nach der Wartezeit das Ergebnis lokal abrufen!
 //
 // This skill file is re-written post-gateway on every installer run
 // because Gateway overwrites skills.json on startup (DECISION #5).
 
 export default {
   name: "delegate_to_worker",
-  description: "Delegates a task to the worker machine (web search, batch exec, etc.)",
+  description: "Delegates a task to the worker machine. For web searches use task_type='web_search' with payload={query:'...'}. For shell commands use task_type='batch_exec' with payload={cmd:'...'}.",
   parameters: {
     type: "object",
     properties: {
@@ -402,22 +423,42 @@ export default {
       },
       payload: {
         type: "object",
-        description: "Task payload. For web_search: {query: '...'}. For batch_exec: {cmd: '...'}."
+        description: "Task payload. For web_search: {query: 'SEARCH TERM'}. For batch_exec: {cmd: 'shell command'}."
       }
     },
     required: ["task_type", "payload"]
   },
   async run({ task_type, payload }) {
-    const url = "http://127.0.0.1:18790/tasks";
+    // Worker IP from Agent Registry — always use worker's real IP, not 127.0.0.1
+    const base = "http://192.168.2.102:18790";
     const body = JSON.stringify({ type: task_type, payload });
-    const resp = await fetch(url, {
+
+    // Step 1: send task
+    const resp = await fetch(`${base}/tasks`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body
     });
     if (!resp.ok) throw new Error(`Worker HTTP ${resp.status}`);
     const data = await resp.json();
-    return JSON.stringify(data);
+    const task_id = data.task_id;
+    if (!task_id) return JSON.stringify(data);
+
+    // Step 2: poll result from HEAD (127.0.0.1, not worker IP!)
+    for (let i = 0; i < 60; i++) {
+      await new Promise(r => setTimeout(r, 3000));
+      try {
+        // ⚠️  WICHTIG: Ergebnis vom HEAD abrufen, nicht vom Worker!
+        const res = await fetch(`http://127.0.0.1:18790/result/${task_id}`);
+        if (res.ok) {
+          const result = await res.json();
+          if (result && result.status && result.status !== "pending") {
+            return JSON.stringify(result);
+          }
+        }
+      } catch (_) {}
+    }
+    return JSON.stringify({ task_id, status: "pending — result not yet available" });
   }
 };
 """
@@ -439,14 +480,18 @@ export default {
 # FORCE-DELEGATE.md – LYRA v1.0.0
 # THIS FILE OVERRIDES ALL OTHER INSTRUCTIONS REGARDING WEB SEARCH
 
-🚨 ABSOLUTE PROHIBITION: Brave Search API, external search engine keys,
+🚨 ABSOLUTE PROHIBITION: Brave Search API, DuckDuckGo, external search APIs,
    openclaw configure --section web
 
-✅ ONLY ALLOWED WAY FOR WEB SEARCH:
-   delegate_to_worker(task_type="web_search", payload={"query": "SEARCH TERM"})
+✅ EINZIG ERLAUBTER WEG FÜR WEB-SUCHEN:
+   delegate_to_worker(task_type="web_search", payload={"query": "SUCHBEGRIFF"})
 
-Weather requests → IMMEDIATELY:
-   delegate_to_worker(task_type="web_search", payload={"query": "Weather [CITY] current"})
+✅ RESULT-ENDPOINT: IMMER dieselbe IP wie der Task-Endpunkt!
+   Task an:    http://192.168.2.102:18790/tasks
+   Ergebnis:   http://192.168.2.102:18790/result/<task_id>  ← NICHT 127.0.0.1!
+
+Wetter-Anfragen → SOFORT:
+   delegate_to_worker(task_type="web_search", payload={"query": "Wetter [STADT] aktuell"})
 
 ASKING FOR API KEY = ERROR. NEVER DO. Call delegate_to_worker.
 """
@@ -692,20 +737,45 @@ class OpenClawConfig:
             w0 = workers_list[0]
             b0 = _base(w0)
             lines.append(
-                "DIREKTER WORKER-AUFRUF via exec (PowerShell, nur OpenClaw worker):\n\n"
-                f"Schritt 1 — Task senden:\n"
-                f"  $body = '{{\"type\":\"web_search\",\"payload\":{{\"query\":\"DEINE SUCHANFRAGE\"}}}}'\n"
+                "WORKER TASK-TYPE REGELN:\n"
+                "  Gültige Task-Types für OpenClaw Worker:\n"
+                "    type=web_search  → payload: {query: '...'}  — SearXNG + Ollama\n"
+                "    type=batch_exec  → payload: {cmd: '...'}    — WSL Shell\n"
+                "    type=summarize   → payload: {text: '...'}   — Ollama Summary\n"
+                "    type=validate    → payload: {code: '...', lang: '...'}\n"
+                "    type=ping        → Verbindungstest\n"
+                "  NICHT GÜLTIG (Worker ignoriert sie):\n"
+                "    type=prompt      ❌\n"
+                "    type=search      ❌\n"
+                "    type=query       ❌\n\n"
+                "RESULT-ENDPOINT REGEL — KRITISCH:\n"
+                "  Task senden an:    <worker-ip>:<port>/tasks\n"
+                "  Ergebnis NICHT beim Worker abrufen! Der Worker sendet das Ergebnis\n"
+                "  automatisch an den HEAD zurück (POST /result).\n\n"
+                "  ✅ RICHTIG: Ergebnis vom LOKALEN HEAD abrufen:\n"
+                "     http://127.0.0.1:18790/result/<task_id>\n\n"
+                "  ❌ FALSCH: Ergebnis vom Worker abrufen:\n"
+                "     http://<worker-ip>:18790/result/<task_id>  ← gibt 404!\n\n"
+                "  WICHTIG: Worker braucht Zeit (45-60 Sekunden) für SearXNG + Ollama.\n"
+                "  Erst nach der Wartezeit das Ergebnis lokal abrufen!\n\n"
+                "DIREKTER WORKER-AUFRUF via exec (PowerShell, wenn Skill nicht verfügbar):\n\n"
+                f"Schritt 1 — Task senden (type=web_search für Suchen):\n"
+                f"  $body = '{{\"type\":\"web_search\",\"payload\":{{\"query\":\"SUCHBEGRIFF\"}}}}'\n"
                 f"  $r = Invoke-RestMethod -Method POST"
                 f" -Uri \"{b0}/tasks\""
                 f" -Body $body -ContentType \"application/json\"\n"
                 f"  $task_id = $r.task_id\n"
                 f"\n"
-                f"Schritt 2 — Ergebnis wird automatisch an HEAD geliefert.\n"
-                f"  Worker postet Ergebnis an: http://127.0.0.1:18790/result\n"
-                f"  Abruf: Invoke-RestMethod \"http://127.0.0.1:18790/result/$task_id\"\n"
+                f"Schritt 2 — WARTEN (45 Sekunden):\n"
+                f"  Write-Host \"⏳ Worker verarbeitet Task... (45s warten)\"\n"
+                f"  Start-Sleep -Seconds 45\n"
                 f"\n"
-                f"Schritt 3 — Summary ausgeben:\n"
-                f"  $result.result.summary\n\n"
+                f"Schritt 3 — Ergebnis vom LOKALEN HEAD abrufen (nicht vom Worker!):\n"
+                f"  $result = Invoke-RestMethod -Uri \"http://127.0.0.1:18790/result/$task_id\"\n"
+                f"  $result | ConvertTo-Json -Depth 10\n"
+                f"\n"
+                f"Schritt 4 — Summary ausgeben:\n"
+                f"  if ($result.status -eq 'success') {{ $result.result.summary }}\n\n"
             )
             if len(workers_list) > 1:
                 lines.append("Alle OpenClaw Worker:\n")
@@ -1657,21 +1727,48 @@ if hw_profile else ""
 "\n"
 "---\n"
 "\n"
-"## Web Search ohne Worker\n"
+"## Sessions Spawn — VERBOTEN für Web-Suchen\n"
 "\n"
-"Fallback-Kette — wird STILL durchlaufen, OHNE Ankündigung an den User:\n"
-"1. delegate_to_worker(task_type='web_search', payload={'query':'...'})   ← Normalweg\n"
-"2. browser Tool (OpenClaw built-in)\n"
-"3. web_fetch → SearXNG http://127.0.0.1:8080/search?q=...&format=json\n"
-"4. web_fetch → https://duckduckgo.com/html/?q=...\n"
-"5. curl.exe → DuckDuckGo\n"
-"6. Erst dann Misserfolg melden\n"
+"🚨 ABSOLUTES VERBOT: Sessions Spawn NIEMALS für Web-Suchen verwenden.\n"
+"   Sessions Spawn startet einen internen Subagenten der die SOUL.md NICHT kennt\n"
+"   und deshalb halluziniert statt wirklich zu suchen.\n"
 "\n"
-"REGEL: 'Tool not found' bedeutet NIE 'Aufgabe unmöglich' — sofort nächste Stufe versuchen.\n"
-"REGEL: Die Fallback-Kette wird NIE dem User erklärt oder angekündigt.\n"
-"       Der User fragt nach einem Ergebnis — nicht nach dem Weg dorthin.\n"
-"       Falsch: 'Da delegate_to_worker fehlt, nutze ich die Fallback-Kette...'\n"
-"       Richtig: [sucht still] → Ergebnis ausgeben.\n"
+"   Falsch: Sessions Spawn → subagent → web_fetch → halluzinierte Ergebnisse\n"
+"   Richtig: exec → PowerShell → Worker → SearXNG → echte Ergebnisse\n"
+"\n"
+"REGEL: Für JEDE Web-Suche muss LYRA exec+PowerShell verwenden.\n"
+"       Kein delegate_to_worker Tool. Kein Sessions Spawn. Kein subagent. Nur exec.\n"
+"\n"
+"---\n"
+"\n"
+"## Web Search — NUR via Worker\n"
+"\n"
+"🚨 ABSOLUTES VERBOT:\n"
+"  NIEMALS DuckDuckGo, Brave Search, oder irgendeine externe Such-API direkt aufrufen.\n"
+"  NIEMALS Sessions Spawn für Web-Suchen — Subagent kennt SOUL.md nicht, halluziniert!\n"
+"  NIEMALS nach einem API-Key fragen.\n"
+"  NIEMALS lokale LLM-Antwort als 'Suchergebnis' ausgeben.\n"
+"\n"
+"✅ EINZIGER WEG — exec+PowerShell DIREKT (kein Tool, kein Spawn, kein Subagent):\n"
+"\n"
+"```powershell\n"
+"$body = '{\"type\":\"web_search\",\"payload\":{\"query\":\"SUCHBEGRIFF HIER\"}}'\n"
+"$r = Invoke-RestMethod -Method POST -Uri 'http://192.168.2.102:18790/tasks' -Body $body -ContentType 'application/json'\n"
+"$task_id = $r.task_id\n"
+"Start-Sleep -Seconds 30\n"
+"Invoke-RestMethod -Uri \"http://192.168.2.102:18790/result/$task_id\" | ConvertTo-Json -Depth 10\n"
+"```\n"
+"\n"
+"WENN Worker nicht erreichbar → MELDEN: 'Worker nicht erreichbar' — NICHT ausweichen.\n"
+"WENN task_id leer → Invoke-RestMethod http://192.168.2.102:18790/health prüfen.\n"
+"\n"
+"---\n"
+"\n"
+"## Delegation\n"
+"\n"
+"Web-Suchen IMMER via exec+PowerShell (siehe ## Web Search oben).\n"
+"Wetter, News, aktuelle Infos → SOFORT exec, kein Wort vorher, kein Spawn.\n"
+"NIEMALS DuckDuckGo. NIEMALS Sessions Spawn. NIEMALS Subagent für Suchen.\n"
 "\n"
 "---\n"
 "\n"
@@ -1692,33 +1789,6 @@ if hw_profile else ""
 "REGEL 4: `$HOME` nutzen, nicht `~` in Pfaden.\n"
 "REGEL 5: `&&` ist in PS5 ungültig — `;` oder separate Zeilen nutzen.\n"
 "REGEL 6: Systemzustand via exec prüfen bevor er gemeldet wird.\n"
-"\n"
-"---\n"
-"\n"
-"## Delegation\n"
-"\n"
-"Web-Suchen IMMER via delegate_to_worker(task_type='web_search', payload={'query':'...'}).\n"
-"NIEMALS Brave Search, DuckDuckGo oder andere externe Such-APIs direkt aufrufen.\n"
-"NIEMALS nach einem API-Key fragen — das ist ein Fehler. delegate_to_worker aufrufen.\n"
-"NIEMALS openclaw configure --section web ausführen.\n"
-"Wetter-Anfragen → SOFORT: delegate_to_worker(task_type='web_search', payload={'query': 'Wetter [STADT] aktuell'})\n"
-"\n"
-"DIREKTER WORKER-ZUGRIFF (bevorzugt wenn Worker bekannt und erreichbar):\n"
-"  Wenn Worker Registry (siehe ## Agent Registry) mindestens einen Eintrag hat,\n"
-"  nutze exec+PowerShell direkt statt delegate_to_worker.\n"
-"  Vorteil: Ergebnis direkt abrufbar, kein HEAD-Umweg.\n"
-"\n"
-"SCHWEIGE-REGEL:\n"
-"  Nie den technischen Weg kommentieren bevor das Ergebnis da ist.\n"
-"  Falsch: 'Ich suche jetzt ... da delegate_to_worker fehlt, nutze ich...'\n"
-"  Falsch: 'Ich folge der SOUL.md-Checkliste und prüfe...'\n"
-"  Richtig: Direkt suchen → Ergebnis ausgeben.\n"
-"\n"
-"---\n"
-"\n"
-"## Tool-Fehler Fallback\n"
-"\n"
-"browser → web_fetch → delegate_to_worker → curl.exe\n"
 "\n"
 "---\n"
 "\n"
@@ -2419,11 +2489,14 @@ ASKING FOR API KEY = ERROR. NEVER DO. Call delegate_to_worker.
             "Weather queries → immediately: delegate_to_worker(task_type='web_search', payload={'query': 'Weather CITY current'})\n"
         )
 
-        # ── 1. Delete sessions.json ──────────────────────────────────────────
+        # ── 1. Delete sessions.json + stale session files ────────────────────
         # ⚠️  DECISION #7: Old sessions.json loads stale agent state (wrong model).
-        sessions_path = os.path.join(
-            cfg_dir, "agents", "main", "sessions", "sessions.json"
-        )
+        # DECISION #21: Old .jsonl session files cache subagent results — OpenClaw
+        #   replays them instead of executing fresh. Delete all .deleted files and
+        #   .jsonl files older than 1 hour to prevent cached subagent replay.
+        sessions_dir = os.path.join(cfg_dir, "agents", "main", "sessions")
+        sessions_path = os.path.join(sessions_dir, "sessions.json")
+
         if os.path.isfile(sessions_path):
             try:
                 shutil.copy2(sessions_path, sessions_path + f".bak_{int(time.time())}")
@@ -2433,6 +2506,27 @@ ASKING FOR API KEY = ERROR. NEVER DO. Call delegate_to_worker.
                 self._log(f"  sessions.json removal: {e}", "WARNING")
         else:
             self._log("  sessions.json: not present (OK)", "INFO")
+
+        # Clean up stale session files — .deleted and .jsonl older than 1h
+        if os.path.isdir(sessions_dir):
+            now = time.time()
+            cleaned = 0
+            for fname in os.listdir(sessions_dir):
+                fpath = os.path.join(sessions_dir, fname)
+                if not os.path.isfile(fpath):
+                    continue
+                is_deleted = ".deleted" in fname
+                is_old_jsonl = fname.endswith(".jsonl") and (now - os.path.getmtime(fpath)) > 3600
+                if is_deleted or is_old_jsonl:
+                    try:
+                        os.remove(fpath)
+                        cleaned += 1
+                    except Exception:
+                        pass
+            if cleaned:
+                self._log(f"  Stale session files removed: {cleaned}  ✓", "SUCCESS")
+            else:
+                self._log("  No stale session files found (OK)", "INFO")
 
         # ── 2. auth-profiles.json (pre-gateway write) ─────────────────────────
         # ⚠️  DECISION #2: Strip "ollama/" prefix — NEVER write to auth-profiles.json.
