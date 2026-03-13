@@ -733,7 +733,7 @@ class OpenClawWinInstaller(OpenClawOperations):
         self._timeout_var = tk.StringVar(value="2h")
         timeout_cb = ttk.Combobox(
             row_t, textvariable=self._timeout_var,
-            values=["30 min", "1h", "2h", "4h", "8h", "Unbegrenzt"],
+            values=["30 min", "1h", "2h", "4h", "8h", "Unlimited"],
             state="readonly", width=12)
         timeout_cb.pack(side=tk.LEFT, padx=(4, 6))
         ttk.Button(row_t, text="✅ Set",
@@ -1003,7 +1003,7 @@ class OpenClawWinInstaller(OpenClawOperations):
             self._timeout_var = tk.StringVar(value="2h")
         timeout_cb = ttk.Combobox(
             row_t, textvariable=self._timeout_var,
-            values=["30 min", "1h", "2h", "4h", "8h", "Unbegrenzt"],
+            values=["30 min", "1h", "2h", "4h", "8h", "Unlimited"],
             state="readonly", width=12)
         timeout_cb.pack(side=tk.LEFT, padx=(4, 6))
         ttk.Button(row_t, text="✅ Set",
@@ -1724,7 +1724,7 @@ class OpenClawWinInstaller(OpenClawOperations):
             "2h":          7200,
             "4h":         14400,
             "8h":         28800,
-            "Unbegrenzt": 86400,   # 24h — OpenClaw rejects 0 as invalid
+            "Unlimited": 86400,   # 24h — OpenClaw rejects 0 as invalid
         }
         selection = self._timeout_var.get()
         seconds   = TIMEOUT_MAP.get(selection, 7200)
@@ -1748,7 +1748,7 @@ class OpenClawWinInstaller(OpenClawOperations):
                     foreground="#1a7f1a")
             if hasattr(self, "_llm_set_status"):
                 self._llm_set_status.config(
-                    text=f"✅ Timeout gesetzt: {selection} ({label}) — Gateway neu starten.",
+                    text=f"✅ Timeout set: {selection} ({label}) — Restart Gateway.",
                     foreground="green")
             # Trigger gateway restart
             self._restart_gateway()

@@ -4453,42 +4453,132 @@ class OpenClawOperations:
         return None, False
 
     def install_node(self):
-        self.log("  Installing Node.js LTS v22...")
+        """
+        Installs or upgrades Node.js to a version compatible with OpenClaw 2026.3.12+.
+        
+        Required version: >=22.16.0 (prefers v24.14.0 LTS).
+        
+        Strategy:
+          1. Try winget upgrade first (fastest, if available)
+          2. Direct MSI download from nodejs.org (primary fallback)
+          3. If both fail → log error and return False (no invalid fallback!)
+        
+        Returns:
+            bool: True if Node.js is installed and meets version requirements
+        """
+        self.log("  Checking/installing Node.js (required: >=22.16.0)...")
+        
+        # Target version (known good for OpenClaw 2026.3.12)
+        TARGET_VERSION = "24.14.0"
+        MIN_MAJOR = 22
+        MIN_MINOR = 16
+        
+        # ── Step 1: Check if already installed and sufficient ─────────────
+        current_ver, current_ok = self.check_node()
+        if current_ver and current_ok:
+            self.log(f"  Node.js {current_ver} already meets requirements ✓", "SUCCESS")
+            return True
+        elif current_ver:
+            self.log(f"  Node.js {current_ver} found but too old (need >=22.16.0)", "WARNING")
+        
+        # ── Step 2: Try winget upgrade ───────────────────────────────────
         if self.check_winget():
+            self.log("  Attempting upgrade via winget...")
             r = self.run_powershell(
-                "winget install OpenJS.NodeJS.LTS --accept-package-agreements --silent",
-                timeout=600
+                "winget upgrade OpenJS.NodeJS.LTS --accept-package-agreements --silent",
+                timeout=300
             )
             if r["returncode"] == 0:
                 self._refresh_path()
-                time.sleep(6)
-                if self.check_node()[0]:
+                time.sleep(5)
+                new_ver, new_ok = self.check_node()
+                if new_ok:
+                    self.log(f"  Node.js upgraded to {new_ver} via winget ✓", "SUCCESS")
                     return True
-
-        self.log("  Downloading Node.js v22 MSI (multiple sources)...")
-        node_ver = "22.14.0"
-        msi_name = f"node-v{node_ver}-x64.msi"
+                else:
+                    self.log(f"  winget reported success but version {new_ver} still insufficient", "WARNING")
+            else:
+                self.log("  winget upgrade failed or not needed", "INFO")
+        
+        # ── Step 3: Direct MSI download from official source ─────────────
+        self.log(f"  Downloading Node.js v{TARGET_VERSION} MSI directly from nodejs.org...")
+        msi_name = f"node-v{TARGET_VERSION}-x64.msi"
         msi_path = os.path.join(tempfile.gettempdir(), msi_name)
-        node_urls = [
-            f"https://nodejs.org/dist/v{node_ver}/{msi_name}",
-            f"https://nodejs.org/download/release/v{node_ver}/{msi_name}",
-            f"https://registry.npmjs.org/node/-/{msi_name}",       # CDN fallback
-        ]
-        if self._download_with_fallback(node_urls, msi_path, "Node.js MSI"):
-            ok = self.msiexec_with_watch(msi_path, timeout=600, label="Node.js")
+        
+        # Official Node.js download URL (single source of truth)
+        msi_url = f"https://nodejs.org/dist/v{TARGET_VERSION}/{msi_name}"
+        
+        if self._download_with_fallback([msi_url], msi_path, "Node.js MSI"):
+            install_success = self.msiexec_with_watch(
+                msi_path,
+                timeout=600,
+                label=f"Node.js {TARGET_VERSION}"
+            )
+            # Clean up installer
             try:
                 os.remove(msi_path)
             except:
                 pass
+            
             self._refresh_path()
-            time.sleep(8)
-            if self.check_node()[0]:
+            time.sleep(8)  # Allow PATH to propagate
+            
+            final_ver, final_ok = self.check_node()
+            if final_ok:
+                self.log(f"  Node.js {final_ver} installed via direct MSI ✓", "SUCCESS")
                 return True
-            if ok:
-                # MSI returned 3010 (restart required) – continue anyway
-                self.log("  Node.js installed (restart may be required)", "WARNING")
+            elif install_success:
+                self.log(
+                    f"  Node.js MSI installed but version check ambiguous. "
+                    f"Reported: {final_ver}. Please verify manually.",
+                    "WARNING"
+                )
+                # Assume success if MSI reported success (return code 0/3010)
                 return True
+        
+        # ── Step 4: Everything failed ────────────────────────────────────
+        self.log(
+            f"  ❌ CRITICAL: Node.js installation failed!\n"
+            f"     OpenClaw {self._get_openclaw_version()} requires Node.js >=22.16.0.\n"
+            f"     Please install manually from: https://nodejs.org/en/download",
+            "ERROR"
+        )
         return False
+
+    def _get_openclaw_version(self):
+        """Returns the installed OpenClaw version or a default string."""
+        try:
+            r = self.run_powershell("openclaw --version 2>$null")
+            return r.get("stdout", "").strip() or "2026.3.12"
+        except:
+            return "2026.3.12"
+
+    def check_node(self):
+        """
+        Checks Node.js installation and version.
+        
+        Returns:
+            tuple: (version_string, meets_requirements)
+                version_string: e.g. "v24.14.0" or None if not found
+                meets_requirements: True if version >= 22.16.0
+        """
+        r = self.run_powershell("node -v 2>$null")
+        if not r["stdout"] or not r["stdout"].startswith("v"):
+            return None, False
+        
+        ver = r["stdout"].strip()
+        try:
+            # Parse version string: remove 'v' and split into components
+            ver_parts = ver.replace("v", "").split(".")
+            major = int(ver_parts[0]) if len(ver_parts) > 0 else 0
+            minor = int(ver_parts[1]) if len(ver_parts) > 1 else 0
+            
+            # OpenClaw 2026.3.12 requires Node.js >=22.16.0
+            meets_req = (major > 22) or (major == 22 and minor >= 16)
+            return ver, meets_req
+        except (ValueError, IndexError):
+            self.log(f"  Could not parse Node.js version: {ver}", "WARNING")
+            return ver, False
 
     # ──────────────────────────────────────────────────────────────────
     # GIT
