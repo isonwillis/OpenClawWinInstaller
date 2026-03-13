@@ -2926,7 +2926,8 @@ class OpenClawWinInstaller(OpenClawOperations):
 
         # ── Final dashboard box ──────────────────────────────────────
         head_ip = head_address if head_address else "head-ip"
-        self.log("\n" + "╔" + "═" * 62 + "╗")
+        self.log("\n")
+        self.log(  "╔" + "═" * 62 + "╗")
         self.log(  "║" + "        LYRA SYSTEM READY – WORKER ACTIVE              ".center(62) + "║")
         self.log(  "╚" + "═" * 62 + "╝")
         self.log(f"  Role:       {role}")
@@ -3406,7 +3407,7 @@ class OpenClawWinInstaller(OpenClawOperations):
             self.progress["value"] = 100
             self._set_status("Complete! LYRA is alive!")
 
-            self.log("\n" + "=" * 70)
+            self.log("=" * 70)
             if gw_ok and lyra_ok:
                 self.log("INSTALLATION COMPLETELY SUCCESSFUL! LYRA IS ALIVE!", "SUCCESS")
                 self.log("=" * 70)
@@ -3489,7 +3490,8 @@ class OpenClawWinInstaller(OpenClawOperations):
             dashboard_url = f"http://127.0.0.1:18789/?token={gw_token}"
 
             # ── Final dashboard box ──────────────────────────────────
-            self.log("\n" + "╔" + "═" * 62 + "╗")
+            self.log("\n")
+            self.log(  "╔" + "═" * 62 + "╗")
             self.log(  "║" + "           LYRA SYSTEM READY – HEAD ACTIVE             ".center(62) + "║")
             self.log(  "╚" + "═" * 62 + "╝")
             self.log(f"  Role:       LYRA (head)")
