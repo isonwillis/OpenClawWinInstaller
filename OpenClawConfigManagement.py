@@ -486,9 +486,9 @@ export default {
 ✅ EINZIG ERLAUBTER WEG FÜR WEB-SUCHEN:
    delegate_to_worker(task_type="web_search", payload={"query": "SUCHBEGRIFF"})
 
-✅ RESULT-ENDPOINT: IMMER dieselbe IP wie der Task-Endpunkt!
+✅ RESULT-ENDPOINT: Task senden an Worker-IP, Ergebnis vom lokalen HEAD!
    Task an:    http://192.168.2.102:18790/tasks
-   Ergebnis:   http://192.168.2.102:18790/result/<task_id>  ← NICHT 127.0.0.1!
+   Ergebnis:   http://127.0.0.1:18790/result/<task_id>  ← IMMER lokaler HEAD!
 
 Wetter-Anfragen → SOFORT:
    delegate_to_worker(task_type="web_search", payload={"query": "Wetter [STADT] aktuell"})
@@ -687,7 +687,7 @@ class OpenClawConfig:
             "  NIEMALS einen API-Key im Klartext ausgeben — weder in Antworten,\n"
             "  noch in PowerShell-Beispielen, noch in Tabellen.\n"
             "  Immer maskieren: sk-5b79...0f0 → sk-***...***\n"
-            "  Stattdessen: $env:DEEPSEEK_API_KEY oder <dein-api-key> als Platzhalter.\n\n"
+            "  Stattdessen: $env:DEEPSEEK_API_KEY als Platzhalter (nie <api_key> oder <dein-api-key>).\n\n"
         )
 
         if not workers:
@@ -728,7 +728,11 @@ class OpenClawConfig:
                     if rule_line.strip():
                         lines.append(f"    DELEGATION-REGEL: {rule_line.strip()}\n")
             else:
-                lines.append(f"    DELEGATION-REGEL: (keine definiert — immer verfügbar)\n")
+                lines.append(
+                    f"    DELEGATION-REGEL: (keine definiert)\n"
+                    f"    WARNUNG: Kein WANN/NICHT/GRUND gesetzt \u2014 Lyra entscheidet nach Gef\u00fchl.\n"
+                    f"    Bitte im Monitoring-Tab Delegation-Regeln hinterlegen.\n"
+                )
 
         lines.append("\n")
 
@@ -756,7 +760,7 @@ class OpenClawConfig:
                 "     http://127.0.0.1:18790/result/<task_id>\n\n"
                 "  ❌ FALSCH: Ergebnis vom Worker abrufen:\n"
                 "     http://<worker-ip>:18790/result/<task_id>  ← gibt 404!\n\n"
-                "  WICHTIG: Worker braucht Zeit (45-60 Sekunden) für SearXNG + Ollama.\n"
+                "  WICHTIG: Worker braucht Zeit (~55 Sekunden) für SearXNG + Ollama.\n"
                 "  Erst nach der Wartezeit das Ergebnis lokal abrufen!\n\n"
                 "DIREKTER WORKER-AUFRUF via exec (PowerShell, wenn Skill nicht verfügbar):\n\n"
                 f"Schritt 1 — Task senden (type=web_search für Suchen):\n"
@@ -766,9 +770,9 @@ class OpenClawConfig:
                 f" -Body $body -ContentType \"application/json\"\n"
                 f"  $task_id = $r.task_id\n"
                 f"\n"
-                f"Schritt 2 — WARTEN (45 Sekunden):\n"
-                f"  Write-Host \"⏳ Worker verarbeitet Task... (45s warten)\"\n"
-                f"  Start-Sleep -Seconds 45\n"
+                f"Schritt 2 — WARTEN (55 Sekunden):\n"
+                f"  Write-Host \"⏳ Worker verarbeitet Task... (55s warten)\"\n"
+                f"  Start-Sleep -Seconds 55\n"
                 f"\n"
                 f"Schritt 3 — Ergebnis vom LOKALEN HEAD abrufen (nicht vom Worker!):\n"
                 f"  $result = Invoke-RestMethod -Uri \"http://127.0.0.1:18790/result/$task_id\"\n"
@@ -794,7 +798,7 @@ class OpenClawConfig:
                 lines.append(
                     f"  {a.get('name','?')}: {chat_url}  model={mdl}\n"
                     f"    Health-Check: GET {b}/models\n"
-                    f"    Auth: Authorization: Bearer <api_key>\n"
+                    f"    Auth: Authorization: Bearer $env:DEEPSEEK_API_KEY\n"
                 )
             lines.append(
                 "  → Delegation: exec per PowerShell ODER Monitoring-Tab → 'chat (openai)'\n"
@@ -829,7 +833,10 @@ class OpenClawConfig:
             "  worker → GET <ip:port>/health         erwartet: {role, port}\n"
             "  ollama → GET <url>/api/tags            erwartet: {models:[...]}\n"
             "  openai → GET <base_url>/models         erwartet: {data:[...]}\n"
-            "REGEL: Agent nicht erreichbar → Fallback auf delegate_to_worker Tool.\n"
+            "REGEL: Agent nicht erreichbar → User melden: '<Agent> nicht erreichbar.'\n"
+"       NICHT still auf einen anderen Agenten ausweichen.\n"
+"       NICHT delegate_to_worker Tool als automatischen Fallback.\n"
+"       Ausnahme: User erteilt explizit Freigabe zum Wechsel.\n"
             "REGEL: workers.json ist die einzige Quelle für Agent-Information.\n"
             "       Gateway-Endpoints /api/workers, /api/agents existieren NICHT.\n"
             "\n---\n\n"
@@ -1669,7 +1676,9 @@ f"role={hw_profile.get('recommended_role','?')}\n"
 if hw_profile else ""
 ) +
 "Senior worker: AVX2, qwen2.5:1.5b-3b, complex helper tasks.\n"
+"  ⚠️ Noch nicht in workers.json konfiguriert \u2014 nicht delegieren.\n"
 "Junior worker: any hardware, qwen2.5:0.5b, simple tasks + web search via SearXNG.\n"
+"  → In workers.json als \"Worker\" eingetragen.\n"
 "\n"
 "---\n"
 "\n"
@@ -1791,8 +1800,8 @@ if hw_profile else ""
 "$body = '{\"type\":\"web_search\",\"payload\":{\"query\":\"SUCHBEGRIFF HIER\"}}'\n"
 "$r = Invoke-RestMethod -Method POST -Uri 'http://192.168.2.102:18790/tasks' -Body $body -ContentType 'application/json'\n"
 "$task_id = $r.task_id\n"
-"Start-Sleep -Seconds 30\n"
-"Invoke-RestMethod -Uri \"http://192.168.2.102:18790/result/$task_id\" | ConvertTo-Json -Depth 10\n"
+"Start-Sleep -Seconds 55\n"
+"Invoke-RestMethod -Uri \"http://127.0.0.1:18790/result/$task_id\" | ConvertTo-Json -Depth 10\n"
 "```\n"
 "\n"
 "WENN Worker nicht erreichbar → MELDEN: 'Worker nicht erreichbar' — NICHT ausweichen.\n"
@@ -1912,6 +1921,39 @@ if hw_profile else ""
 "\n"
 "Der Entwickler entscheidet ob der Vorschlag in die nächste Version übernommen wird.\n"
 "LYRA erfindet keine Regeln selbst — sie schlägt vor, der Mensch entscheidet.\n"
+"\n"
+"---\n"
+"\n"
+"## Session-Ende-Checkliste\n"
+"\n"
+"PFLICHT: Bevor eine Session endet, folgende Pr\u00fcfung EINMAL durchf\u00fchren.\n"
+"Kein Blockieren, kein Aufhalten \u2014 nur kurz pr\u00fcfen.\n"
+"\n"
+"### Schritt 1 \u2014 Selbstlern-Check\n"
+"\n"
+"Ist eines dieser Ereignisse in dieser Session eingetreten?\n"
+"\n"
+"  A. Ein Fehler trat zweimal auf und wurde danach korrekt gel\u00f6st\n"
+"  B. Eine Annahme war falsch (Datei nicht da, API verhielt sich anders)\n"
+"  C. Ein Worker-Ergebnis enthielt eine neue/unerwartete Erkenntnis\n"
+"  D. Ein Tool schlug fehl und ein Workaround wurde gefunden\n"
+"  E. Eine Regel aus SOUL.md oder BOOTSTRAP.md erwies sich als unvollst\u00e4ndig\n"
+"\n"
+"\u2192 JA: Sofort [LEARNING]-Eintrag in memory/YYYY-MM-DD.md schreiben.\n"
+"\u2192 NEIN: Nichts schreiben. Session normal beenden.\n"
+"\n"
+"### Schritt 2 \u2014 SOUL-Update-Check\n"
+"\n"
+"Hat sich gezeigt dass eine SOUL.md-Regel fehlt oder widerspr\u00fcchlich ist?\n"
+"\n"
+"\u2192 JA: [SOUL-UPDATE-VORSCHLAG] an den Entwickler anh\u00e4ngen.\n"
+"\u2192 NEIN: Nichts schreiben.\n"
+"\n"
+"### Regeln\n"
+"\n"
+"NICHT schreiben f\u00fcr Routine-Sessions ohne Ereignisse A\u2013E.\n"
+"NICHT die Session k\u00fcnstlich verl\u00e4ngern.\n"
+"NICHT r\u00fcckwirkend erfinden \u2014 nur was wirklich eingetreten ist.\n"
 "\n"
 "---\n"
 "\n"

@@ -2031,6 +2031,59 @@ class OpenClawWinInstaller(OpenClawOperations):
                 if mem_fixed:
                     fixes_applied.append("memorySearch (provider=local, fallback=none, remote removed)")
 
+
+                # DECISION #21: workers.json delegation_rules — seed canonical rules
+                # If an agent entry has empty delegation_rules, the installer wrote
+                # the generic warning "WARNUNG: Kein WANN/NICHT/GRUND gesetzt".
+                # This fix seeds the canonical rules discovered in the first
+                # Claude Code observer session (2026-03-17) so SOUL.md always
+                # contains actionable delegation policy, not a blank warning.
+                # Safe: only fills EMPTY rules — never overwrites user-defined rules.
+                workers_path = self.cfg._workers_json_path()
+                if os.path.isfile(workers_path):
+                    try:
+                        import json as _json
+                        with open(workers_path, "r", encoding="utf-8") as _wf:
+                            _workers = _json.load(_wf)
+
+                        _CANONICAL = {
+                            # Match by type + partial URL/name — robust against renames
+                            "worker": (
+                                "WANN: web_search, summarize, batch_exec, validate, ping\n"
+                                "NICHT: type=prompt, type=query (Worker ignoriert sie)\n"
+                                "GRUND: Lokaler Dienst, kostenlos, Standard fuer alle Task-Delegationen\n"
+                                "HEALTH: GET http://192.168.2.102:18790/health vor jeder Delegation\n"
+                                "UNREACHABLE: User melden — NICHT still auf Deepseek ausweichen"
+                            ),
+                            "openai": (
+                                "WANN: User fordert Deepseek explizit an ('frag Deepseek', 'via Deepseek')\n"
+                                "      ODER lokales Modell (glm/qwen) hat denselben Task 3x nicht geloest\n"
+                                "NICHT: Web-Suchen (→ Worker), lokal loesbare Tasks, Routineanfragen\n"
+                                "GRUND: Externer Dienst, kostenpflichtig pro Token — sparsam einsetzen\n"
+                                "AUTH: $env:DEEPSEEK_API_KEY — niemals Klartext oder <api_key>"
+                            ),
+                        }
+
+                        _changed = False
+                        for _agent in _workers:
+                            _atype = _agent.get("type", "worker")
+                            _rules = _agent.get("delegation_rules", "").strip()
+                            if not _rules and _atype in _CANONICAL:
+                                _agent["delegation_rules"] = _CANONICAL[_atype]
+                                _changed = True
+                                fixes_applied.append(
+                                    f"workers.json delegation_rules seeded for "
+                                    f"{_agent.get('name','?')} ({_atype})"
+                                )
+
+                        if _changed:
+                            import shutil as _shutil
+                            _shutil.copy2(workers_path, workers_path + f".bak_{int(time.time())}")
+                            with open(workers_path, "w", encoding="utf-8") as _wf:
+                                _json.dump(_workers, _wf, indent=2, ensure_ascii=False)
+                    except Exception as _e:
+                        self.log(f"[Fix] workers.json delegation_rules: {_e}", "WARNING")
+
                 # ── Future fixes go here, same pattern ────────────────────────
 
                 # CLEANUP #20a: models.providers.ollama — schema rejected
@@ -2926,7 +2979,6 @@ class OpenClawWinInstaller(OpenClawOperations):
 
         # ── Final dashboard box ──────────────────────────────────────
         head_ip = head_address if head_address else "head-ip"
-        self.log("\n")
         self.log(  "╔" + "═" * 62 + "╗")
         self.log(  "║" + "        LYRA SYSTEM READY – WORKER ACTIVE              ".center(62) + "║")
         self.log(  "╚" + "═" * 62 + "╝")
@@ -3490,7 +3542,6 @@ class OpenClawWinInstaller(OpenClawOperations):
             dashboard_url = f"http://127.0.0.1:18789/?token={gw_token}"
 
             # ── Final dashboard box ──────────────────────────────────
-            self.log("\n")
             self.log(  "╔" + "═" * 62 + "╗")
             self.log(  "║" + "           LYRA SYSTEM READY – HEAD ACTIVE             ".center(62) + "║")
             self.log(  "╚" + "═" * 62 + "╝")
