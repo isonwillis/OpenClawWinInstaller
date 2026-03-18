@@ -1,5 +1,5 @@
 """
-OpenClawAgentMonitoring.py  –  v1.0.5
+OpenClawAgentMonitoring.py  –  v1.0.4
 ======================================
 Agent Monitoring & Management Module — Lyra (Head) only.
 
