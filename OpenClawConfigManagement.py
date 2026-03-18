@@ -3,6 +3,17 @@
 """
 OpenClawConfigManagement.py  –  v1.0.4
 =======================================
+v1.0.5 changes:
+  DECISION #21: workers.json delegation_rules — canonical rules seeded when empty
+  DECISION #22: _check_gateway hasattr guard — Worker has no _gw_status widget
+  DECISION #24: patch_gateway_cmd() creates stub from dist/index.js if missing
+                stub includes "gateway" subcommand (required to start server)
+  DECISION #28: OLLAMA_KEEP_ALIVE=10m injected by patch_gateway_cmd()
+  SOUL.md: exit status 2 → dynamic qwen2.5:7b switch via exec
+  SOUL.md: ~55s wait, 127.0.0.1 result endpoint, auth placeholder,
+           fallback rule, Senior worker warning, Session-Ende-Checkliste
+  duplicate check_node removed (old major>=18, correct >22 or 22+minor>=16)
+
 All non-GUI logic for OpenClaw / LYRA:
   - Configuration read/write (OpenClawConfig)
   - Delegate tool registration (LyraDelegateToolRegistrar)
@@ -1340,6 +1351,9 @@ class OpenClawConfig:
                 "SET OLLAMA_API_KEY=ollama-local\n",
                 "SET OLLAMA_HOST=http://127.0.0.1:11434\r\n",
                 "SET OLLAMA_HOST=http://127.0.0.1:11434\n",
+                # DECISION #28: OLLAMA_KEEP_ALIVE cleanup
+                "SET OLLAMA_KEEP_ALIVE=10m\r\n",
+                "SET OLLAMA_KEEP_ALIVE=10m\n",
                 "SET OPENCLAW_GATEWAY_TOKEN=lyra-local-token\r\n",
                 "SET OPENCLAW_GATEWAY_TOKEN=lyra-local-token\n",
                 f"SET OPENCLAW_GATEWAY_TOKEN={gw_token}\r\n",
@@ -1374,6 +1388,10 @@ class OpenClawConfig:
                 "SET OLLAMA_API_KEY=ollama-local\r\n"
                 "SET OLLAMA_HOST=http://127.0.0.1:11434\r\n"
                 f"SET OPENCLAW_GATEWAY_TOKEN={gw_token}\r\n"
+                # DECISION #28: OLLAMA_KEEP_ALIVE — unload model after 10min
+                # idle. Prevents VRAM accumulation that causes exit status 2.
+                # 10m balances responsiveness vs VRAM pressure.
+                "SET OLLAMA_KEEP_ALIVE=10m\r\n"
                 # ⚠️  DECISION #20: undici 300s timeout fix
                 f"{node_opts_line}"
             )
@@ -1402,7 +1420,8 @@ class OpenClawConfig:
                     and node_ok):
                 self._log(
                     "  gateway.cmd: TZ + OLLAMA_API_KEY + OPENCLAW_GATEWAY_TOKEN "
-                    "+ NODE_OPTIONS (undici fix) injected  ✓", "SUCCESS"
+                    "+ NODE_OPTIONS (undici fix) + OLLAMA_KEEP_ALIVE=10m injected  ✓",
+                    "SUCCESS"
                 )
                 self._log(f"  First 4 lines: {verify[:200]!r}", "INFO")
                 return True
@@ -1754,6 +1773,24 @@ if hw_profile else ""
 "REGEL: Wenn glm-4.7-flash 3x hintereinander Timeout → qwen2.5:7b wählen.\n"
 "  Modell wechseln: User informieren + Installer Primary LLM Dropdown.\n"
 "  NICHT einfach weiter retrien ohne Diagnose.\n"
+"\n"
+"REGEL: Bei \"exit status 2\" (llama runner process has terminated):\n"
+"  SOFORT auf qwen2.5:7b wechseln \u2014 kein Retry, kein Warten.\n"
+"  exit status 2 = VRAM-Crash, nicht Timeout. Retry hilft nicht.\n"
+"\n"
+"  Wechsel via exec (sofort wirksam, kein manueller Gateway-Neustart noetig):\n"
+"\n"
+"  ```powershell\n"
+"  $cfg = Get-Content \"$env:USERPROFILE\\.openclaw\\openclaw.json\" -Raw | ConvertFrom-Json\n"
+"  $cfg.agents.defaults.model.primary = \"ollama/qwen2.5:7b\"\n"
+"  $cfg | ConvertTo-Json -Depth 20 | Set-Content \"$env:USERPROFILE\\.openclaw\\openclaw.json\" -Encoding UTF8\n"
+"  Stop-Process -Name node -Force -ErrorAction SilentlyContinue ; Start-Sleep 3\n"
+"  cmd /c \"$env:USERPROFILE\\.openclaw\\gateway.cmd\" &\n"
+"  ```\n"
+"\n"
+"  Nach dem Wechsel User informieren:\n"
+"  [MODELL-WECHSEL] glm-4.7-flash -> qwen2.5:7b (VRAM-Crash exit status 2).\n"
+"  Zurueck zu glm: nvidia-smi pruefen, dann Installer -> Primary LLM Dropdown.\n"
 "\n"
 "---\n"
 "\n"

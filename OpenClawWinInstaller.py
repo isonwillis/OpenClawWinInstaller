@@ -3,6 +3,18 @@
 """
 OpenClawWinInstaller.py  –  v1.0.4
 ====================================
+Changelog:
+  v1.0.5  DECISION #21: workers.json delegation_rules seeded on Apply fixes
+          DECISION #22: hasattr guard for _gw_status on Worker startup
+          DECISION #23: Node.js version check + upgrade in Worker setup flow
+          DECISION #24: gateway.cmd stub created from dist/index.js if missing
+          DECISION #25: check_openclaw + fix_openclaw_installation in Worker flow
+          DECISION #26: openclaw gateway install --force in Worker flow
+          DECISION #27: write_openclaw_config() always called after onboard
+          DECISION #28: _restart_ollama() — Docker/WSL/native/service detection
+                        OLLAMA_KEEP_ALIVE=10m injected via patch_gateway_cmd()
+          f-string fix: Port {port} refused — missing f-prefix
+          duplicate check_node removed (was: major>=18, correct: >22 or 22+16)
 GUI installer for OpenClaw / LYRA on Windows.
 Handles the "New Installation" flow (Steps 1-16) and all GUI interactions.
 
@@ -750,8 +762,12 @@ class OpenClawWinInstaller(OpenClawOperations):
         self._llm_set_status.pack(anchor=tk.W, pady=(2, 2))
 
         # Refresh button
-        ttk.Button(sec_llm, text="🔄 Refresh model list",
-                   command=self._refresh_ollama_models).pack(anchor=tk.W, pady=(4, 8))
+        btn_row_llm = ttk.Frame(sec_llm)
+        btn_row_llm.pack(anchor=tk.W, pady=(4, 8))
+        ttk.Button(btn_row_llm, text="🔄 Refresh model list",
+                   command=self._refresh_ollama_models).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btn_row_llm, text="♻️ Restart Ollama",
+                   command=self._restart_ollama).pack(side=tk.LEFT)
 
         ttk.Separator(sec_llm, orient="horizontal").pack(fill=tk.X, pady=4)
 
@@ -1020,8 +1036,12 @@ class OpenClawWinInstaller(OpenClawOperations):
         self._llm_set_status.pack(anchor=tk.W, pady=(2, 2))
 
         # Refresh button
-        ttk.Button(sec_llm, text="🔄 Refresh model list",
-                   command=self._refresh_ollama_models).pack(anchor=tk.W, pady=(4, 8))
+        btn_row_wllm = ttk.Frame(sec_llm)
+        btn_row_wllm.pack(anchor=tk.W, pady=(4, 8))
+        ttk.Button(btn_row_wllm, text="🔄 Refresh model list",
+                   command=self._refresh_ollama_models).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btn_row_wllm, text="♻️ Restart Ollama",
+                   command=self._restart_ollama).pack(side=tk.LEFT)
 
         ttk.Separator(sec_llm, orient="horizontal").pack(fill=tk.X, pady=4)
 
@@ -1049,6 +1069,194 @@ class OpenClawWinInstaller(OpenClawOperations):
     # ──────────────────────────────────────────────────────────────────
     # DIAGNOSTIC ACTIONS
     # ──────────────────────────────────────────────────────────────────
+
+    def _restart_ollama(self):
+        """
+        DECISION #28 (v1.0.5): Restart Ollama dynamically.
+
+        Detects which Ollama runtime is active and restarts it:
+          1. Docker container  — docker ps | grep ollama  → docker restart <name>
+          2. WSL               — wsl bash -lc "ollama serve"
+          3. Windows-native    — taskkill + start ollama.exe
+          4. Windows Service   — Stop-Service / Start-Service ollama
+
+        Also unloads all models via keep_alive=0 API call before restart
+        to free VRAM immediately.
+
+        Used to recover from "exit status 2" (VRAM-Crash) without manual
+        PowerShell intervention.
+
+        Prevention: OLLAMA_KEEP_ALIVE=10m is injected into gateway.cmd by
+        patch_gateway_cmd() (DECISION #28) so models auto-unload after 10
+        minutes idle — this button is the manual override for immediate relief.
+        """
+        self.log("\n♻️  Restarting Ollama...")
+
+        def _run():
+            # ── Step 1: Unload all models via API (free VRAM now) ────────────
+            self.log("  [Ollama] Unloading models via API (keep_alive=0)...")
+            try:
+                r = self.run_powershell(
+                    "Invoke-RestMethod http://127.0.0.1:11434/api/ps | "
+                    "ConvertTo-Json -Depth 5"
+                )
+                import json as _json
+                ps_data = _json.loads(r["stdout"]) if r["stdout"].strip() else {}
+                models = ps_data.get("models", [])
+                for m in models:
+                    name = m.get("name", "")
+                    if name:
+                        self.log(f"  [Ollama] Unloading: {name}")
+                        _body = '{' + f'"model":"{name}","keep_alive":0' + '}'
+                        self.run_powershell(
+                            f'$b = \'{_body}\'; '
+                            'Invoke-RestMethod -Method POST '
+                            '-Uri "http://127.0.0.1:11434/api/generate" '
+                            '-Body $b -ContentType "application/json" | Out-Null'
+                        )
+                if not models:
+                    self.log("  [Ollama] No models loaded.", "INFO")
+            except Exception as e:
+                self.log(f"  [Ollama] API unload skipped: {e}", "INFO")
+
+            import time as _time
+
+            # ── Step 2: Detect runtime and restart ───────────────────────────
+            restarted = False
+
+            # 2a. Docker
+            r_docker = self.run_powershell(
+                "docker ps --format \"{{.Names}}\t{{.Image}}\" 2>$null"
+            )
+            docker_out = r_docker.get("stdout", "")
+            docker_containers = [
+                line.split("\t")[0] for line in docker_out.splitlines()
+                if "ollama" in line.lower()
+            ]
+            if docker_containers:
+                for cname in docker_containers:
+                    self.log(f"  [Ollama] Docker container found: {cname}")
+                    r2 = self.run_powershell(f'docker restart "{cname}" 2>&1')
+                    if r2["returncode"] == 0:
+                        self.log(f"  [Ollama] Docker restart OK: {cname}", "SUCCESS")
+                        restarted = True
+                    else:
+                        self.log(
+                            f"  [Ollama] Docker restart failed: "
+                            f"{r2.get('stdout','')[:80]}", "WARNING"
+                        )
+
+            # 2b. Windows-native ollama.exe process
+            if not restarted:
+                r_proc = self.run_powershell(
+                    "Get-NetTCPConnection -LocalPort 11434 -ErrorAction SilentlyContinue "
+                    "| ForEach-Object { Get-Process -Id $_.OwningProcess "
+                    "-ErrorAction SilentlyContinue } "
+                    "| Where-Object { $_.Name -notlike '*docker*' -and "
+                    "$_.Name -notlike '*wsl*' } "
+                    "| Select-Object Id,Name,Path | ConvertTo-Json -Depth 3"
+                )
+                if r_proc["stdout"].strip() and "ollama" in r_proc["stdout"].lower():
+                    self.log(f"  [Ollama] Windows-native process detected")
+                    # Kill and restart
+                    self.run_powershell(
+                        "Get-NetTCPConnection -LocalPort 11434 -ErrorAction SilentlyContinue "
+                        "| ForEach-Object { Stop-Process -Id $_.OwningProcess -Force "
+                        "-ErrorAction SilentlyContinue }"
+                    )
+                    _time.sleep(2)
+                    ollama_exe = (
+                        "$env:LOCALAPPDATA\\Programs\\Ollama\\ollama.exe"
+                    )
+                    self.run_powershell(
+                        f'Start-Process "{ollama_exe}" -ArgumentList "serve" '
+                        '-WindowStyle Hidden 2>$null'
+                    )
+                    self.log("  [Ollama] Windows-native restarted", "SUCCESS")
+                    restarted = True
+
+            # 2c. WSL Ollama
+            if not restarted:
+                r_wsl = self.run_powershell(
+                    'wsl bash -lc "pgrep -l ollama 2>/dev/null" 2>$null'
+                )
+                if r_wsl["stdout"].strip():
+                    self.log("  [Ollama] WSL process detected")
+                    self.run_powershell(
+                        'wsl bash -lc "pkill ollama 2>/dev/null; sleep 2; '
+                        'nohup ollama serve > /tmp/ollama.log 2>&1 &" 2>$null'
+                    )
+                    self.log("  [Ollama] WSL Ollama restarted", "SUCCESS")
+                    restarted = True
+
+            # 2d. Windows Service
+            if not restarted:
+                r_svc = self.run_powershell(
+                    "Get-Service -Name ollama -ErrorAction SilentlyContinue "
+                    "| Select-Object Status | ConvertTo-Json"
+                )
+                if r_svc["stdout"].strip():
+                    self.log("  [Ollama] Windows Service detected")
+                    self.run_powershell(
+                        "Stop-Service -Name ollama -Force -ErrorAction SilentlyContinue; "
+                        "Start-Sleep 3; Start-Service -Name ollama"
+                    )
+                    self.log("  [Ollama] Windows Service restarted", "SUCCESS")
+                    restarted = True
+
+            if not restarted:
+                self.log(
+                    "  [Ollama] No running Ollama instance found on port 11434. "
+                    "Start Ollama manually.", "WARNING"
+                )
+                return
+
+            # ── Step 3: Wait for API to come back ────────────────────────────
+            self.log("  [Ollama] Waiting for API (max 20s)...")
+            for i in range(20):
+                _time.sleep(1)
+                r_health = self.run_powershell(
+                    "Invoke-RestMethod http://127.0.0.1:11434/api/tags "
+                    "-ErrorAction SilentlyContinue 2>$null | ConvertTo-Json"
+                )
+                if r_health["returncode"] == 0 and r_health["stdout"].strip():
+                    self.log(
+                        f"  [Ollama] API reachable after {i+1}s ✓", "SUCCESS"
+                    )
+                    break
+            else:
+                self.log(
+                    "  [Ollama] API not responding after 20s — "
+                    "check Ollama manually.", "WARNING"
+                )
+                return
+
+            # ── Step 4: Verify VRAM is free ───────────────────────────────────
+            r_ps = self.run_powershell(
+                "Invoke-RestMethod http://127.0.0.1:11434/api/ps | "
+                "ConvertTo-Json -Depth 5"
+            )
+            try:
+                import json as _json2
+                ps2 = _json2.loads(r_ps["stdout"]) if r_ps["stdout"].strip() else {}
+                loaded = ps2.get("models", [])
+                if loaded:
+                    self.log(
+                        f"  [Ollama] {len(loaded)} model(s) still loaded "
+                        f"(will unload on next request)", "INFO"
+                    )
+                else:
+                    self.log("  [Ollama] VRAM clear — no models loaded ✓", "SUCCESS")
+            except Exception:
+                pass
+
+            self.log("♻️  Ollama restart complete. Retry your request in Lyra.", "SUCCESS")
+            # Refresh model list
+            self.root.after(500, self._refresh_ollama_models)
+
+        import threading
+        threading.Thread(target=_run, daemon=True).start()
+
 
     def _refresh_ips(self):
         """Shows all local IPv4 addresses in the Lyra tab."""
@@ -2799,6 +3007,14 @@ class OpenClawWinInstaller(OpenClawOperations):
           - wttr.in returns plain text → no HTML strip needed, use directly
           - ollama not visible in PowerShell: _refresh_path() must be called after
             Windows-native install (handled inside install_ollama_wsl)
+
+        v1.0.5 — Worker gateway setup (full parity with Lyra):
+          DECISION #23: Node.js >=22.16.0 checked + upgraded before gateway.
+          DECISION #25: check_openclaw() + fix_openclaw_installation() run.
+          DECISION #26: openclaw gateway install --force → proper gateway.cmd
+            with node.exe path + 'gateway --port 18789' (identical to Lyra).
+          DECISION #27: write_openclaw_config() always called after onboard
+            → ensures gateway.mode=local in openclaw.json.
         """
         self.log(f"\n🤝 WORKER SETUP: {role.upper()} mode")
         self.log(f"   Connecting to LYRA head: {head_address}")

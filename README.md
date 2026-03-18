@@ -35,6 +35,7 @@ From v1.0.4 the system also supports **external LLM agents** (OpenAI-compatible 
 
 ## Table of Contents
 
+- [What's New in v1.0.5](#whats-new-in-v105)
 - [What's New in v1.0.4](#whats-new-in-v104)
 - [What's New in v1.0.3](#whats-new-in-v103)
 - [What's New in v1.0.0](#whats-new-in-v100)
@@ -49,6 +50,62 @@ From v1.0.4 the system also supports **external LLM agents** (OpenAI-compatible 
 - [Current Models](#current-models)
 - [File Paths & Ports](#file-paths--ports)
 - [Running the Installer](#running-the-installer)
+
+---
+
+## What's New in v1.0.5
+
+### ♻️ Restart Ollama Button
+
+New **`♻️ Restart Ollama`** button next to `🔄 Refresh model list` in both the Lyra Config Tab and Worker Config Tab.
+
+**Problem it solves:** Ollama running in Docker (or Windows-native) accumulates VRAM over long sessions. The `expires_at` keep-alive timer does not reliably unload models on Windows, leaving glm-4.7-flash (19 GB) partially in VRAM. On the next request the Ollama runner cannot acquire enough VRAM → `exit status 2: llama runner process has terminated`.
+
+**What the button does:**
+1. Unloads all loaded models via `POST /api/generate` with `keep_alive: 0` — frees VRAM immediately
+2. Detects the active Ollama runtime automatically and restarts it:
+
+| Runtime | Detection | Restart |
+|---|---|---|
+| Docker container | `docker ps \| grep ollama` | `docker restart <container>` |
+| Windows-native | Port 11434 owner process | `taskkill` + `ollama.exe serve` |
+| WSL | `pgrep ollama` in WSL | `pkill` + `ollama serve &` |
+| Windows Service | `Get-Service ollama` | `Stop-Service` + `Start-Service` |
+
+3. Waits up to 20s for the API to respond
+4. Verifies VRAM is clear via `GET /api/ps`
+5. Refreshes the model list automatically
+
+All steps are logged. Implemented in `_restart_ollama()` (DECISION #28).
+
+### 🔒 OLLAMA_KEEP_ALIVE=10m in gateway.cmd
+
+`patch_gateway_cmd()` now injects `SET OLLAMA_KEEP_ALIVE=10m` into `gateway.cmd`. This instructs Ollama to automatically unload models after 10 minutes of inactivity, preventing the VRAM buildup that causes `exit status 2` in the first place. Applied automatically by `🛠 Apply fixes + Update SOUL.md`.
+
+### 🤖 Worker Setup — Full Parity with Lyra (DECISIONS #23–#27)
+
+The Worker installation flow (`_install_worker_mode`) now mirrors the Lyra setup for all gateway-related steps:
+
+| Decision | Fix |
+|---|---|
+| #23 | Node.js ≥22.16.0 checked and upgraded before gateway setup |
+| #24 | `gateway.cmd` stub created from `dist/index.js` if missing after npm reinstall |
+| #25 | `check_openclaw()` + `fix_openclaw_installation()` run in Worker flow — same as Lyra Step 10/16 |
+| #26 | `openclaw gateway install --force` writes proper `gateway.cmd` (node.exe path + `gateway --port 18789`) |
+| #27 | `write_openclaw_config()` always called — ensures `gateway.mode=local` even if onboard wizard wrote incomplete config |
+
+### 🐛 Bug Fixes
+
+| Bug | Fix |
+|---|---|
+| `AttributeError: _gw_status` on Worker startup | `hasattr` guard in `_check_gateway` (DECISION #22) |
+| `Port {port} refused` literal in log | Missing `f` prefix on f-string |
+| Duplicate `check_node()` (wrong version check) | Removed old `major >= 18` check, kept `>22 or (==22 and minor>=16)` |
+| `workers.json` delegation_rules empty on first run | DECISION #21: seeded with canonical rules on `Apply fixes` |
+
+### 📋 SOUL.md — exit status 2 Rule
+
+New SOUL.md rule for `exit status 2`: LYRA switches to `qwen2.5:7b` dynamically via exec (patching `openclaw.json` directly) and restarts the gateway — no manual intervention. After VRAM is clear, the user can switch back to glm via the Installer dropdown.
 
 ---
 
@@ -383,6 +440,8 @@ External LLM ──────────────────────�
 | Transformers diagnose | `AutoModel` + `trust_remote_code=True` | v1.0.0 |
 | LLM Timeout Fallback | 3x timeout → `qwen2.5:7b` · nvidia-smi diagnosis | v1.0.4 |
 | Ollama exit status 2 | VRAM · corrupt blob · version bug | v1.0.4 |
+| exit status 2 action | exec: switch to qwen2.5:7b + restart gateway | v1.0.5 |
+| Worker setup parity  | Node.js · OpenClaw · gateway.cmd auto-setup | v1.0.5 |
 | memorySearch sentinel | Three defense layers | v1.0.4 |
 | PowerShell `${var}:` | `$date:` = drive reference | v1.0.4 |
 | Agent Registry source | `workers.json` only — no Gateway API calls | v1.0.4 |
@@ -396,6 +455,14 @@ External LLM ──────────────────────�
 ---
 
 ## Critical Knowledge — Bugs Already Resolved
+
+### ❌ Worker gateway.cmd missing after npm reinstall — NEVER REINTRODUCE
+`openclaw gateway install` writes `gateway.cmd`. npm `uninstall`/`reinstall` removes the package but not `~/.openclaw/`. On next Worker setup `gateway.cmd` is absent — gateway cannot start.  
+**Fix:** Worker flow now runs `openclaw gateway install --force` (DECISION #26). `patch_gateway_cmd()` creates a stub from `dist/index.js` as fallback (DECISION #24).
+
+### ❌ `openclaw.json` missing `gateway.mode=local` after onboard — NEVER REINTRODUCE
+`openclaw onboard` wizard may write an incomplete `openclaw.json` without `gateway.mode=local`. Gateway start is then blocked with `set gateway.mode=local or pass --allow-unconfigured`.  
+**Fix:** `write_openclaw_config()` always called after onboard — merges all required fields (DECISION #27).
 
 ### ❌ `_results.values()` in LyraHeadServer — NEVER REINTRODUCE
 `_results` is a `list`. Calling `.values()` raises `AttributeError` on `GET /results`. Also `GET /result/<task_id>` was missing entirely.  
@@ -543,20 +610,6 @@ $entry = "[LEARNING] $date: text"                     # ← FAILS
 # Read agent registry
 Get-Content $env:USERPROFILE\.openclaw\workers.json -Raw | ConvertFrom-Json
 ```
-
----
-
-## 🧬 LYRA Creates — DNARusher
-
-LYRA independently conceived and fully implemented her first open-source project: **DNARusher**, a Python library for DNA pattern recognition in noisy sequences.
-
-No template. No step-by-step instruction. From the project name to the finished GitHub README — her work.
-
-She chose a meaningful name that was still available, selected a real scientific domain (bioinformatics / DNA sequence analysis), designed a clean two-class architecture with full type annotations, and authored both the library and its documentation consistently and completely.
-
-She signed it herself: *"Made with ❤️ by Lyra AI"*
-
-→ **[github.com/isonwillis/dnarusher](https://github.com/isonwillis/dnarusher)**
 
 ---
 
