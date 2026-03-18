@@ -1218,8 +1218,31 @@ class OpenClawConfig:
         gw_token = self._read_token_from_config() or "lyra-local-token"
 
         if not os.path.isfile(gateway_cmd):
-            self._log("  gateway.cmd not found – skipping patch", "WARNING")
-            return False
+            # DECISION #24 (v1.0.5): gateway.cmd missing after npm reinstall.
+            # Create a minimal stub so patch_gateway_cmd() can proceed.
+            self._log("  gateway.cmd not found — creating stub...", "WARNING")
+            try:
+                appdata = os.environ.get("APPDATA", "")
+                index_js = os.path.join(
+                    appdata, "npm", "node_modules", "openclaw", "dist", "index.js"
+                )
+                if not os.path.isfile(index_js):
+                    self._log(
+                        "  openclaw not installed (index.js missing) — "
+                        "run: npm install -g openclaw", "ERROR"
+                    )
+                    return False
+                os.makedirs(os.path.dirname(gateway_cmd), exist_ok=True)
+                with open(gateway_cmd, "w", encoding="utf-8", newline="") as _f:
+                    _f.write(
+                        "@echo off\r\n"
+                        f'node "{index_js}" gateway\r\n'
+                    )
+                self._log(f"  gateway.cmd stub created: {gateway_cmd}  ✓", "SUCCESS")
+            except Exception as _e:
+                self._log(f"  gateway.cmd stub creation failed: {_e}", "ERROR")
+                return False
+
 
         # ── DECISION #20: Write undici timeout preload script ─────────────
         preload_path = os.path.join(cfg_dir, "undici-timeout-preload.cjs")
@@ -4483,17 +4506,6 @@ class OpenClawOperations:
     # NODE.JS
     # ──────────────────────────────────────────────────────────────────
 
-    def check_node(self):
-        r = self.run_powershell("node -v 2>$null")
-        if r["stdout"].startswith("v"):
-            ver = r["stdout"].strip()
-            try:
-                major = int(ver.replace("v", "").split(".")[0])
-            except:
-                major = 0
-            return ver, major >= 18  # >= 18 is enough for OpenClaw
-        return None, False
-
     def install_node(self):
         """
         Installs or upgrades Node.js to a version compatible with OpenClaw 2026.3.12+.
@@ -6086,6 +6098,7 @@ exit 1
             self.log(f"{prefix}Error: {e}", "WARNING")
             # Fallback: normal call
             return self.run_powershell_live(command, timeout=timeout, prefix=prefix)
+
 
     def setup_gateway(self):
         self.log("Setting up gateway...")

@@ -1455,7 +1455,20 @@ class OpenClawWinInstaller(OpenClawOperations):
         Strategie: /health zuerst (200 = laeuft), Fallback auf /api/health.
         Token als Query-Parameter: auth.mode=token, _diag_api sendet bei GET
         keinen Auth-Header (SearXNG-Kompatibilitaet).
+
+        DECISION #22 (v1.0.5): Guard against Worker role.
+          _gw_status only exists on Lyra (HEAD) tab — _build_lyra_tab() creates it.
+          On Worker machines _build_worker_tab() is used instead and _gw_status is
+          never created. _restart_gateway() schedules this method via root.after()
+          without role-checking, causing AttributeError on Worker startup.
+          Fix: early return when _gw_status widget is absent.
+        DECISION #22 (v1.0.5): Guard against Worker role. _gw_status only
+          exists on HEAD tab. Worker tab never creates it.
         """
+        if not hasattr(self, "_gw_status"):
+            self.log("[Gateway] _check_gateway skipped — Worker role.", "INFO")
+            return
+
         token = self.cfg._read_token_from_config() or "lyra-local-token"
         # Primary: /health (2026.3.1+)
         url = f"http://127.0.0.1:18789/health?token={token}"
@@ -2189,7 +2202,7 @@ class OpenClawWinInstaller(OpenClawOperations):
             hint = ""
             err = str(body)
             if "10061" in err or "refused" in err.lower():
-                hint = " → LYRA head task server not running (Port {port} refused)."
+                hint = f" → LYRA head task server not running (Port {port} refused on {head})."
             elif "10060" in err or "timed out" in err.lower():
                 hint = f" → Timeout 6s – IP '{head}' wrong or firewall blocking."
             elif "11001" in err or "Name or service" in err:
@@ -2800,6 +2813,117 @@ class OpenClawWinInstaller(OpenClawOperations):
             ollama_timeout = 600
 
         self.log(f"   Model for {role}: {worker_model}")
+
+        # ── DECISION #23: Node.js check + upgrade (v1.0.5) ──────────
+        # Worker gateway requires Node.js >=22.16.0 (OpenClaw 2026.3.12+).
+        self._set_status(f"{role}: Checking Node.js...")
+        self.log(f"\n\U0001f4e6 Node.js check for {role}")
+        node_ver, node_ok = self.check_node()
+        if node_ver:
+            if node_ok:
+                self.log(f"  Node.js {node_ver} — OK (>=22.16.0) ✓", "SUCCESS")
+            else:
+                self.log(
+                    f"  Node.js {node_ver} too old (need >=22.16.0) — upgrading...",
+                    "WARNING"
+                )
+                self.install_node()
+                node_ver, node_ok = self.check_node()
+                if node_ok:
+                    self.log(f"  Node.js {node_ver} upgraded ✓", "SUCCESS")
+                else:
+                    self.log(
+                        f"  Node.js upgrade incomplete ({node_ver}) — "
+                        "gateway may fail. Install manually: winget install OpenJS.NodeJS.LTS",
+                        "WARNING"
+                    )
+        else:
+            self.log("  Node.js not found — installing...", "WARNING")
+            if not self.install_node():
+                self.log(
+                    "  Node.js install failed — gateway will not start! "
+                    "Install manually: winget install OpenJS.NodeJS.LTS",
+                    "ERROR"
+                )
+            else:
+                node_ver, _ = self.check_node()
+                self.log(f"  Node.js {node_ver} installed ✓", "SUCCESS")
+
+        # ── DECISION #25: OpenClaw install check (v1.0.5) ────────────
+        # OpenClaw npm package must be present on the Worker — it provides
+        # the gateway process (dist/index.js). Previously assumed to always
+        # be installed; broke silently after npm uninstall/reinstall.
+        # Worker setup now mirrors Lyra Step 10/16: check + install if needed.
+        self._set_status(f"{role}: Checking OpenClaw...")
+        self.log(f"\n\U0001f916 OpenClaw check for {role}")
+        oc_ok, oc_detail = self.check_openclaw()
+        if oc_ok and oc_detail == "ok":
+            self.log("  OpenClaw already installed and functional ✓", "SUCCESS")
+        else:
+            msg = ("  OpenClaw found but incomplete — repairing..."
+                   if oc_ok else "  OpenClaw not found — installing...")
+            self.log(msg, "WARNING")
+            if not self.fix_openclaw_installation():
+                self.log(
+                    "  OpenClaw installation failed — gateway will not start!\n"
+                    "  Run manually: npm install -g openclaw",
+                    "ERROR"
+                )
+                # Non-fatal for worker task server — continue setup
+                # but gateway restart button will fail until fixed
+            else:
+                self.log("  OpenClaw installed ✓", "SUCCESS")
+
+        # ── DECISION #26: gateway.cmd setup — identical to Lyra ────
+        # Lyra: setup_gateway() runs openclaw onboard + openclaw gateway install
+        # which writes the full gateway.cmd with node.exe path + gateway --port.
+        # Worker must do exactly the same. --force rewrites even if already present
+        # so the format always matches Lyra (node.exe path, gateway --port 18789).
+        self.log("\n🚪 Setting up gateway.cmd (openclaw gateway install --force)...")
+        oc = self.get_openclaw_cmd()
+        # Step A: onboard — initialises ~/.openclaw/ and openclaw.json
+        self.log("  openclaw onboard...")
+        r_ob = self._run_with_yes_input(
+            f"{oc} onboard 2>&1", timeout=90, prefix="    "
+        )
+        self.log(f"  onboard exit {r_ob['returncode']}", "INFO")
+        time.sleep(2)
+        # Step B: gateway install --force — writes proper gateway.cmd like Lyra
+        # --force rewrites even if 'Gateway service already registered'
+        self.log("  openclaw gateway install --force...")
+        r_gi = self._run_with_yes_input(
+            f"{oc} gateway install --force 2>&1", timeout=60, prefix="    "
+        )
+        self.log(f"  gateway install exit {r_gi['returncode']}: "
+                 f"{(r_gi['stdout']+r_gi.get('stderr','')).strip()[:80]}", "INFO")
+        time.sleep(2)
+        gw_cmd_path = os.path.join(
+            os.path.expanduser("~"), ".openclaw", "gateway.cmd"
+        )
+        if os.path.isfile(gw_cmd_path):
+            self.log("  gateway.cmd created by openclaw ✓", "SUCCESS")
+        else:
+            self.log("  gateway.cmd still missing — patch_gateway_cmd will create stub",
+                     "WARNING")
+        # ── DECISION #27: write/fix openclaw.json (v1.0.5) ────────
+        # openclaw onboard may write an incomplete openclaw.json that
+        # lacks gateway.mode=local — causing 'Gateway start blocked'.
+        # Always call write_openclaw_config() which merges correct values
+        # (gateway.mode, auth.token, auth.password, etc.) into the file.
+        # Safe: write_openclaw_config() preserves existing valid values
+        # via deep-merge and only overwrites missing/sentinel fields.
+        self.log("  Writing/verifying openclaw.json config...")
+        try:
+            self.cfg.write_openclaw_config(
+                primary_model="qwen2.5:0.5b",
+                hw_profile=self._hw_profile
+            )
+            self.log("  openclaw.json written ✓", "SUCCESS")
+        except Exception as _e:
+            self.log(f"  openclaw.json write failed: {_e}", "WARNING")
+
+        # Inject ENV block (TZ, token, undici) — idempotent, safe to always call
+        self.cfg.patch_gateway_cmd()
 
         # ── Check WSL2 / Ollama ──────────────────────────────────────
         self._set_status(f"{role}: Checking WSL2 + Ollama...")
