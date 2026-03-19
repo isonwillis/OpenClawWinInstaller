@@ -55,8 +55,10 @@ TYPE_META: dict[str, dict] = {
                "show_port": True,  "show_key": False, "show_model": True},
     "openai": {"protocol": "openai",   "port": 443,
                "show_port": False, "show_key": True,  "show_model": True},
-    "custom": {"protocol": "openai",   "port": 8080,
-               "show_port": True,  "show_key": True,  "show_model": True},
+    "custom":      {"protocol": "openai",   "port": 8080,
+                    "show_port": True,  "show_key": True,  "show_model": True},
+    "claude_code": {"protocol": "process",  "port": 0,
+                    "show_port": False, "show_key": False, "show_model": False},
 }
 
 PROTOCOLS   = ["openclaw", "openai", "ollama"]
@@ -209,6 +211,8 @@ class _HealthPoller(threading.Thread):
         base    = _agent_base_url(agent)
         atype   = agent.get("type", "worker")
         api_key = agent.get("api_key", "")
+        if atype == "claude_code":
+            return "", ""  # never called — poll loop uses process check
         if atype == "openai":
             return f"{base}/models", api_key
         if atype == "ollama":
@@ -221,12 +225,32 @@ class _HealthPoller(threading.Thread):
             return
         results = []
         for a in agents:
+            atype = a.get("type", "worker")
+            # claude_code: check if lyra_observer.ps1 is in powershell cmdline
+            if atype == "claude_code":
+                online = False
+                try:
+                    import subprocess as _sp
+                    _r = _sp.run(
+                        ["wmic", "process", "where",
+                         "name='powershell.exe'",
+                         "get", "CommandLine", "/format:csv"],
+                        capture_output=True,
+                        encoding="utf-8", errors="replace",
+                        timeout=4,
+                        creationflags=0x08000000  # CREATE_NO_WINDOW
+                    )
+                    online = "lyra_observer" in _r.stdout.lower()
+                except Exception:
+                    pass
+                info = "running" if online else "not running"
+                results.append({"agent": a, "online": online, "info": info})
+                continue
             url, key = self._health_url_and_key(a)
             sc, body = _diag_api(url, timeout=4, api_key=key)
             online = (0 < sc < 400)
             info   = "OK"
             if online and isinstance(body, dict):
-                atype = a.get("type", "worker")
                 if atype == "worker":
                     info = f"role={body.get('role', '?')}"
                 elif atype == "ollama":
@@ -813,6 +837,29 @@ class MonitoringTab:
         atype   = a["type"]
         base    = _agent_base_url(a)
         api_key = a.get("api_key", "")
+
+        if atype == "claude_code":
+            # Check if lyra_observer.ps1 is running in powershell
+            try:
+                import subprocess as _sp2
+                _r2 = _sp2.run(
+                    ["wmic", "process", "where",
+                     "name='powershell.exe'",
+                     "get", "CommandLine", "/format:csv"],
+                    capture_output=True,
+                    encoding="utf-8", errors="replace",
+                    timeout=4,
+                    creationflags=0x08000000  # CREATE_NO_WINDOW
+                )
+                found = "lyra_observer" in _r2.stdout.lower()
+                msg = "✅ Claude Code Observer — running" if found \
+                      else "❌ Claude Code Observer — not running"
+                clr = "green" if found else "red"
+            except Exception as ex:
+                msg, clr, found = f"❌ Check failed: {ex}", "red", False
+            self._reg_status_lbl.config(text=msg, foreground=clr)
+            self._log(f"[Monitor] {msg}", "SUCCESS" if found else "ERROR")
+            return
 
         if atype == "openai":
             # Health check via /models — works for OpenAI (/v1/models) and

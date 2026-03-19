@@ -60,6 +60,9 @@ import uuid
 import socket
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+# Claude Code: no import at startup — loaded lazily when install button clicked
+CLAUDE_CODE_AVAILABLE = False  # set to True lazily in _cc_load_module()
+
 # ══════════════════════════════════════════════════════════════════════════════
 # LYRA HEAD-WORKER COMMUNICATION
 # ══════════════════════════════════════════════════════════════════════════════
@@ -110,10 +113,24 @@ class OpenClawWinInstaller(OpenClawOperations):
         # Auto-start task server on Lyra at app launch (no manual click needed)
         if self._saved_role == "Lyra":
             self.root.after(1000, self._auto_start_head_task_server)
+            self.root.after(4000, self._cc_auto_start)
 
     # ──────────────────────────────────────────────────────────────────
     # CONFIG EARLY READ (without dialog)
     # ──────────────────────────────────────────────────────────────────
+
+    def _on_close(self):
+        """Clean shutdown — stop poller thread before destroying tkinter."""
+        try:
+            if hasattr(self, "monitoring") and self.monitoring:
+                self.monitoring.destroy()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
 
     def _read_machine_role_silent(self):
         """Reads machine_role.json without dialog. Returns (role, head) or (None, None)."""
@@ -789,6 +806,31 @@ class OpenClawWinInstaller(OpenClawOperations):
             font=("Arial", 8), foreground="#888888", wraplength=300)
         self._pull_status.pack(anchor=tk.W, pady=(6, 0))
 
+        # ── Claude Code Observer ──────────────────────────────────────
+        cc_lf = ttk.LabelFrame(sec_llm, text="🔵  Claude Code Observer",
+                               padding="8")
+        cc_lf.pack(fill=tk.X, pady=(10, 0))
+        cc_row1 = ttk.Frame(cc_lf)
+        cc_row1.pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(cc_row1, text="⬇ Install Claude Code",
+                   command=self._cc_install).pack(side=tk.LEFT)
+        self._cc_status = ttk.Label(cc_row1, text="",
+                                    font=("Arial", 8), foreground="#888888")
+        self._cc_status.pack(side=tk.LEFT, padx=(10, 0))
+        self._cc_enabled_var = tk.BooleanVar()
+        ttk.Checkbutton(cc_lf,
+                        text="Start Claude Code Observer on app launch",
+                        variable=self._cc_enabled_var,
+                        command=self._cc_toggle_enabled
+                        ).pack(anchor=tk.W)
+        self._cc_autonomous_var = tk.BooleanVar()
+        ttk.Checkbutton(cc_lf,
+                        text="Work autonomously  (improves Lyra without user prompts)",
+                        variable=self._cc_autonomous_var,
+                        command=self._cc_toggle_autonomous
+                        ).pack(anchor=tk.W)
+        self.root.after(300, self._cc_refresh_status_loop)
+
         # Auto-load model list on tab open
         self.root.after(900, self._refresh_ollama_models)
 
@@ -1069,6 +1111,279 @@ class OpenClawWinInstaller(OpenClawOperations):
     # ──────────────────────────────────────────────────────────────────
     # DIAGNOSTIC ACTIONS
     # ──────────────────────────────────────────────────────────────────
+
+    # ──────────────────────────────────────────────────────────────────
+    # CLAUDE CODE OBSERVER
+    # ──────────────────────────────────────────────────────────────────
+
+    def _cc_project_dir(self) -> str:
+        """Absolute path to the project folder (contains OpenClawWinInstaller.py)."""
+        # Try multiple sources to find the real project dir
+        candidates = []
+        # 1. sys.argv[0] — most reliable when running as .py or .exe
+        if sys.argv:
+            candidates.append(os.path.dirname(os.path.abspath(sys.argv[0])))
+        # 2. __file__ if available
+        try:
+            candidates.append(os.path.dirname(os.path.abspath(__file__)))
+        except NameError:
+            pass
+        # 3. Known hardcoded fallback
+        candidates.append(r"C:\Python\Projects\ClawBotInstaller")
+        # Return first candidate that contains OpenClawWinInstaller.py
+        for c in candidates:
+            if os.path.isfile(os.path.join(c, "OpenClawWinInstaller.py")):
+                return c
+            # also check one level up (dist folder)
+            parent = os.path.dirname(c)
+            if os.path.isfile(os.path.join(parent, "OpenClawWinInstaller.py")):
+                return parent
+        return candidates[0] if candidates else os.getcwd()
+
+    def _cc_observer_script(self) -> str:
+        """Absolute path to lyra_observer.ps1 in the project root."""
+        return os.path.join(self._cc_project_dir(), "lyra_observer.ps1")
+
+    def _cc_claude_md(self) -> str:
+        """Absolute path to CLAUDE.md in the project root."""
+        return os.path.join(self._cc_project_dir(), "CLAUDE.md")
+
+    def _cc_is_claude_installed(self) -> bool:
+        """Check if claude CLI exists — simple file check, no PowerShell."""
+        appdata = os.environ.get("APPDATA", "")
+        for p in [
+            os.path.join(appdata, "npm", "claude.ps1"),
+            os.path.join(appdata, "npm", "claude.cmd"),
+            os.path.join(appdata, "npm", "claude"),
+        ]:
+            if os.path.isfile(p):
+                return True
+        return False
+
+    def _cc_is_setup_complete(self) -> bool:
+        """True if CLAUDE.md + lyra_observer.ps1 exist."""
+        return (os.path.isfile(self._cc_claude_md()) and
+                os.path.isfile(self._cc_observer_script()))
+
+    def _cc_is_running(self) -> bool:
+        """Check if lyra_observer.ps1 is running.
+        Uses WMI Win32_Process via COM — no subprocess, no window.
+        """
+        try:
+            import subprocess
+            r = subprocess.run(
+                ["wmic", "process", "where",
+                 "name='powershell.exe'",
+                 "get", "CommandLine", "/format:csv"],
+                capture_output=True,
+                encoding="utf-8", errors="replace",
+                timeout=4,
+                creationflags=0x08000000  # CREATE_NO_WINDOW
+            )
+            return "lyra_observer" in r.stdout.lower()
+        except Exception:
+            return False
+    def _cc_refresh_status_loop(self):
+        """Refresh status once, then schedule next refresh in 10s."""
+        self._cc_refresh_status()
+        if hasattr(self, "_cc_status"):
+            self.root.after(10000, self._cc_refresh_status_loop)
+
+    def _cc_refresh_status(self):
+        """Update status label — called once at startup and after actions."""
+        if not hasattr(self, "_cc_status"):
+            return
+        proj = self._cc_project_dir()
+        cli  = self._cc_is_claude_installed()
+        setup = self._cc_is_setup_complete()
+        running = self._cc_is_running()
+
+        if running:
+            self._cc_status.config(text="● Running", foreground="#00e676")
+        elif cli and setup:
+            self._cc_status.config(text="● Ready (not running)", foreground="#888888")
+        elif cli and not setup:
+            self._cc_status.config(text="⚠ Click Install to setup", foreground="#ffb300")
+        else:
+            self._cc_status.config(text="⚠ claude not installed", foreground="#ff4444")
+
+        # Load checkbox states
+        data = self._cc_read_settings()
+        if hasattr(self, "_cc_enabled_var"):
+            self._cc_enabled_var.set(data.get("claude_code_enabled", False))
+        if hasattr(self, "_cc_autonomous_var"):
+            self._cc_autonomous_var.set(data.get("claude_code_autonomous", False))
+
+    def _cc_read_settings(self) -> dict:
+        """Read claude_code_enabled + claude_code_autonomous from machine_role.json."""
+        path = os.path.join(os.path.expanduser("~"), ".openclaw", "machine_role.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _cc_write_settings(self, enabled: bool, autonomous: bool):
+        """Persist Claude Code checkbox states to machine_role.json."""
+        path = os.path.join(os.path.expanduser("~"), ".openclaw", "machine_role.json")
+        try:
+            data = self._cc_read_settings()
+            data["claude_code_enabled"]    = enabled
+            data["claude_code_autonomous"] = autonomous
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            self.log(f"[ClaudeCode] Settings save failed: {e}", "WARNING")
+
+    def _cc_load_module(self):
+        """Lazily load InstallerLogic from Tools/ClaudeCodeSetup/ClaudeCodeSetup.py."""
+        global CLAUDE_CODE_AVAILABLE, _ClaudeCodeLogic
+        if CLAUDE_CODE_AVAILABLE:
+            return True
+        proj = self._cc_project_dir()
+        tools_dir = os.path.join(proj, "Tools")
+        setup_py  = os.path.join(tools_dir, "ClaudeCodeSetup", "ClaudeCodeSetup.py")
+        if not os.path.isfile(setup_py):
+            self.log(f"[ClaudeCode] Not found: {setup_py}", "WARNING")
+            return False
+        if tools_dir not in sys.path:
+            sys.path.insert(0, tools_dir)
+        try:
+            # Provide a stub tkinter so ClaudeCodeSetup imports cleanly
+            # in frozen binaries where tkinter path differs
+            import importlib, types
+            if 'ClaudeCodeSetup.ClaudeCodeSetup' in sys.modules:
+                del sys.modules['ClaudeCodeSetup.ClaudeCodeSetup']
+            if 'ClaudeCodeSetup' in sys.modules:
+                del sys.modules['ClaudeCodeSetup']
+            import importlib.util as _ilu
+            _cc_path = os.path.join(tools_dir, 'ClaudeCodeSetup', 'ClaudeCodeSetup.py')
+            _spec = _ilu.spec_from_file_location('_cc_temp', _cc_path)
+            _mod  = _ilu.module_from_spec(_spec)
+            # Inject the already-loaded tkinter into the module's namespace
+            import tkinter as _tk
+            import tkinter.ttk as _ttk
+            import tkinter.filedialog as _fd
+            import tkinter.scrolledtext as _st
+            import tkinter.messagebox as _mb
+            _mod.__dict__['tk']           = _tk
+            _mod.__dict__['ttk']          = _ttk
+            _mod.__dict__['filedialog']   = _fd
+            _mod.__dict__['scrolledtext'] = _st
+            _mod.__dict__['messagebox']   = _mb
+            _spec.loader.exec_module(_mod)
+            _ClaudeCodeLogic      = _mod.InstallerLogic
+            CLAUDE_CODE_AVAILABLE = True
+            self.log("[ClaudeCode] Module loaded ✓", "SUCCESS")
+            return True
+        except Exception as e:
+            self.log(f"[ClaudeCode] Module load failed: {e}", "ERROR")
+            return False
+
+    def _cc_install(self):
+        """Run ClaudeCodeSetup.InstallerLogic.install() to create CLAUDE.md + scripts."""
+        if not self._cc_load_module():
+            return
+        proj = self._cc_project_dir()
+        ocl  = self.cfg._find_openclaw_config_dir()
+        self.log("\n🔵 Installing Claude Code Observer...")
+        import threading
+        def _run():
+            logic = _ClaudeCodeLogic(log_cb=self.log,
+                                     status_cb=lambda msg, lvl="info": None)
+            logic.install(proj, ocl)
+            self.root.after(0, self._cc_refresh_status)
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _cc_toggle_enabled(self):
+        """Checkbox A toggled — start or stop observer terminal and save state."""
+        enabled    = self._cc_enabled_var.get()
+        autonomous = self._cc_autonomous_var.get()
+        if not enabled:
+            autonomous = False
+            if hasattr(self, "_cc_autonomous_var"):
+                self._cc_autonomous_var.set(False)
+        self._cc_write_settings(enabled, autonomous)
+        if enabled:
+            if not self._cc_is_setup_complete():
+                self.log("[ClaudeCode] Run Install first.", "WARNING")
+                self._cc_enabled_var.set(False)
+                return
+            self._cc_start_terminal()
+        else:
+            self._cc_stop_terminal()
+        self._cc_refresh_status()
+
+    def _cc_toggle_autonomous(self):
+        """Checkbox B toggled — rewrite CLAUDE.md and restart terminal if running."""
+        autonomous = self._cc_autonomous_var.get()
+        enabled    = self._cc_enabled_var.get()
+        if autonomous and not enabled:
+            self._cc_enabled_var.set(True)
+            enabled = True
+        self._cc_write_settings(enabled, autonomous)
+        # Rewrite CLAUDE.md with updated mode
+        if self._cc_load_module():
+            proj = self._cc_project_dir()
+            ocl  = self.cfg._find_openclaw_config_dir()
+            try:
+                _ClaudeCodeLogic(log_cb=self.log,
+                                 status_cb=lambda m, l="info": None
+                                 ).write_claude_md(proj, ocl, autonomous=autonomous)
+                self.log(f"[ClaudeCode] CLAUDE.md updated "
+                         f"({'autonomous' if autonomous else 'interactive'}) ✓", "SUCCESS")
+            except Exception as e:
+                self.log(f"[ClaudeCode] CLAUDE.md write failed: {e}", "WARNING")
+        # Restart terminal if running
+        if self._cc_is_running():
+            self._cc_stop_terminal()
+            self.root.after(2000, self._cc_start_terminal)
+        elif enabled:
+            self._cc_start_terminal()
+        self._cc_refresh_status()
+
+    def _cc_start_terminal(self):
+        """Launch lyra_observer.ps1 in Windows Terminal or a normal PowerShell window."""
+        script = self._cc_observer_script()
+        if not os.path.isfile(script):
+            self.log("[ClaudeCode] lyra_observer.ps1 missing — click Install.", "WARNING")
+            return
+        import subprocess
+        try:
+            # Windows Terminal — visible, normal window
+            subprocess.Popen(
+                ["wt.exe", "powershell", "-ExecutionPolicy", "Bypass", "-File", script]
+            )
+        except FileNotFoundError:
+            # No Windows Terminal — regular PowerShell window (Normal, visible)
+            subprocess.Popen(
+                ["powershell.exe", "-NoProfile",
+                 "-ExecutionPolicy", "Bypass",
+                 "-WindowStyle", "Normal",
+                 "-File", script],
+                creationflags=0x00000010  # CREATE_NEW_CONSOLE
+            )
+        self.log("[ClaudeCode] Observer terminal started ✓", "SUCCESS")
+
+    def _cc_stop_terminal(self):
+        """Stop the observer by killing all powershell processes running lyra_observer."""
+        self.run_powershell(
+            "Get-Process -Name claude -ErrorAction SilentlyContinue | Stop-Process -Force"
+        )
+        self.log("[ClaudeCode] Observer stopped.", "INFO")
+
+    def _cc_auto_start(self):
+        """Called 4s after app launch — start observer if enabled."""
+        data = self._cc_read_settings()
+        if not data.get("claude_code_enabled", False):
+            return
+        if not self._cc_is_setup_complete():
+            return
+        if self._cc_is_running():
+            return
+        self.log("[ClaudeCode] Auto-starting observer...", "INFO")
+        self._cc_start_terminal()
+
 
     def _restart_ollama(self):
         """
@@ -3976,7 +4291,8 @@ class OpenClawWinInstaller(OpenClawOperations):
 
 def main():
     root = tk.Tk()
-    OpenClawWinInstaller(root)
+    app = OpenClawWinInstaller(root)
+    root.protocol("WM_DELETE_WINDOW", app._on_close)
     root.mainloop()
 
 

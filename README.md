@@ -40,6 +40,7 @@ From v1.0.4 the system also supports **external LLM agents** (OpenAI-compatible 
 - [What's New in v1.0.3](#whats-new-in-v103)
 - [What's New in v1.0.0](#whats-new-in-v100)
 - [Three-Module Architecture](#three-module-architecture)
+- [Tools](#tools)
 - [Machines](#machines)
 - [What Works](#what-works)
 - [Machine Role Hierarchy](#machine-role-hierarchy)
@@ -127,6 +128,7 @@ The Monitoring Tab has been completely rewritten. The old Worker-only registry i
 | `ollama` | ollama (sync) | POST /api/chat · GET /api/tags |
 | `openai` | openai (sync) | POST /v1/chat/completions · GET /v1/models |
 | `custom` | openai or ollama | best-effort /health |
+| `claude_code` | process | — (no port · no key · no model) |
 
 **Field visibility** is dynamic — irrelevant fields hidden by type:
 
@@ -136,6 +138,7 @@ The Monitoring Tab has been completely rewritten. The old Worker-only registry i
 | `ollama` | URL · Port · Name · Role · Model |
 | `openai` | URL · Name · Role · Model · API Key _(Port hidden)_ |
 | `custom` | All fields |
+| `claude_code` | Name · Role only _(no URL · no Port · no Key · no Model)_ |
 
 **Inline edit** — click any agent → all fields prefill → modify → `💾 Update Agent`. No re-entry required.
 
@@ -364,11 +367,27 @@ The original 9005-line monolith split into three focused files:
 ## Three-Module Architecture
 
 ```
-OpenClawWinInstaller.py        3 454 lines   GUI + installation flow
-OpenClawConfigManagement.py    5 801 lines   All logic, servers, config
-OpenClawAgentMonitoring.py     1 081 lines   Monitoring Tab (self-contained)
+OpenClawWinInstaller.py        4 292 lines   GUI + installation flow
+OpenClawConfigManagement.py    6 284 lines   All logic, servers, config
+OpenClawAgentMonitoring.py     1 120 lines   Monitoring Tab (self-contained)
 ─────────────────────────────────────────
-Total                         10 336 lines
+Total                         11 696 lines
+```
+
+---
+
+## Tools
+
+Standalone utilities in `Tools/` — each in its own subdirectory with `.py` + `.md`.
+
+| Tool | File | Description |
+|---|---|---|
+| Claude Code Setup | `Tools/ClaudeCodeSetup/ClaudeCodeSetup.py` | GUI installer for the Claude Code ↔ Lyra self-improvement bridge. Installs, configures, starts, stops and uninstalls the observer layer. Can be run standalone — independent of the main installer. |
+| PyTorch Setup GUI | `Tools/pytorch_setup_gui/pytorch_setup_gui.py` | PyTorch & Transformers Setup GUI (COMPLETE EDITION). Detects CUDA version automatically, creates a virtual environment, installs PyTorch with the correct CUDA build, and runs a comprehensive test suite. Includes `HardwareDetector`, `InstallationTester`, and `PyTorchInstaller` classes. |
+
+```bash
+python Tools/ClaudeCodeSetup/ClaudeCodeSetup.py
+python Tools/pytorch_setup_gui/pytorch_setup_gui.py
 ```
 
 ---
@@ -563,6 +582,10 @@ Skill check was a session blocker. Only delegation via that tool is affected whe
 
 ### ❌ `memorySearch` sentinel returns after every Gateway start — NEVER REINTRODUCE
 **Fix:** `_post_gateway_sentinel_fix()` runs 500ms after every health-check.
+
+### ❌ `doctor --fix` loop — NEVER REINTRODUCE
+`openclaw doctor --fix` rewrites `openclaw.json` to strip rejected keys. If `write_openclaw_config()` then re-inserts a rejected key (e.g. `runTimeoutSeconds`), the next gateway start fails → another `doctor --fix` run → infinite loop.
+**Fix:** `write_openclaw_config()` and `_write_llm_to_config()` never write any schema-rejected key. `REJECTED_KEYS_*` constants enumerate all known bad keys and strip them on every config write (DECISION #7).
 
 ### ❌ `runTimeoutSeconds` in openclaw.json — NEVER REINTRODUCE
 Schema rejected → Gateway cannot start. Only `agents.defaults.timeoutSeconds` is valid.

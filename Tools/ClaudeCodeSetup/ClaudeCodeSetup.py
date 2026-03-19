@@ -1,5 +1,6 @@
+# -*- coding: utf-8 -*-
 """
-ClaudeCodeSetup.py  --  v1.0.1
+ClaudeCodeSetup.py  --  v1.0.4
 Claude Code ↔ Lyra Self-Improvement Bridge Installer
 ────────────────────────────────────────────────────
 Installs, configures, starts, stops and uninstalls the
@@ -57,7 +58,8 @@ FONT_SMALL  = ("Segoe UI", 9)
 # CLAUDE.md TEMPLATE
 # ──────────────────────────────────────────────────────────────────────────────
 
-def build_claude_md(project_dir: str, openclaw_dir: str) -> str:
+def build_claude_md(project_dir: str, openclaw_dir: str,
+                    autonomous: bool = False) -> str:
     workspace  = os.path.join(openclaw_dir, "workspace")
     memory     = os.path.join(workspace, "memory")
     skills     = os.path.join(openclaw_dir, "skills")
@@ -324,7 +326,29 @@ Before any write operation, Claude Code will show:
   WRITE: <file path>
   CHANGE: <summary>
   Confirm? [y/N]
-"""
+""" + (
+f"""
+
+## Autonomous Mode (ACTIVE)
+
+Start immediately without waiting for user input.
+Run the full Observe -> Identify -> Fix cycle on every startup.
+
+Autonomous actions PERMITTED:
+- Read all files in allowed directories
+- Write SOUL.md, memory, skills (Track 1)
+- Write OpenClawConfigManagement.py (Track 2)
+- Restart Lyra Gateway via exec (Stop-Process node + cmd gateway.cmd)
+- Restart Ollama via exec (docker restart mein-ki-setup-ollama-1)
+- Write log entries for every action
+
+Autonomous actions FORBIDDEN (always require user confirmation):
+- Changing openclaw.json gateway token
+- Deleting any file
+- npm install / uninstall
+- Changing APP_VERSION in any file
+- Modifying ClaudeCodeSetup.py itself
+""" if autonomous else "")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # OBSERVER SCRIPT TEMPLATE
@@ -596,6 +620,7 @@ class InstallerLogic:
         self.log(f"      npm {r.stdout.strip()} ({' '.join(npm)})", "info")
 
     def check_claude_code(self):
+        """Verify claude CLI is installed and return its version string."""
         claude = self._claude_cmd()
         r      = subprocess.run(claude + ["--version"], capture_output=True, text=True, shell=False)
         if r.returncode != 0 or not r.stdout.strip():
@@ -667,12 +692,13 @@ class InstallerLogic:
             os.makedirs(d, exist_ok=True)
             self.log(f"      📁 {d}", "info")
 
-    def write_claude_md(self, project_dir: str, openclaw_dir: str):
+    def write_claude_md(self, project_dir: str, openclaw_dir: str,
+                         autonomous: bool = False):
         path    = os.path.join(project_dir, "CLAUDE.md")
-        content = build_claude_md(project_dir, openclaw_dir)
+        content = build_claude_md(project_dir, openclaw_dir, autonomous=autonomous)
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
-        self.log(f"      📄 {path}", "info")
+        self.log(f"      📄 {path} (autonomous={autonomous})", "info")
 
     def write_scripts(self, project_dir: str, openclaw_dir: str):
         scripts = {
@@ -706,6 +732,38 @@ class InstallerLogic:
             f.write(content)
         self.log(f"      📋 {log_path}", "info")
 
+    def write_workers_entry(self, openclaw_dir: str, autonomous: bool = False):
+        """Add/update Claude Code Observer entry in workers.json."""
+        workers_path = os.path.join(openclaw_dir, "workers.json")
+        try:
+            with open(workers_path, "r", encoding="utf-8") as f:
+                workers = json.load(f)
+        except Exception:
+            workers = []
+        # Remove any existing claude_code entry
+        workers = [w for w in workers if w.get("type") != "claude_code"]
+        workers.append({
+            "type":       "claude_code",
+            "name":       "Claude Code Observer",
+            "role":       "Observer",
+            "protocol":   "process",
+            "ip":         "127.0.0.1",
+            "port":       0,
+            "model":      "",
+            "api_key":    "",
+            "autonomous": autonomous,
+            "delegation_rules": (
+                "WANN: Lyra erkennt exit status 2, SOUL.md-Widerspruch, oder [SOUL-UPDATE-VORSCHLAG]\n"
+                "NICHT: Routineaufgaben, Web-Suchen, normale User-Tasks\n"
+                "GRUND: Externer Claude Code Observer fuer Selbstverbesserung"
+            )
+        })
+        import shutil as _sh
+        _sh.copy2(workers_path, workers_path + ".bak")
+        with open(workers_path, "w", encoding="utf-8") as f:
+            json.dump(workers, f, indent=2, ensure_ascii=False)
+        self.log(f"      📋 workers.json updated (claude_code entry added)", "info")
+
     def install(self, project_dir: str, openclaw_dir: str):
         ok = True
         ok &= self.run_step("Python-Version prüfen",    self.check_python)
@@ -716,6 +774,7 @@ class InstallerLogic:
         ok &= self.run_step("CLAUDE.md schreiben",       lambda: self.write_claude_md(project_dir, openclaw_dir))
         ok &= self.run_step("Scripts schreiben",         lambda: self.write_scripts(project_dir, openclaw_dir))
         ok &= self.run_step("Install-Log schreiben",     lambda: self.write_install_log(project_dir, openclaw_dir))
+        ok &= self.run_step("workers.json aktualisieren", lambda: self.write_workers_entry(openclaw_dir))
 
         if ok:
             self.status("✅  Installation abgeschlossen", "ok")
