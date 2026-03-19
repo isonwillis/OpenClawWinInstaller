@@ -135,6 +135,13 @@ ARCHITECTURAL DECISIONS  (read before changing anything)
     Adaptive fix removes remote sub-block and sets provider+fallback if wrong.
     Docs: "If you don't want to set an API key, use provider='local' or
     set fallback='none'." (openclaw.ai/concepts/memory). Confirmed 2026-03-04.
+
+16. agents.defaults.bootstrapMaxChars — raise from 20000 to 40000
+    Default 20000 chars truncates SOUL.md in Lyra's injected context.
+    Confirmed 2026-03-20: SOUL.md reached 20585 chars after Lyra expanded
+    the claude_code registry entry. OpenClaw truncates silently with a warning.
+    Fix: bootstrapMaxChars=40000 via resolveBootstrapMaxChars() in
+    auth-profiles-iXW75sRj.js (reads cfg.agents.defaults.bootstrapMaxChars).
 """
 
 import os
@@ -689,12 +696,15 @@ class OpenClawConfig:
             "REGEL: Wenn jemand fragt 'Prüfe deine Worker / Agenten / DeepSeek' —\n"
             "  1. LESE workers.json (exec: Get-Content $env:USERPROFILE\\.openclaw\\workers.json)\n"
             "  2. INTERPRETIERE den Typ-Eintrag:\n"
-            "     type=worker  → OpenClaw WorkerTaskServer (lokales Netzwerk, async)\n"
-            "     type=openai  → OpenAI-kompatibler API-Agent (extern, sync, API-Key nötig)\n"
-            "     type=ollama  → Remote Ollama (sync, kein API-Key)\n"
-            "     type=custom  → Beliebiger HTTP-Endpunkt\n"
+            "     type=worker      → OpenClaw WorkerTaskServer (lokales Netzwerk, async)\n"
+            "     type=openai     → OpenAI-kompatibler API-Agent (extern, sync, API-Key nötig)\n"
+            "     type=ollama     → Remote Ollama (sync, kein API-Key)\n"
+            "     type=custom     → Beliebiger HTTP-Endpunkt\n"
+            "     type=claude_code → Claude Code Observer (Prozess, KEIN HTTP-Endpunkt)\n"
+            "       → Erreichbarkeit: wmic process | 'lyra_observer' suchen\n"
+            "       → NICHT: HTTP-Request versuchen — kein Server, port=0\n"
             "  3. NICHT: Gateway-API-Endpoints abfragen (/api/workers, /api/agents existieren NICHT)\n"
-            "  4. NICHT: Port 18791 prüfen (existiert nicht — HeadServer läuft auf 18790)\n\n"
+            "  4. NICHT: Port 18791 für Agenten-Kommunikation verwenden (Browser-Control-Server, read-only UI — HeadServer läuft auf 18790)\n\n"
             "SICHERHEITSREGEL — API-Keys:\n"
             "  NIEMALS einen API-Key im Klartext ausgeben — weder in Antworten,\n"
             "  noch in PowerShell-Beispielen, noch in Tabellen.\n"
@@ -723,12 +733,29 @@ class OpenClawConfig:
         for a in workers:
             atype   = a.get("type", "worker")
             name    = a.get("name", "?")
-            base    = _base(a)
             role    = a.get("role", "?")
             model   = a.get("model", "")
             api_key = a.get("api_key", "")
             proto   = a.get("protocol", "openclaw")
             rules   = a.get("delegation_rules", "").strip()
+
+            # ── claude_code: Prozess, kein HTTP-Endpunkt ──────────────────
+            if atype == "claude_code":
+                lines.append(
+                    f"  [claude_code] {name}  ({role})  proto=process\n"
+                    f"    STATUS: Kein HTTP-Endpunkt — Erreichbarkeit via Prozesscheck.\n"
+                    f"    PRÜFEN: exec → wmic process where \"name='powershell.exe'\" get CommandLine\n"
+                    f"            'lyra_observer' im Output → läuft | nicht vorhanden → gestoppt\n"
+                    f"    NICHT: HTTP-Request versuchen (port=0, kein Server)\n"
+                    f"    NICHT: claude_code Tasks senden — Observer läuft eigenständig\n"
+                )
+                if rules:
+                    for rule_line in rules.splitlines():
+                        if rule_line.strip():
+                            lines.append(f"    DELEGATION-REGEL: {rule_line.strip()}\n")
+                continue
+
+            base      = _base(a)
             model_str = f"  model={model}" if model   else ""
             key_str   = f"  key={_mask(api_key)}" if api_key else ""
             lines.append(
@@ -1045,6 +1072,10 @@ class OpenClawConfig:
                     # DECISION #3 — 3600s correct for RTX 3050 GPU-hybrid
                     # DECISION #9 — 7200 causes orphaned session-write-locks
                     "timeoutSeconds": timeout_seconds,  # from HardwareProfile (v1.0.3)
+                    # DECISION #16 — bootstrapMaxChars raised to 40000
+                    # Default 20000 truncates SOUL.md in Lyra's context (confirmed 2026-03-20).
+                    # resolveBootstrapMaxChars() in auth-profiles-iXW75sRj.js reads this field.
+                    "bootstrapMaxChars": 40000,
                 },
             },
             "commands": {

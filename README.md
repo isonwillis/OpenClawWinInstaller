@@ -319,12 +319,13 @@ Quellen:  <relevant URLs or file paths — only if needed>
 
 #### SOUL.md size management
 
-SOUL.md now has an enforced soft ceiling of **~19 500 characters** against OpenClaw's 20 000-char bootstrap limit. After the `[CONTEXT]` addition pushed the file to 22 069 chars (causing silent truncation), six targeted compressions brought it to **19 183 chars** — 817 chars of buffer. No rules were removed; only redundant examples and duplicate section content were consolidated. The Observer must recheck char count after any future SOUL.md addition.
+SOUL.md size is controlled via `agents.defaults.bootstrapMaxChars` in `openclaw.json` (DECISION #16, 2026-03-20). The default OpenClaw limit is 20 000 chars; exceeding it causes silent truncation. The installer now writes `bootstrapMaxChars: 40000`, giving SOUL.md ~40 000 chars of headroom. Current size: **~21 000 chars** — ~19 000 chars of buffer. No content compression required.
 
 ```python
 # Check after every SOUL.md write:
 content = open('SOUL.md', encoding='utf-8').read()
-assert len(content) < 19_500, f"SOUL.md too large: {len(content)} chars"
+bootstrap_max = openclaw_json['agents']['defaults'].get('bootstrapMaxChars', 20_000)
+assert len(content) < bootstrap_max, f"SOUL.md too large: {len(content)} / {bootstrap_max} chars"
 ```
 
 ---
@@ -526,7 +527,7 @@ External LLM ──────────────────────�
 | Persistent self-learning | `[LEARNING]` (A–E) + `[SOUL-UPDATE-VORSCHLAG]` | v1.0.4 |
 | Context persistence | `[CONTEXT]` (F–I) — successful work survives session reset | v1.0.4 |
 | Dynamic model names | Primary + fallback read from `openclaw.json` at generation | v1.0.4 |
-| SOUL.md size limit | Enforced soft ceiling 19 500 chars (hard limit 20 000) | v1.0.4 |
+| SOUL.md size limit | `bootstrapMaxChars: 40 000` in `openclaw.json` — DECISION #16 | v1.0.4 |
 
 ---
 
@@ -564,9 +565,9 @@ Switching immediately wastes the VRAM recovery chance and is slower than a resta
 Hardcoded `glm-4.7-flash` / `qwen2.5:7b` in SOUL.md template strings break every time the user changes the primary model via the GUI.
 **Fix:** `primary_model` and `fallback_model` are read from `openclaw.json` at generation time and injected as variables.
 
-### ❌ SOUL.md exceeds 20 000 chars bootstrap limit — NEVER REINTRODUCE
-OpenClaw silently truncates SOUL.md in the injected context if it exceeds 20 000 chars. LYRA then operates with an incomplete rulebook — no warning shown to the user.
-**Fix:** Soft ceiling 19 500 chars. Check with `len(open('SOUL.md', encoding='utf-8').read())` after every SOUL.md write.
+### ❌ SOUL.md exceeds `bootstrapMaxChars` — NEVER REINTRODUCE
+OpenClaw silently truncates SOUL.md if it exceeds `agents.defaults.bootstrapMaxChars` (default: 20 000). LYRA then operates with an incomplete rulebook — no warning shown to the user.
+**Fix (DECISION #16):** Set `bootstrapMaxChars: 40000` in `openclaw.json` via `write_openclaw_config()`. Do NOT compress SOUL.md content — raise the limit instead. Verify: `len(open('SOUL.md', encoding='utf-8').read())` vs `openclaw.json → agents.defaults.bootstrapMaxChars`.
 
 ### ❌ LYRA queries `/api/workers` or `/api/agents` — NEVER REINTRODUCE
 These Gateway endpoints do not exist. Agent registry is in `workers.json` only.  
