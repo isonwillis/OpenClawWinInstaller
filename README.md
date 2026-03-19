@@ -53,7 +53,7 @@ From v1.0.4 the system also supports **external LLM agents** (OpenAI-compatible 
 
 ---
 
-## What's New in v1.0.5
+## What's New in v1.0.4
 
 ### ♻️ Restart Ollama Button
 
@@ -106,10 +106,6 @@ The Worker installation flow (`_install_worker_mode`) now mirrors the Lyra setup
 ### 📋 SOUL.md — exit status 2 Rule
 
 New SOUL.md rule for `exit status 2`: LYRA switches to `qwen2.5:7b` dynamically via exec (patching `openclaw.json` directly) and restarts the gateway — no manual intervention. After VRAM is clear, the user can switch back to glm via the Installer dropdown.
-
----
-
-## What's New in v1.0.4
 
 ### 📡 Unified Agent Registry (Monitoring Tab — complete rewrite)
 
