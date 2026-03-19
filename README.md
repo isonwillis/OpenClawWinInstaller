@@ -35,7 +35,6 @@ From v1.0.4 the system also supports **external LLM agents** (OpenAI-compatible 
 
 ## Table of Contents
 
-- [What's New in v1.0.5](#whats-new-in-v105)
 - [What's New in v1.0.4](#whats-new-in-v104)
 - [What's New in v1.0.3](#whats-new-in-v103)
 - [What's New in v1.0.0](#whats-new-in-v100)
