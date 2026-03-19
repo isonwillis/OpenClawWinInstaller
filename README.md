@@ -1,6 +1,6 @@
 # OpenClawWinInstaller
 
-> **Status: v1.0.4 — PRODUCTION READY** · 2026-03-06
+> **Status: v1.0.4 — PRODUCTION READY** · 2026-03-19
 
 A fully automated Windows installer that sets up **OpenClaw** with a local LLM (LYRA via Ollama).  
 After running the script, LYRA is immediately ready to use — no manual configuration, no token issues, no approval prompts.
@@ -36,6 +36,7 @@ From v1.0.4 the system also supports **external LLM agents** (OpenAI-compatible 
 ## Table of Contents
 
 - [What's New in v1.0.4](#whats-new-in-v104)
+  - [Observer Session 2026-03-19](#-soulmd--observer-session-2026-03-19)
 - [What's New in v1.0.3](#whats-new-in-v103)
 - [What's New in v1.0.0](#whats-new-in-v100)
 - [Three-Module Architecture](#three-module-architecture)
@@ -102,9 +103,19 @@ The Worker installation flow (`_install_worker_mode`) now mirrors the Lyra setup
 | Duplicate `check_node()` (wrong version check) | Removed old `major >= 18` check, kept `>22 or (==22 and minor>=16)` |
 | `workers.json` delegation_rules empty on first run | DECISION #21: seeded with canonical rules on `Apply fixes` |
 
-### 📋 SOUL.md — exit status 2 Rule
+### 📋 SOUL.md — exit status 2 Rule (corrected 2026-03-19)
 
-New SOUL.md rule for `exit status 2`: LYRA switches to `qwen2.5:7b` dynamically via exec (patching `openclaw.json` directly) and restarts the gateway — no manual intervention. After VRAM is clear, the user can switch back to glm via the Installer dropdown.
+`exit status 2` means the llama runner VRAM-crashed. The correct recovery sequence is:
+
+1. **Restart Ollama** — `docker restart mein-ki-setup-ollama-1` + wait 15s (gives VRAM a recovery chance)
+2. **Retry the request once**
+3. **Only if retry also fails** — switch to `agents.defaults.model.fallbacks[0]` from `openclaw.json`, patch the config, restart the gateway
+
+Model names are **dynamic** — read from `openclaw.json` at SOUL.md generation time, never hardcoded. This means the rule survives any model change without needing a SOUL.md update.
+
+> ⚠️ **Previous (wrong) rule:** LYRA switched to `qwen2.5:7b` immediately without attempting a restart — wasting the VRAM recovery chance and hardcoding a model name. Fixed in observer session 2026-03-19 (both SOUL.md and `_build_soul_content()`).
+
+After VRAM is clear, the user switches back via the Installer dropdown (Primary LLM).
 
 ### 📡 Unified Agent Registry (Monitoring Tab — complete rewrite)
 
@@ -271,6 +282,50 @@ LYRA now correctly identifies and uses her agent registry:
 
 ---
 
+### 🧠 SOUL.md — Observer Session 2026-03-19
+
+#### Dynamic model names in `_build_soul_content()`
+
+`## Machine role hierarchy`, `## LLM Timeout` and the exit status 2 section previously contained hardcoded model names (`glm-4.7-flash`, `qwen2.5:7b`). These are now read dynamically from `openclaw.json` at SOUL.md generation time via `agents.defaults.model.primary` and `agents.defaults.model.fallbacks[0]`. Any model change via the Installer dropdown is automatically reflected in the next SOUL.md write — no observer intervention needed.
+
+#### `[CONTEXT]` — new persistent memory type
+
+LYRA's self-learning system previously only recorded **failures** (`[LEARNING]`, triggers A–E). Successful complex work — research sessions, ongoing projects, open questions — was never persisted and was lost after every session reset. This caused LYRA to ask "did you mention this before?" even when a topic had been thoroughly discussed.
+
+New memory type `[CONTEXT]` (triggers F–I):
+
+| Trigger | Condition |
+|---|---|
+| F | Complex topic explored that could continue in a follow-up session |
+| G | User mentioned a project / goal not yet completed |
+| H | Research or analysis created as a foundation for further work |
+| I | Session explicitly left open ("we'll continue next time") |
+
+**Format** (max 6 lines — performance-conscious):
+```
+[CONTEXT] YYYY-MM-DD: <topic in 5 words>
+Ziel:     <what does the user want to achieve? 1 sentence>
+Stand:    <what was established? max 2 sentences>
+Offen:    <next steps or open questions, max 2 sentences>
+Quellen:  <relevant URLs or file paths — only if needed>
+```
+
+**Session-start behavior:** LYRA reads `[CONTEXT]` entries from the last 14 days at session start. If the user brings up a matching topic, LYRA immediately references the previous state — no re-asking, no "did you mention this?".
+
+**Performance note:** The 6-line limit keeps token overhead minimal. The `[CONTEXT]` entry replaces the need to keep long session contexts alive — users can reset sessions freely without losing project continuity.
+
+#### SOUL.md size management
+
+SOUL.md now has an enforced soft ceiling of **~19 500 characters** against OpenClaw's 20 000-char bootstrap limit. After the `[CONTEXT]` addition pushed the file to 22 069 chars (causing silent truncation), six targeted compressions brought it to **19 183 chars** — 817 chars of buffer. No rules were removed; only redundant examples and duplicate section content were consolidated. The Observer must recheck char count after any future SOUL.md addition.
+
+```python
+# Check after every SOUL.md write:
+content = open('SOUL.md', encoding='utf-8').read()
+assert len(content) < 19_500, f"SOUL.md too large: {len(content)} chars"
+```
+
+---
+
 ## What's New in v1.0.3
 
 ### OpenClaw 2026.3.2 Sentinel Bug Fixes (DECISION #11 + #12)
@@ -359,7 +414,11 @@ Total                         10 336 lines
 - ✅ SOUL.md written on every install + `🛠 Apply fixes + Update SOUL.md`
 - ✅ FORCE-DELEGATE.md prevents Brave Search API requests
 - ✅ Error escalation: same error twice → read docs → `[CORRECTION]`
-- ✅ Persistent self-learning: `[LEARNING]` entries to `memory/YYYY-MM-DD.md`
+- ✅ Failure memory: `[LEARNING]` entries (A–E) to `memory/YYYY-MM-DD.md`
+- ✅ Context persistence: `[CONTEXT]` entries (F–I) — ongoing work survives session reset
+- ✅ Session-start: reads `[CONTEXT]` entries from last 14 days — picks up threads without asking
+- ✅ exit status 2: docker restart → retry → dynamic fallback from `openclaw.json`
+- ✅ Model names in SOUL.md always reflect live `openclaw.json` config (dynamic generation)
 
 ### Core Infrastructure
 - ✅ Gateway auto-starts at Windows login
@@ -433,10 +492,10 @@ External LLM ──────────────────────�
 | Web search without worker | SearXNG → DuckDuckGo → curl.exe fallback | Initial |
 | Fehler-Eskalation | Same error twice → read docs → `[CORRECTION]` | v1.0.0 |
 | Transformers diagnose | `AutoModel` + `trust_remote_code=True` | v1.0.0 |
-| LLM Timeout Fallback | 3x timeout → `qwen2.5:7b` · nvidia-smi diagnosis | v1.0.4 |
-| Ollama exit status 2 | VRAM · corrupt blob · version bug | v1.0.4 |
-| exit status 2 action | exec: switch to qwen2.5:7b + restart gateway | v1.0.5 |
-| Worker setup parity  | Node.js · OpenClaw · gateway.cmd auto-setup | v1.0.5 |
+| LLM Timeout Fallback | 3x timeout → nvidia-smi diagnosis → fallback model | v1.0.4 |
+| Ollama exit status 2 | VRAM crash: docker restart → retry → dynamic fallback | v1.0.4 |
+| exit status 2 action | `docker restart` + retry; fallback = `fallbacks[0]` from config | v1.0.4 |
+| Worker setup parity  | Node.js · OpenClaw · gateway.cmd auto-setup | v1.0.4 |
 | memorySearch sentinel | Three defense layers | v1.0.4 |
 | PowerShell `${var}:` | `$date:` = drive reference | v1.0.4 |
 | Agent Registry source | `workers.json` only — no Gateway API calls | v1.0.4 |
@@ -445,7 +504,10 @@ External LLM ──────────────────────�
 | API key security | Never output plaintext keys | v1.0.4 |
 | Delegation rules | Per-agent rules read from `workers.json` via SOUL.md | v1.0.4 |
 | undici timeout | Gateway start log confirms active timeout value | v1.0.4 |
-| Persistent self-learning | `[LEARNING]` + `[SOUL-UPDATE-VORSCHLAG]` | v1.0.4 |
+| Persistent self-learning | `[LEARNING]` (A–E) + `[SOUL-UPDATE-VORSCHLAG]` | v1.0.4 |
+| Context persistence | `[CONTEXT]` (F–I) — successful work survives session reset | v1.0.4 |
+| Dynamic model names | Primary + fallback read from `openclaw.json` at generation | v1.0.4 |
+| SOUL.md size limit | Enforced soft ceiling 19 500 chars (hard limit 20 000) | v1.0.4 |
 
 ---
 
@@ -473,6 +535,19 @@ Worker POSTs result to `LyraHeadServer` immediately after completion — result 
 
 ### ❌ DeepSeek base_url without `/v1` — NEVER REINTRODUCE
 Use `https://api.deepseek.com/v1` as base_url. Code appends `/chat/completions` → identical to OpenAI. No provider detection needed.
+
+### ❌ exit status 2 → immediate model switch — NEVER REINTRODUCE
+`exit status 2` is a VRAM crash. The correct sequence is: restart Ollama → retry → only then switch model.
+Switching immediately wastes the VRAM recovery chance and is slower than a restart.
+**Fix:** SOUL.md `## LLM Timeout` rule + `_build_soul_content()` — 3-step recovery, dynamic fallback from `openclaw.json`.
+
+### ❌ Hardcoded model names in `_build_soul_content()` — NEVER REINTRODUCE
+Hardcoded `glm-4.7-flash` / `qwen2.5:7b` in SOUL.md template strings break every time the user changes the primary model via the GUI.
+**Fix:** `primary_model` and `fallback_model` are read from `openclaw.json` at generation time and injected as variables.
+
+### ❌ SOUL.md exceeds 20 000 chars bootstrap limit — NEVER REINTRODUCE
+OpenClaw silently truncates SOUL.md in the injected context if it exceeds 20 000 chars. LYRA then operates with an incomplete rulebook — no warning shown to the user.
+**Fix:** Soft ceiling 19 500 chars. Check with `len(open('SOUL.md', encoding='utf-8').read())` after every SOUL.md write.
 
 ### ❌ LYRA queries `/api/workers` or `/api/agents` — NEVER REINTRODUCE
 These Gateway endpoints do not exist. Agent registry is in `workers.json` only.  
