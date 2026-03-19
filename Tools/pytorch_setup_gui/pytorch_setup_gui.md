@@ -1,6 +1,6 @@
 # pytorch_setup_gui.py — Documentation
 
-**Version:** 2.0.5
+**Version:** 1.0.1
 **File:** `Tools/pytorch_setup_gui/pytorch_setup_gui.py`
 **Lines:** 2,647
 **Python:** 3.8+

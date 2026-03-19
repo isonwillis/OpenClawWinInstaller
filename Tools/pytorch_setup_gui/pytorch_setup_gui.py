@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 🔥 PyTorch & Transformers Setup GUI - COMPLETE EDITION
-Version: 2.0.5
+Version: 1.0.1
 Enhanced: Automatic CUDA version detection and verification
 Fixed: ALL NoneType errors with comprehensive error handling
 """
