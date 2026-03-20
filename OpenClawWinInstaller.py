@@ -88,6 +88,7 @@ class OpenClawWinInstaller(OpenClawOperations):
             machine_role      = getattr(self, "machine_role", "Lyra"),
         )
 
+        self._tray_icon = None          # pystray.Icon when minimized to tray
         self.installation_running = False
         self.auto_scroll = True
         self._diag_tab_built = False
@@ -120,7 +121,35 @@ class OpenClawWinInstaller(OpenClawOperations):
     # ──────────────────────────────────────────────────────────────────
 
     def _on_close(self):
-        """Clean shutdown — stop poller thread before destroying tkinter."""
+        """Close handler: minimize to tray when autonomous mode active, else full close."""
+        autonomous = False
+        if hasattr(self, "_cc_autonomous_var"):
+            try:
+                autonomous = self._cc_autonomous_var.get()
+            except Exception:
+                pass
+
+        if autonomous:
+            # Guard: don't create a second tray icon if already minimized
+            if self._tray_icon is not None:
+                return
+            icon = self._build_tray_icon()
+            if icon is not None:
+                self._tray_icon = icon
+                self.root.withdraw()
+                import threading as _t
+                _t.Thread(target=icon.run, daemon=True, name="TrayIconThread").start()
+                return
+        self._full_close()
+
+    def _full_close(self):
+        """Full shutdown — stops tray icon, monitoring, destroys window."""
+        if self._tray_icon is not None:
+            try:
+                self._tray_icon.stop()
+            except Exception:
+                pass
+            self._tray_icon = None
         try:
             if hasattr(self, "monitoring") and self.monitoring:
                 self.monitoring.destroy()
@@ -130,6 +159,39 @@ class OpenClawWinInstaller(OpenClawOperations):
             self.root.destroy()
         except Exception:
             pass
+
+    def _build_tray_icon(self):
+        """Build a pystray system-tray icon. Returns None if pystray/Pillow missing."""
+        try:
+            import pystray
+            from PIL import Image, ImageDraw, ImageFont
+        except ImportError:
+            self.log("[Tray] pystray or Pillow not installed — "
+                     "run: pip install pystray Pillow", "WARNING")
+            return None
+
+        # 64×64 icon: dark background, cyan circle, 'L' label
+        # RGB mode (not RGBA) — pystray on Windows needs RGB for reliable HICON creation
+        img  = Image.new("RGB", (64, 64), (13, 15, 20))
+        draw = ImageDraw.Draw(img)
+        draw.ellipse([4, 4, 60, 60], fill=(0, 180, 220))
+        draw.text((22, 16), "L", fill=(13, 15, 20))
+
+        def _restore(icon, item):
+            icon.stop()
+            self._tray_icon = None
+            self.root.after(0, self.root.deiconify)
+
+        def _exit(icon, item):
+            icon.stop()
+            self._tray_icon = None
+            self.root.after(0, self._full_close)
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Restore", _restore, default=True),
+            pystray.MenuItem("Exit",    _exit),
+        )
+        return pystray.Icon("OpenClaw", img, "OpenClaw – Lyra Observer", menu)
 
 
     def _read_machine_role_silent(self):

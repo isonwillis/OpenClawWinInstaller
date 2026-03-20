@@ -3111,6 +3111,15 @@ class LyraHeadServer:
         # so GUI code must schedule via root.after(0, ...).
         self.on_result_callback = None
 
+        # ── Memory FileSystemWatcher (autonomous Claude Code trigger) ───────
+        self._watcher_thread  = None
+        self._watcher_stop    = threading.Event()
+        self._watcher_seen    = {}   # fpath -> last mtime that reset debounce
+        self._watcher_pending = {}   # fpath -> float timestamp of first change
+        self._watcher_dir     = os.path.join(
+            os.path.expanduser("~"), ".openclaw", "workspace", "memory"
+        )
+
     def add_task(self, task_type: str, payload: dict) -> str:
         """Adds a task to the queue. Returns task_id."""
         task_id = str(uuid.uuid4())[:8]
@@ -3308,6 +3317,130 @@ class LyraHeadServer:
         # Return the Handler CLASS, not an instance
         return Handler
 
+    # ── Autonomous watcher helpers ──────────────────────────────────────────
+
+    def _is_autonomous_mode(self) -> bool:
+        """Returns True iff 'Work autonomously' is enabled in machine_role.json."""
+        path = os.path.join(os.path.expanduser("~"), ".openclaw", "machine_role.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f).get("claude_code_autonomous", False)
+        except Exception:
+            return False
+
+    def _is_claude_running(self) -> bool:
+        """Returns True if Claude Code is already running.
+
+        Claude Code on Windows runs as node.exe (not claude.exe).
+        We check node.exe processes whose CommandLine contains 'claude'.
+        This mirrors the pattern used by _cc_is_running() in the installer.
+        """
+        try:
+            r = subprocess.run(
+                ["wmic", "process", "where", "name='node.exe'",
+                 "get", "CommandLine", "/format:csv"],
+                capture_output=True, encoding="utf-8", errors="replace",
+                timeout=4, creationflags=0x08000000  # CREATE_NO_WINDOW
+            )
+            return "claude" in r.stdout.lower()
+        except Exception:
+            return False
+
+    def _trigger_claude(self, reason: str):
+        """Start claude non-interactively via PowerShell (CREATE_NO_WINDOW)."""
+        self.log(f"[Watcher] Triggering claude — {reason}", "INFO")
+        try:
+            appdata = os.environ.get("APPDATA", "")
+            for candidate in [
+                os.path.join(appdata, "npm", "claude.cmd"),
+                os.path.join(appdata, "npm", "claude.ps1"),
+                "claude",
+            ]:
+                if os.path.isfile(candidate) or candidate == "claude":
+                    subprocess.Popen(
+                        ["powershell.exe", "-NoProfile", "-ExecutionPolicy",
+                         "Bypass", "-Command", f'& "{candidate}"'],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=0x08000000,
+                    )
+                    self.log("[Watcher] claude launched", "SUCCESS")
+                    return
+            self.log("[Watcher] claude executable not found — skipping", "WARNING")
+        except Exception as e:
+            self.log(f"[Watcher] claude trigger failed: {e}", "WARNING")
+
+    def _watcher_loop(self):
+        """Poll memory/ every 30 s; fire claude after 5-min debounce if tags found."""
+        POLL_SECS    = 30
+        DEBOUNCE_SECS = 300   # 5 minutes
+        TAGS         = ("[SOUL-UPDATE-VORSCHLAG]", "[CORRECTION]")
+
+        self.log(f"[Watcher] Watching {self._watcher_dir}", "INFO")
+
+        while not self._watcher_stop.is_set():
+            try:
+                if not self._is_autonomous_mode():
+                    self._watcher_pending.clear()
+                    # NOTE: do NOT clear _watcher_seen here — if we did, all existing
+                    # files would look "new" on the next autonomous re-enable, triggering
+                    # a full debounce wave and potentially multiple claude starts.
+                    self._watcher_stop.wait(POLL_SECS)
+                    continue
+
+                if not os.path.isdir(self._watcher_dir):
+                    self._watcher_stop.wait(POLL_SECS)
+                    continue
+
+                now = time.time()
+
+                # Detect new/changed .md files
+                for fname in os.listdir(self._watcher_dir):
+                    if not fname.endswith(".md"):
+                        continue
+                    fpath = os.path.join(self._watcher_dir, fname)
+                    try:
+                        mtime = os.path.getmtime(fpath)
+                    except OSError:
+                        continue
+                    if self._watcher_seen.get(fpath) != mtime:
+                        self._watcher_seen[fpath]    = mtime
+                        self._watcher_pending[fpath] = now
+                        self.log(f"[Watcher] Change: {fname} — debounce started", "INFO")
+
+                # Fire debounced files
+                fired = []
+                for fpath, detected_at in list(self._watcher_pending.items()):
+                    if now - detected_at < DEBOUNCE_SECS:
+                        continue
+                    fired.append(fpath)
+                    try:
+                        content = open(fpath, encoding="utf-8", errors="replace").read()
+                        if any(tag in content for tag in TAGS):
+                            self.log(
+                                f"[Watcher] Tag found in {os.path.basename(fpath)}", "INFO")
+                            if self._is_claude_running():
+                                self.log("[Watcher] claude already running — skip", "INFO")
+                            else:
+                                self._trigger_claude(os.path.basename(fpath))
+                        else:
+                            self.log(
+                                f"[Watcher] No trigger tags in "
+                                f"{os.path.basename(fpath)} — skip", "INFO")
+                    except Exception as e:
+                        self.log(f"[Watcher] Read error {fpath}: {e}", "WARNING")
+
+                for fpath in fired:
+                    self._watcher_pending.pop(fpath, None)
+
+            except Exception as e:
+                self.log(f"[Watcher] Loop error: {e}", "WARNING")
+
+            self._watcher_stop.wait(POLL_SECS)
+
+        self.log("[Watcher] Stopped", "INFO")
+
     def start(self):
         """Starts the server in a background thread."""
         handler_class = self._make_handler()
@@ -3326,13 +3459,24 @@ class LyraHeadServer:
         )
         self._thread.start()
         self.log(f"[HeadSrv] Task server running on port {self.port} with /result endpoint", "SUCCESS")
+
+        # Start memory watcher (only one instance)
+        if self._watcher_thread is None or not self._watcher_thread.is_alive():
+            self._watcher_stop.clear()
+            self._watcher_thread = threading.Thread(
+                target=self._watcher_loop, daemon=True, name="LyraMemWatcher"
+            )
+            self._watcher_thread.start()
+            self.log("[HeadSrv] Memory watcher thread started", "INFO")
+
         return True
 
     def stop(self):
-        """Stops the server."""
+        """Stops the server and watcher."""
+        self._watcher_stop.set()
         if self._server:
             self._server.shutdown()
-            self.log("[HeadSrv] Server stopped", "INFO")
+        self.log("[HeadSrv] Server and watcher stopped", "INFO")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # WORKER TASK SERVER
