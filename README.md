@@ -1,6 +1,6 @@
 # OpenClawWinInstaller
 
-> **Status: v1.0.4 — PRODUCTION READY** · 2026-03-19
+> **Status: v1.0.4 — PRODUCTION READY** · 2026-03-20
 
 A fully automated Windows installer that sets up **OpenClaw** with a local LLM (LYRA via Ollama).  
 After running the script, LYRA is immediately ready to use — no manual configuration, no token issues, no approval prompts.
@@ -36,6 +36,7 @@ From v1.0.4 the system also supports **external LLM agents** (OpenAI-compatible 
 ## Table of Contents
 
 - [What's New in v1.0.4](#whats-new-in-v104)
+  - [Observer Session 2026-03-20](#-observer-session-2026-03-20)
   - [Observer Session 2026-03-19](#-soulmd--observer-session-2026-03-19)
 - [What's New in v1.0.3](#whats-new-in-v103)
 - [What's New in v1.0.0](#whats-new-in-v100)
@@ -330,6 +331,66 @@ assert len(content) < bootstrap_max, f"SOUL.md too large: {len(content)} / {boot
 
 ---
 
+### 🔭 Observer Session 2026-03-20
+
+#### 🗂 FileSystemWatcher — Autonomous Claude Code Trigger
+
+`LyraHeadServer` now contains a **memory file watcher** that closes the autonomous loop between LYRA and Claude Code:
+
+| Step | What happens |
+|---|---|
+| 1 | Lyra writes `[SOUL-UPDATE-VORSCHLAG]` or `[CORRECTION]` tag to `memory/YYYY-MM-DD.md` |
+| 2 | Watcher polls every 30s, detects the changed file |
+| 3 | 5-minute debounce (Lyra may write several entries in sequence) |
+| 4 | Tag check → Claude Code not running → `Popen(claude, CREATE_NO_WINDOW)` |
+| 5 | Claude Code applies the fix to SOUL.md + Installer (both tracks) |
+
+**Activation:** "Work autonomously" checkbox in the Claude Code Tab. Reads `machine_role.json` live on every poll — never cached.
+
+New methods in `LyraHeadServer`:
+- `_is_autonomous_mode()` — reads `machine_role.json` live
+- `_is_claude_running()` — checks `node.exe` CommandLine via wmic
+- `_trigger_claude(reason)` — starts Claude Code via PowerShell (`CREATE_NO_WINDOW`)
+- `_watcher_loop()` — 30s poll, 300s debounce, tag-based trigger
+
+#### 🔵 System Tray — Installer stays alive
+
+When "Work autonomously" is enabled, closing the installer window **no longer exits the app**. Instead it minimizes to the system tray — keeping `LyraHeadServer`, `LyraWorkerClient`, and the memory watcher running in the background.
+
+| Action | Result |
+|---|---|
+| Click X (autonomous=on) | `root.withdraw()` → tray icon appears |
+| Tray left-click | Restore window |
+| Tray right-click → Exit | `_full_close()` → teardown |
+
+**Dependencies:** `pystray` + `Pillow` (lazy import — app starts normally without them).
+
+New methods:
+- `_build_tray_icon()` — creates pystray.Icon with RGB Pillow icon (RGB required, RGBA broken on Windows)
+- `_full_close()` — extracted from `_on_close`, stops tray icon + all threads
+
+#### 🐛 Watcher + Tray Bug Fixes
+
+| Bug | Root Cause | Fix |
+|---|---|---|
+| Tray icon invisible | `RGBA` mode → silent Win32 HICON failure | Changed to `RGB` mode in `_build_tray_icon()` |
+| Double Claude starts after re-enabling autonomous | `_watcher_seen.clear()` reset file history → all files looked new | Only clear `_watcher_pending`, never `_watcher_seen` |
+| Claude started even when already running | `_is_claude_running()` checked `claude.exe` (doesn't exist) | Now checks `node.exe` CommandLine for "claude" — same approach as `_cc_is_running()` |
+
+#### 📋 SOUL.md — 3 Lost Rules Restored
+
+Three rules were inadvertently truncated in a previous session. Both tracks restored:
+
+| Section | What was missing | Why it matters |
+|---|---|---|
+| `## Fehler-Eskalation` | "Hugging Face Discussions" in step 2 | HF Discussions and GitHub Issues are separate platforms; ML model errors often only on HF |
+| `## Transformers` | Error text `→ None → 'NoneType has no attribute from_pretrained'` + `AutoTokenizer` in example | Error text is the diagnostic anchor for stack-trace pattern matching |
+| `## Kein Erfinden` | Full "NIEMALS ein erfundenes Ergebnis" block | Cross-reference weakens the anti-hallucination rule; must be stated directly |
+
+SOUL.md size after restore: **~20 988 chars** · bootstrapMaxChars: 40 000 · Buffer: ~19 012 chars.
+
+---
+
 ## What's New in v1.0.3
 
 ### OpenClaw 2026.3.2 Sentinel Bug Fixes (DECISION #11 + #12)
@@ -368,11 +429,15 @@ The original 9005-line monolith split into three focused files:
 ## Three-Module Architecture
 
 ```
-OpenClawWinInstaller.py        4 292 lines   GUI + installation flow
-OpenClawConfigManagement.py    6 284 lines   All logic, servers, config
-OpenClawAgentMonitoring.py     1 120 lines   Monitoring Tab (self-contained)
-─────────────────────────────────────────
-Total                         11 696 lines
+OpenClawWinInstaller.py                    4 396 lines   GUI + installation flow
+OpenClawConfigManagement.py                6 524 lines   All logic, servers, config
+OpenClawAgentMonitoring.py                 1 157 lines   Monitoring Tab (self-contained)
+──────────────────────────────────────────────────────
+Subtotal (3-module core)                  12 077 lines
+
+Tools/ClaudeCodeSetup/ClaudeCodeSetup.py  1 248 lines   Claude Code ↔ Lyra Setup GUI
+──────────────────────────────────────────────────────
+Total                                     13 325 lines
 ```
 
 ---
@@ -383,7 +448,7 @@ Standalone utilities in `Tools/` — each in its own subdirectory with `.py` + `
 
 | Tool | File | Description |
 |---|---|---|
-| Claude Code Setup | `Tools/ClaudeCodeSetup/ClaudeCodeSetup.py` | GUI installer for the Claude Code ↔ Lyra self-improvement bridge. Installs, configures, starts, stops and uninstalls the observer layer. Can be run standalone — independent of the main installer. |
+| Claude Code Setup | `Tools/ClaudeCodeSetup/ClaudeCodeSetup.py` (1 248 lines) | GUI installer for the Claude Code ↔ Lyra self-improvement bridge. Installs, configures, starts, stops and uninstalls the observer layer. Can be run standalone — independent of the main installer. |
 | PyTorch Setup GUI | `Tools/pytorch_setup_gui/pytorch_setup_gui.py` | PyTorch & Transformers Setup GUI (COMPLETE EDITION). Detects CUDA version automatically, creates a virtual environment, installs PyTorch with the correct CUDA build, and runs a comprehensive test suite. Includes `HardwareDetector`, `InstallationTester`, and `PyTorchInstaller` classes. |
 
 ```bash
@@ -439,6 +504,14 @@ python Tools/pytorch_setup_gui/pytorch_setup_gui.py
 - ✅ Session-start: reads `[CONTEXT]` entries from last 14 days — picks up threads without asking
 - ✅ exit status 2: docker restart → retry → dynamic fallback from `openclaw.json`
 - ✅ Model names in SOUL.md always reflect live `openclaw.json` config (dynamic generation)
+
+### Autonomous Observer Loop
+- ✅ FileSystemWatcher: `[SOUL-UPDATE-VORSCHLAG]` / `[CORRECTION]` tags auto-trigger Claude Code
+- ✅ 30s poll + 300s debounce — no spam, tolerates multi-entry sessions
+- ✅ `_is_claude_running()` checks node.exe CommandLine — no double starts
+- ✅ System tray: close button minimizes installer when "Work autonomously" is enabled
+- ✅ Tray restore + exit via context menu
+- ✅ Tray icon: RGB mode (RGBA silent failure on Windows fixed)
 
 ### Core Infrastructure
 - ✅ Gateway auto-starts at Windows login
@@ -528,6 +601,9 @@ External LLM ──────────────────────�
 | Context persistence | `[CONTEXT]` (F–I) — successful work survives session reset | v1.0.4 |
 | Dynamic model names | Primary + fallback read from `openclaw.json` at generation | v1.0.4 |
 | SOUL.md size limit | `bootstrapMaxChars: 40 000` in `openclaw.json` — DECISION #16 | v1.0.4 |
+| Fehler-Eskalation (HF) | Step 2 includes Hugging Face Discussions — separate from GitHub Issues | v1.0.4 |
+| Transformers error text | Full error string + `AutoTokenizer` in example — diagnostic anchor | v1.0.4 |
+| Kein Erfinden block | Full "NIEMALS erfundenes Ergebnis" rule inline — no cross-reference | v1.0.4 |
 
 ---
 
@@ -572,6 +648,18 @@ OpenClaw silently truncates SOUL.md if it exceeds `agents.defaults.bootstrapMaxC
 ### ❌ LYRA queries `/api/workers` or `/api/agents` — NEVER REINTRODUCE
 These Gateway endpoints do not exist. Agent registry is in `workers.json` only.  
 **Fix:** SOUL.md explicit rule + recognition checklist for agent queries.
+
+### ❌ `_is_claude_running()` checks `claude.exe` — NEVER REINTRODUCE
+Claude Code runs as `node.exe` on Windows. Checking for `claude.exe` always returns False → Claude is started even when already running.
+**Fix:** Check `node.exe` CommandLine for "claude" via wmic — same approach as `_cc_is_running()`.
+
+### ❌ Tray icon with RGBA mode — NEVER REINTRODUCE
+`pystray` on Windows requires `RGB` mode for reliable HICON conversion. `RGBA` images silently fail Win32 icon creation → tray icon never appears.
+**Fix:** `Image.new("RGB", ...)` in `_build_tray_icon()`.
+
+### ❌ `_watcher_seen.clear()` when autonomous disabled — NEVER REINTRODUCE
+Clearing `_watcher_seen` on autonomous-mode off makes all existing memory files look "new" on re-enable → mass pending entries → multiple Claude starts after debounce.
+**Fix:** Only clear `_watcher_pending`; never clear `_watcher_seen`.
 
 ### ❌ LYRA outputs API key in plaintext — NEVER REINTRODUCE
 API keys must never appear in answers, tables, or PowerShell examples.  

@@ -196,6 +196,7 @@ class HardwareProfile:
     ]
 
     def __init__(self, log_fn=None):
+        """Stores optional logger; defaults to a print-based fallback."""
         self._log = log_fn or (lambda msg, lvl="INFO": print(f"[HW] {msg}"))
 
     # ── Public API ─────────────────────────────────────────────────────────────
@@ -369,6 +370,13 @@ class LyraDelegateToolRegistrar:
     """
 
     def __init__(self, cfg_dir: str, base_url: str, token: str, log_fn=None):
+        """
+        Args:
+            cfg_dir:  OpenClaw config directory (~/.openclaw).
+            base_url: Gateway base URL (e.g. http://127.0.0.1:18789).
+            token:    Gateway auth token.
+            log_fn:   Optional logging callback(msg, level).
+        """
         self.cfg_dir  = cfg_dir
         self.base_url = base_url
         self.token    = token
@@ -376,6 +384,7 @@ class LyraDelegateToolRegistrar:
 
     def _api(self, method: str, path: str, data: dict | None = None,
              timeout: int = 10) -> dict | None:
+        """Calls the gateway REST API with Bearer auth. Returns parsed JSON or None on error."""
         url = f"{self.base_url}{path}"
         body = json.dumps(data).encode() if data else None
         headers = {
@@ -603,6 +612,15 @@ class OpenClawConfig:
         status_cb         = None,
         machine_role      = "Lyra",
     ):
+        """
+        Args:
+            log_fn:            Logging callback(msg, level).
+            run_powershell_fn: Callback to execute PowerShell commands (required for ENV writes).
+            npm_prefix_fn:     Callback returning the global npm prefix path.
+            apply_browser_fn:  Callback to apply browser config changes.
+            status_cb:         GUI status-bar update callback(text).
+            machine_role:      "Lyra" (head) or "Junior"/"Senior" (worker).
+        """
         self._log = log_fn or (lambda msg, lvl="INFO": print(f"[Config] {msg}"))
 
         # Stub: run_powershell_fn is required for ENV writes.
@@ -3098,6 +3116,14 @@ class LyraHeadServer:
     """
 
     def __init__(self, port: int = LYRA_HEAD_PORT, log_fn=None):
+        """
+        Args:
+            port:   TCP port to listen on (default: 18790).
+            log_fn: Optional logging callback(msg, level).
+
+        Sets on_result_callback to None; assign a callable to receive worker results
+        for auto-display in the MonitoringTab (called from server thread — schedule via root.after).
+        """
         self.port     = port
         self.log      = log_fn or (lambda msg, lvl="INFO": print(f"[HeadSrv] {msg}"))
         self._lock    = threading.Lock()
@@ -3500,6 +3526,12 @@ class WorkerTaskServer:
     """
 
     def __init__(self, port: int = LYRA_HEAD_PORT, log_fn=None, task_queue=None):
+        """
+        Args:
+            port:       TCP port to listen on (default: 18790).
+            log_fn:     Optional logging callback(msg, level).
+            task_queue: Optional external Queue; creates a new one if not provided.
+        """
         self.port = port
         self.log = log_fn or (lambda msg, lvl="INFO": print(f"[WorkerSrv] {msg}"))
         self.task_queue = task_queue or queue_module.Queue()
@@ -3689,6 +3721,15 @@ class LyraWorkerClient:
     def __init__(self, head_address: str, role: str, model: str,
                  log_fn=None, poll_interval: int = 7,
                  local_server: "WorkerTaskServer | None" = None):
+        """
+        Args:
+            head_address:  LYRA head address (IP[:port] or http://...).
+            role:          Worker role label ("Junior", "Senior", ...).
+            model:         Ollama model name to use for task inference.
+            log_fn:        Optional logging callback(msg, level).
+            poll_interval: Seconds between HEAD task-queue polls (default: 7).
+            local_server:  WorkerTaskServer ref for local result storage.
+        """
         self.head         = head_address.rstrip("/")
         self.role         = role
         self.model        = model
@@ -3716,6 +3757,7 @@ class LyraWorkerClient:
         return "http://127.0.0.1:8080"
 
     def _head_url(self, path: str) -> str:
+        """Returns a full URL for the given path on the LYRA head server, appending port 18790 if absent."""
         # Normalize: if port given → use directly, otherwise 18790
         if ":" in self.head.replace("://", ""):
             base = self.head if "://" in self.head else f"http://{self.head}"
@@ -4020,6 +4062,7 @@ class LyraWorkerClient:
         self._thread.start()
 
     def stop(self):
+        """Signals the worker polling loop to terminate gracefully."""
         self._stop.set()
 
     def check_head_reachable(self, timeout: int = 5) -> bool:
@@ -4367,6 +4410,7 @@ class OpenClawOperations:
     # ──────────────────────────────────────────────────────────────────
 
     def run_powershell(self, command, timeout=120):
+        """Runs a PowerShell command and returns {stdout, stderr, returncode}. Blocks until done."""
         try:
             proc = subprocess.Popen(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
@@ -4386,6 +4430,10 @@ class OpenClawOperations:
     # ──────────────────────────────────────────────────────────────────
 
     def run_powershell_live(self, command, timeout=480, prefix="    ", env_extra=None):
+        """
+        Runs a PowerShell command with real-time stdout/stderr streaming via log_fn.
+        Returns {stdout, stderr, returncode}. Uses background reader threads to prevent deadlock.
+        """
         stdout_lines, stderr_lines = [], []
         try:
             env = os.environ.copy()
@@ -4473,10 +4521,12 @@ class OpenClawOperations:
             os.environ["PATH"] = r["stdout"]
 
     def _npm_prefix(self):
+        """Returns the global npm prefix directory; falls back to %APPDATA%\\npm if the npm query fails."""
         r = self.run_powershell("npm prefix -g")
         return r["stdout"].strip() if r["stdout"] else os.path.join(os.environ["APPDATA"], "npm")
 
     def check_admin(self):
+        """Returns True if the current process has Windows Administrator privileges."""
         r = self.run_powershell(
             "([Security.Principal.WindowsPrincipal]"
             " [Security.Principal.WindowsIdentity]::GetCurrent())"
@@ -4598,6 +4648,7 @@ class OpenClawOperations:
     # ──────────────────────────────────────────────────────────────────
 
     def check_winget(self):
+        """Returns True if winget is installed and reports a version string."""
         r = self.run_powershell("winget --version 2>$null")
         return bool(r["stdout"] and "v" in r["stdout"].lower())
 
@@ -4641,6 +4692,7 @@ class OpenClawOperations:
         return results
 
     def install_winget(self):
+        """Installs winget via Windows App Runtime + AppxPackage registration. Falls back to direct MSIX download."""
         self.log("  Installing winget (Microsoft App Installer)...")
 
         # ── Step A: Ensure Windows App Runtime ──────────────────────────────
@@ -4868,12 +4920,14 @@ class OpenClawOperations:
     # ──────────────────────────────────────────────────────────────────
 
     def check_git(self):
+        """Returns the git version string if installed, or None."""
         r = self.run_powershell("git --version 2>$null")
         return (r["stdout"].strip()
                 if r["stdout"] and "git version" in r["stdout"].lower()
                 else None)
 
     def install_git(self):
+        """Installs Git for Windows via winget, or downloads from GitHub mirrors as fallback."""
         self.log("  Installing Git for Windows...")
         if self.check_winget():
             r = self.run_powershell(
@@ -4950,12 +5004,14 @@ class OpenClawOperations:
     # ──────────────────────────────────────────────────────────────────
 
     def check_cmake(self):
+        """Returns the cmake version string if installed, or None."""
         r = self.run_powershell("cmake --version 2>$null")
         return (r["stdout"].strip()
                 if r["stdout"] and "cmake version" in r["stdout"].lower()
                 else None)
 
     def install_cmake(self):
+        """Installs CMake via winget (Kitware.CMake). Refreshes PATH after install."""
         self.log("  Installing CMake...")
 
         if self.check_winget():
@@ -5016,6 +5072,7 @@ class OpenClawOperations:
         return r2["stdout"].strip() if r2["stdout"].strip() else None
 
     def install_vcredist(self):
+        """Installs Visual C++ Redistributable 2015-2022 x64 via winget or direct download from Microsoft."""
         self.log("  Installing Visual C++ Redistributable 2015-2022 x64...")
 
         if self.check_winget():
@@ -5055,10 +5112,12 @@ class OpenClawOperations:
     # ──────────────────────────────────────────────────────────────────
 
     def check_xpm(self):
+        """Returns the xpm version string if installed, or None."""
         r = self.run_powershell("xpm --version 2>$null")
         return r["stdout"].strip() if r["stdout"].strip() else None
 
     def install_xpm(self):
+        """Installs xpm (xPack Package Manager) globally via npm."""
         self.log("  Installing xpm (xPack Package Manager)...")
         r = self.run_powershell_live("npm install -g xpm", timeout=180, prefix="    ")
         if r["returncode"] == 0:
@@ -5077,10 +5136,12 @@ class OpenClawOperations:
     # ──────────────────────────────────────────────────────────────────
 
     def check_node_gyp(self):
+        """Returns the node-gyp version string if installed, or None."""
         r = self.run_powershell("node-gyp --version 2>$null")
         return r["stdout"].strip() if r["stdout"].strip() and "v" in r["stdout"] else None
 
     def install_node_gyp(self):
+        """Installs node-gyp globally via npm. Required for building native Node.js addons."""
         self.log("  Installing node-gyp (native addon build tool)...")
         r = self.run_powershell_live("npm install -g node-gyp", timeout=120, prefix="    ")
         if r["returncode"] == 0:
@@ -5993,6 +6054,7 @@ exit 1
             return -1, {"error": str(e)}
 
     def force_kill_openclaw_processes(self):
+        """Kills all openclaw* and node processes except the installer's own PID."""
         self.log("  Terminating running OpenClaw/Node processes...")
         own_pid = os.getpid()
         # Exclude own PID – binary name "OpenClawWinInstaller.exe" matches "openclaw*"!
@@ -6091,6 +6153,7 @@ exit 1
     # ──────────────────────────────────────────────────────────────────
 
     def check_openclaw(self):
+        """Returns (installed: bool, status: str) where status is 'ok', 'missing_file', 'npm_only', or 'not_found'."""
         r = self.run_powershell("Get-Command openclaw -ErrorAction SilentlyContinue")
         if r["stdout"]:
             prefix = self._npm_prefix()
@@ -6262,6 +6325,7 @@ exit 1
     # ──────────────────────────────────────────────────────────────────
 
     def get_openclaw_cmd(self):
+        """Returns PowerShell invocation string for openclaw: direct .cmd path or bare 'openclaw' command."""
         cmd_file = os.path.join(self._npm_prefix(), "openclaw.cmd")
         return f'& "{cmd_file}"' if os.path.isfile(cmd_file) else "openclaw"
 
@@ -6330,6 +6394,7 @@ exit 1
 
 
     def setup_gateway(self):
+        """Runs openclaw onboard (auto-confirming prompts), then installs and starts the gateway service."""
         self.log("Setting up gateway...")
         oc = self.get_openclaw_cmd()
 

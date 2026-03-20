@@ -60,6 +60,13 @@ FONT_SMALL  = ("Segoe UI", 9)
 
 def build_claude_md(project_dir: str, openclaw_dir: str,
                     autonomous: bool = False) -> str:
+    """
+    Generates the CLAUDE.md content for the Claude Code ↔ Lyra observer session.
+
+    Embeds absolute paths to project_dir and openclaw_dir so Claude Code operates
+    with the correct allowed directories, log paths, and workspace references.
+    When autonomous=True the Autonomous Mode section is activated.
+    """
     workspace  = os.path.join(openclaw_dir, "workspace")
     memory     = os.path.join(workspace, "memory")
     skills     = os.path.join(openclaw_dir, "skills")
@@ -360,6 +367,11 @@ def _ps(p: str) -> str:
 
 
 def build_observer_ps1(project_dir: str, openclaw_dir: str) -> str:
+    """
+    Generates lyra_observer.ps1 — the PowerShell launcher that starts Claude Code
+    with the Lyra project context, restricted to the allowed directories.
+    Written with UTF-8 BOM (utf-8-sig) for PowerShell 5 compatibility.
+    """
     workspace = os.path.join(openclaw_dir, "workspace")
     memory    = os.path.join(workspace, "memory")
     logs_dir  = os.path.join(project_dir, "ClaudeCode", "logs")
@@ -413,6 +425,7 @@ claude
 # ──────────────────────────────────────────────────────────────────────────────
 
 def build_stop_ps1(project_dir: str) -> str:
+    """Generates lyra_observer_stop.ps1 — kills all running Claude Code observer sessions and logs the stop event."""
     logs_dir = os.path.join(project_dir, "ClaudeCode", "logs")
     ld = _ps(logs_dir)
     return f"""# lyra_observer_stop.ps1 - Stop all Claude Code observer sessions
@@ -446,6 +459,7 @@ RESULT   : SUCCESS
 # ──────────────────────────────────────────────────────────────────────────────
 
 def build_uninstall_ps1(project_dir: str) -> str:
+    """Generates lyra_observer_uninstall.ps1 — removes ClaudeCode/ folder and CLAUDE.md; never touches .openclaw."""
     claudecode_dir = os.path.join(project_dir, "ClaudeCode")
     cd2 = _ps(claudecode_dir); pd = _ps(project_dir)
     return f"""# lyra_observer_uninstall.ps1 - Clean uninstall of Claude Code observer layer
@@ -503,11 +517,24 @@ Write-Host "       To reinstall: run ClaudeCodeSetup.py again." -ForegroundColor
 # ──────────────────────────────────────────────────────────────────────────────
 
 class InstallerLogic:
+    """
+    GUI-independent installation logic for the Claude Code ↔ Lyra observer setup.
+
+    All output goes through log_cb / status_cb callbacks so this class can be
+    driven from any GUI (or from a script). Raises RuntimeError on fatal errors.
+    """
+
     def __init__(self, log_cb, status_cb):
+        """
+        Args:
+            log_cb:    Callable(msg: str, tag: str) for log output.
+            status_cb: Callable(msg: str, level: str) for status bar updates.
+        """
         self.log    = log_cb
         self.status = status_cb
 
     def run_step(self, label: str, fn) -> bool:
+        """Executes fn() with a labeled log header. Returns True on success, False on exception."""
         self.log(f"\n▶  {label}", "step")
         try:
             fn()
@@ -518,6 +545,7 @@ class InstallerLogic:
             return False
 
     def check_python(self):
+        """Raises RuntimeError if Python < 3.10; logs the current version otherwise."""
         v = sys.version_info
         if v.major < 3 or (v.major == 3 and v.minor < 10):
             raise RuntimeError(f"Python 3.10+ benötigt, gefunden: {v.major}.{v.minor}")
@@ -583,6 +611,7 @@ class InstallerLogic:
     # ── CHECKS ───────────────────────────────────────────────────────────────
 
     def check_node(self):
+        """Raises RuntimeError if Node.js is not found or returns no version; logs path and version on success."""
         node_dir = self._find_node_dir()
         if node_dir:
             r = subprocess.run(
@@ -602,6 +631,7 @@ class InstallerLogic:
             self.log(f"      Pfad: {node_dir}", "info")
 
     def check_npm(self):
+        """Raises RuntimeError with fix hint if npm is not on PATH; logs the npm version on success."""
         npm = self._npm_cmd()
         r   = subprocess.run(npm + ["--version"], capture_output=True, text=True, shell=False)
         if r.returncode != 0 or not r.stdout.strip():
@@ -683,6 +713,7 @@ class InstallerLogic:
         log_cb("      Claude Code installiert ✅", "ok")
 
     def create_dirs(self, project_dir: str):
+        """Creates ClaudeCode/, ClaudeCode/logs/, and ClaudeCode/scripts/ under project_dir."""
         dirs = [
             os.path.join(project_dir, "ClaudeCode"),
             os.path.join(project_dir, "ClaudeCode", "logs"),
@@ -694,6 +725,7 @@ class InstallerLogic:
 
     def write_claude_md(self, project_dir: str, openclaw_dir: str,
                          autonomous: bool = False):
+        """Writes CLAUDE.md to project_dir using build_claude_md(). Enables autonomous mode if requested."""
         path    = os.path.join(project_dir, "CLAUDE.md")
         content = build_claude_md(project_dir, openclaw_dir, autonomous=autonomous)
         with open(path, "w", encoding="utf-8") as f:
@@ -701,6 +733,7 @@ class InstallerLogic:
         self.log(f"      📄 {path} (autonomous={autonomous})", "info")
 
     def write_scripts(self, project_dir: str, openclaw_dir: str):
+        """Writes lyra_observer.ps1, lyra_observer_stop.ps1, and lyra_observer_uninstall.ps1 with UTF-8 BOM."""
         scripts = {
             "lyra_observer.ps1":           build_observer_ps1(project_dir, openclaw_dir),
             "lyra_observer_stop.ps1":      build_stop_ps1(project_dir),
@@ -715,6 +748,7 @@ class InstallerLogic:
             self.log(f"      📜 {path}", "info")
 
     def write_install_log(self, project_dir: str, openclaw_dir: str):
+        """Writes a timestamped install log entry to ClaudeCode/logs/YYYY-MM-DD_HH-MM_install.log."""
         logs_dir = os.path.join(project_dir, "ClaudeCode", "logs")
         ts       = datetime.datetime.now()
         log_path = os.path.join(logs_dir, ts.strftime("%Y-%m-%d_%H-%M") + "_install.log")
@@ -765,6 +799,11 @@ class InstallerLogic:
         self.log(f"      📋 workers.json updated (claude_code entry added)", "info")
 
     def install(self, project_dir: str, openclaw_dir: str):
+        """
+        Runs the full installation sequence: Python/Node/npm/Claude Code checks,
+        create dirs, write CLAUDE.md + PS1 scripts + install log + workers.json entry.
+        Logs final success or failure summary.
+        """
         ok = True
         ok &= self.run_step("Python-Version prüfen",    self.check_python)
         ok &= self.run_step("Node.js prüfen",            self.check_node)
@@ -794,6 +833,10 @@ class InstallerLogic:
             self.log("══════════════════════════════════════════\n", "warn")
 
     def start_observer(self, project_dir: str):
+        """
+        Launches lyra_observer.ps1 in a visible terminal window.
+        Prefers Windows Terminal (wt.exe); falls back to cmd /c start for a new console window.
+        """
         script = os.path.join(project_dir, "lyra_observer.ps1")
         if not os.path.exists(script):
             raise RuntimeError("lyra_observer.ps1 nicht gefunden - bitte erst installieren.")
@@ -825,6 +868,7 @@ class InstallerLogic:
         self.log("  3. .\\lyra_observer.ps1", "info")
 
     def stop_observer(self, project_dir: str):
+        """Runs lyra_observer_stop.ps1 to kill all active Claude Code observer sessions."""
         script = os.path.join(project_dir, "lyra_observer_stop.ps1")
         if not os.path.exists(script):
             raise RuntimeError("lyra_observer_stop.ps1 nicht gefunden — bitte erst installieren.")
@@ -835,6 +879,7 @@ class InstallerLogic:
         self.log(r.stdout or "Gestoppt.", "info")
 
     def uninstall(self, project_dir: str):
+        """Runs lyra_observer_uninstall.ps1 in a new console. Removes ClaudeCode/ and CLAUDE.md; never touches .openclaw."""
         script = os.path.join(project_dir, "lyra_observer_uninstall.ps1")
         if not os.path.exists(script):
             raise RuntimeError("lyra_observer_uninstall.ps1 nicht gefunden.")
@@ -850,7 +895,16 @@ class InstallerLogic:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class App(tk.Tk):
+    """
+    Main application window for the Claude Code ↔ Lyra Setup tool.
+
+    Dark-themed Tkinter GUI with path selectors, log output, status bar,
+    and action buttons (Install / Start / Stop / Fix npm / Uninstall).
+    All long-running actions run in daemon threads to keep the UI responsive.
+    """
+
     def __init__(self):
+        """Initializes window geometry, builds UI, and creates the InstallerLogic instance."""
         super().__init__()
         self.title(APP_TITLE)
         self.configure(bg=COLORS["bg"])
@@ -866,6 +920,7 @@ class App(tk.Tk):
         )
 
     def _center(self):
+        """Centers the 860×700 window on the primary screen."""
         self.update_idletasks()
         w, h = 860, 700
         sw   = self.winfo_screenwidth()
@@ -875,6 +930,7 @@ class App(tk.Tk):
     # ── UI BUILD ────────────────────────────────────────────────────────────
 
     def _build_ui(self):
+        """Assembles all UI sections: header, path rows, status bar, log area, and button rows."""
         self._build_header()
         self._build_paths()
         self._build_status_bar()
@@ -882,6 +938,7 @@ class App(tk.Tk):
         self._build_buttons()
 
     def _build_header(self):
+        """Builds the title row with app name, subtitle, and version label."""
         hdr = tk.Frame(self, bg=COLORS["bg"], pady=18)
         hdr.pack(fill="x", padx=0)
 
@@ -904,6 +961,7 @@ class App(tk.Tk):
         sep.pack(fill="x")
 
     def _build_paths(self):
+        """Builds the path configuration panel with project dir and OpenClaw dir rows."""
         frame = tk.LabelFrame(
             self, text="  Pfad-Konfiguration  ",
             font=FONT_BOLD, fg=COLORS["accent"],
@@ -931,6 +989,7 @@ class App(tk.Tk):
                  ).grid(row=2, column=0, columnspan=3, sticky="w", padx=12, pady=(2, 8))
 
     def _build_path_row(self, parent, label: str, var: tk.StringVar, row: int):
+        """Adds a label + entry + browse button row for a directory path variable."""
         tk.Label(parent, text=label, font=FONT_UI,
                  fg=COLORS["text"], bg=COLORS["panel"], width=22, anchor="w"
                  ).grid(row=row, column=0, padx=12, pady=5, sticky="w")
@@ -946,6 +1005,7 @@ class App(tk.Tk):
         parent.columnconfigure(1, weight=1)
 
     def _build_status_bar(self):
+        """Creates the status bar with a color-dot indicator and a status text label."""
         bar = tk.Frame(self, bg=COLORS["panel"], height=36,
                        highlightbackground=COLORS["border"], highlightthickness=1)
         bar.pack(fill="x", padx=16, pady=(0, 4))
@@ -959,6 +1019,7 @@ class App(tk.Tk):
         self._status_label.pack(side="left")
 
     def _build_log(self):
+        """Creates the scrollable log output area with color-tagged text (step/ok/warn/error/info)."""
         lf = tk.LabelFrame(
             self, text="  Log-Ausgabe  ",
             font=FONT_BOLD, fg=COLORS["text_dim"],
@@ -989,6 +1050,7 @@ class App(tk.Tk):
         self._log("  Passe die Pfade an und klicke INSTALLIEREN.", "info")
 
     def _build_buttons(self):
+        """Builds the Install / Start / Stop / Fix npm / Uninstall / Clear Log button rows."""
         bf = tk.Frame(self, bg=COLORS["bg"])
         bf.pack(fill="x", padx=16, pady=(4, 14))
 
@@ -1025,6 +1087,7 @@ class App(tk.Tk):
     # ── WIDGET HELPERS ───────────────────────────────────────────────────────
 
     def _flat_btn(self, parent, text: str, cmd) -> tk.Button:
+        """Returns a flat secondary button with hover highlight, no colored label."""
         b = tk.Button(
             parent, text=text, command=cmd,
             font=FONT_SMALL,
@@ -1038,6 +1101,7 @@ class App(tk.Tk):
         return b
 
     def _action_btn(self, parent, text: str, cmd, color: str) -> tk.Button:
+        """Returns a prominent action button with the given foreground color."""
         b = tk.Button(
             parent, text=text, command=cmd,
             font=FONT_BOLD,
@@ -1053,11 +1117,13 @@ class App(tk.Tk):
     # ── ACTIONS ──────────────────────────────────────────────────────────────
 
     def _browse(self, var: tk.StringVar):
+        """Opens a directory picker and updates var with the selected (normalized) path."""
         d = filedialog.askdirectory(initialdir=var.get() or os.path.expanduser("~"))
         if d:
             var.set(os.path.normpath(d))
 
     def _on_fix_npm(self):
+        """Runs fix_npm_path_and_install_claude in a background thread. Shows status on completion."""
         self._set_status("🔧  npm PATH fix + Claude Code Installation…", "warn")
         self._log("\n══════════════════════════════════════════", "step")
         self._log("  npm fix + Claude Code Installation", "step")
@@ -1075,6 +1141,7 @@ class App(tk.Tk):
         threading.Thread(target=_run, daemon=True).start()
 
     def _on_install(self):
+        """Validates paths, optionally creates project dir, then runs logic.install in a background thread."""
         proj = os.path.normpath(self._project_var.get().strip())
         ocl  = os.path.normpath(self._openclaw_var.get().strip())
 
@@ -1097,6 +1164,7 @@ class App(tk.Tk):
         ).start()
 
     def _on_start(self):
+        """Launches the observer script in a background thread via logic.start_observer."""
         proj = os.path.normpath(self._project_var.get().strip())
         self._set_status("🚀  Observer wird gestartet…", "ok")
         threading.Thread(
@@ -1105,6 +1173,7 @@ class App(tk.Tk):
         ).start()
 
     def _on_stop(self):
+        """Stops the observer in a background thread via logic.stop_observer."""
         proj = os.path.normpath(self._project_var.get().strip())
         self._set_status("■  Observer wird gestoppt…", "warn")
         threading.Thread(
@@ -1113,6 +1182,7 @@ class App(tk.Tk):
         ).start()
 
     def _on_uninstall(self):
+        """Confirms, then runs logic.uninstall in a background thread."""
         if not messagebox.askyesno(
             "Deinstallieren?",
             "Alle ClaudeCode-Dateien und Scripts entfernen?\n\n"
@@ -1127,6 +1197,7 @@ class App(tk.Tk):
         ).start()
 
     def _safe_run(self, fn, *args):
+        """Calls fn(*args) and logs any exception to the log area and status bar."""
         try:
             fn(*args)
         except Exception as e:
@@ -1134,6 +1205,7 @@ class App(tk.Tk):
             self._set_status(f"❌  Fehler: {e}", "error")
 
     def _clear_log(self):
+        """Clears all text from the log area."""
         self._log_area.config(state="normal")
         self._log_area.delete("1.0", "end")
         self._log_area.config(state="disabled")

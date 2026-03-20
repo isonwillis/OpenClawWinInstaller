@@ -150,6 +150,7 @@ def _agent_base_url(agent: dict) -> str:
     # A "real" URL has a scheme OR looks like a public domain (contains a dot
     # but is NOT a bare IP address like 192.168.x.x / 10.x / 172.x / 127.x)
     def _is_real_url(s: str) -> bool:
+        """Returns True if s looks like a full URL or hostname; False for bare IP addresses."""
         if "://" in s:
             return True
         # Bare IP patterns — NOT a real URL, need port appended
@@ -192,6 +193,13 @@ class _HealthPoller(threading.Thread):
                  on_result:    Callable[[list[dict]], None],
                  root:         tk.Tk,
                  interval_sec: int = POLL_INTERVAL_SEC):
+        """
+        Args:
+            get_agents:   Callable returning the current agent list from workers.json.
+            on_result:    Callback receiving poll results list; scheduled on root thread.
+            root:         Tkinter root for thread-safe root.after scheduling.
+            interval_sec: Seconds between polls (default: POLL_INTERVAL_SEC = 30).
+        """
         super().__init__(daemon=True, name="LyraHealthPoller")
         self._get_agents  = get_agents
         self._on_result   = on_result
@@ -200,14 +208,17 @@ class _HealthPoller(threading.Thread):
         self._stop_evt    = threading.Event()
 
     def stop(self):
+        """Signals the polling thread to exit on the next interval."""
         self._stop_evt.set()
 
     def run(self):
+        """Thread entry point: polls agent health at fixed intervals until stop() is called."""
         while not self._stop_evt.is_set():
             self._poll()
             self._stop_evt.wait(self._interval)
 
     def _health_url_and_key(self, agent: dict) -> tuple[str, str]:
+        """Returns (health_endpoint_url, api_key) appropriate for the agent type."""
         base    = _agent_base_url(agent)
         atype   = agent.get("type", "worker")
         api_key = agent.get("api_key", "")
@@ -220,6 +231,7 @@ class _HealthPoller(threading.Thread):
         return f"{base}/health", ""
 
     def _poll(self):
+        """Checks health of all agents and delivers results via on_result callback on the main thread."""
         agents = self._get_agents()
         if not agents:
             return
@@ -280,6 +292,13 @@ class MonitoringTab:
 
     def __init__(self, notebook: ttk.Notebook, cfg,
                  log_fn: Callable, root: tk.Tk):
+        """
+        Args:
+            notebook: Parent ttk.Notebook to add the Monitoring tab into.
+            cfg:      OpenClawConfig instance for workers.json read/write and SOUL.md generation.
+            log_fn:   Logging callback(msg, level) shared with the installer.
+            root:     Tkinter root for thread-safe scheduling via root.after.
+        """
         self._nb    = notebook
         self._cfg   = cfg
         self._log   = log_fn
@@ -340,12 +359,14 @@ class MonitoringTab:
         head_server.on_result_callback = _cb
 
     def destroy(self):
+        """Stops the background health poller thread gracefully."""
         if self._poller:
             self._poller.stop()
 
     # ── UI construction ───────────────────────────────────────────────────────
 
     def _build_ui(self, parent: ttk.Frame):
+        """Creates scrollable layout with agent registry, task sender, and result viewer sections."""
         canvas = tk.Canvas(parent, borderwidth=0, highlightthickness=0)
         vsb    = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
@@ -365,6 +386,7 @@ class MonitoringTab:
         self._build_result_viewer_section(outer)
 
     def _build_registry_section(self, parent: ttk.Frame):
+        """Builds the Agent Registry LabelFrame with type/protocol selector, address fields, and action buttons."""
         lf = ttk.LabelFrame(parent, text="🖥  Agent Registry", padding="8")
         lf.pack(fill=tk.X, pady=(0, 8))
 
@@ -456,6 +478,7 @@ class MonitoringTab:
         self._apply_type_visibility("worker")
 
     def _build_task_sender_section(self, parent: ttk.Frame):
+        """Builds the task sender LabelFrame with target, task type selector, payload input, and Send button."""
         lf = ttk.LabelFrame(parent, text="📤  Send Task / Prompt", padding="8")
         lf.pack(fill=tk.X, pady=(0, 8))
 
@@ -531,6 +554,7 @@ class MonitoringTab:
     # ── Type visibility ───────────────────────────────────────────────────────
 
     def _on_type_changed(self, *_):
+        """Updates protocol, default port, and field visibility when agent type changes."""
         atype = self._reg_type_var.get()
         meta  = TYPE_META.get(atype, TYPE_META["worker"])
         self._reg_proto_var.set(meta["protocol"])
@@ -560,6 +584,7 @@ class MonitoringTab:
     # ── Agent label ───────────────────────────────────────────────────────────
 
     def _agent_label(self, a: dict, status: str = "?") -> str:
+        """Returns a formatted listbox label string: [STATUS] name  url  (type/role) [model]."""
         atype = a.get("type", "worker")
         url   = _agent_base_url(a)
         name  = a.get("name", "?")
@@ -590,6 +615,7 @@ class MonitoringTab:
     # ── Poller integration ────────────────────────────────────────────────────
 
     def _load_agents_and_start_poller(self):
+        """Loads agents from workers.json, populates the listbox, and (re)starts the health poller."""
         agents = self._cfg.load_workers()
         self._agents = agents
         self._reg_list.delete(0, tk.END)
@@ -677,6 +703,7 @@ class MonitoringTab:
         }
 
     def _list_select(self, event):
+        """Prefills form fields with the selected agent's data and switches the task sender to match."""
         sel = self._reg_list.curselection()
         if not sel:
             return
@@ -833,6 +860,7 @@ class MonitoringTab:
         rules_box.insert("1.0", existing if existing else default_rules)
 
     def _check_agent(self):
+        """Tests reachability of the agent in the form (HTTP health check or process check for claude_code)."""
         a       = self._collect_form()
         atype   = a["type"]
         base    = _agent_base_url(a)
@@ -890,6 +918,7 @@ class MonitoringTab:
             self._log(f"[Monitor] {msg}", "ERROR")
 
     def _add_agent(self):
+        """Adds or updates an agent in the registry. Existing entries are matched by base URL; delegation_rules are preserved."""
         entry = self._collect_form()
         base  = _agent_base_url(entry)
         for i, a in enumerate(self._agents):
@@ -917,6 +946,7 @@ class MonitoringTab:
             self._reg_save_btn.config(text="💾 Save / Update")
 
     def _remove_agent(self):
+        """Removes the selected agent from the in-memory list, the listbox, and persists to workers.json."""
         sel = self._reg_list.curselection()
         if not sel:
             self._log("[Monitor] No agent selected for removal", "INFO")
@@ -931,6 +961,7 @@ class MonitoringTab:
         self._save_and_update_soul()
 
     def _save_and_update_soul(self):
+        """Writes agents to workers.json and regenerates SOUL.md with the updated Agent Registry section."""
         self._cfg.save_workers(self._agents)
         self._cfg.write_soul_files(log_prefix="monitor-agent-update")
         self._log(f"[Monitor] workers.json saved + SOUL.md updated "
@@ -948,6 +979,7 @@ class MonitoringTab:
         return None
 
     def _send_task(self):
+        """Routes the task to the correct sender based on task type (OpenAI chat, Ollama chat, or OpenClaw task)."""
         ttype   = self._snd_task_type.get()
         message = self._snd_payload.get().strip()
         target  = self._snd_target.get().strip()
@@ -966,6 +998,7 @@ class MonitoringTab:
             self._send_openclaw_task(url, ttype, message)
 
     def _send_openclaw_task(self, url: str, ttype: str, text: str):
+        """POSTs an OpenClaw async task (web_search, batch_exec, summarize, validate) to the worker."""
         if ttype == "web_search":
             payload = {"query": text}
         elif ttype == "batch_exec":
@@ -989,6 +1022,7 @@ class MonitoringTab:
 
     def _send_openai_chat(self, url: str, message: str,
                           model: str, api_key: str):
+        """Sends a chat message to an OpenAI-compatible API (/chat/completions). Supports DeepSeek."""
         if not model:
             model = ("deepseek-chat" if "deepseek" in url.lower()
                      else "gpt-4o-mini")
@@ -1023,6 +1057,7 @@ class MonitoringTab:
 
     def _send_ollama_chat(self, url: str, message: str,
                           model: str, api_key: str):
+        """Sends a chat message to an Ollama API (/api/chat) with streaming disabled."""
         self._log(f"[Monitor] Ollama chat → {url}  model={model or 'default'}")
         sc, body = _diag_api(
             f"{url}/api/chat", timeout=60, method="POST",
@@ -1048,6 +1083,7 @@ class MonitoringTab:
     # ── Result viewer ─────────────────────────────────────────────────────────
 
     def _result_write(self, text: str):
+        """Replaces the entire result box content with the given text."""
         self._res_box.configure(state=tk.NORMAL)
         self._res_box.delete("1.0", tk.END)
         self._res_box.insert(tk.END, text)
@@ -1064,6 +1100,7 @@ class MonitoringTab:
         self._res_box.configure(state=tk.DISABLED)
 
     def _clear_result_box(self):
+        """Clears the result display box and resets the status label to the waiting state."""
         self._result_write("")
         if self._res_status_lbl:
             self._res_status_lbl.config(

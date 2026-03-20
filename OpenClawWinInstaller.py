@@ -68,7 +68,22 @@ CLAUDE_CODE_AVAILABLE = False  # set to True lazily in _cc_load_module()
 # ══════════════════════════════════════════════════════════════════════════════
 
 class OpenClawWinInstaller(OpenClawOperations):
+    """
+    Main application window for the OpenClaw / LYRA installer.
+
+    Inherits all PowerShell helpers and installation logic from OpenClawOperations.
+    Reads machine_role.json on startup to determine whether to run as LYRA head or worker.
+    Auto-starts the head task server and Claude Code observer when role is "Lyra".
+    """
+
     def __init__(self, root):
+        """
+        Args:
+            root: Tkinter Tk root window.
+
+        Initializes OpenClawConfig with GUI callbacks, detects hardware profile,
+        reads machine role, builds UI, and schedules auto-start tasks.
+        """
         self.root = root
         self.root.title("OpenClaw Windows Setup  –  v1.0.4")
         self.root.geometry("1020x860")
@@ -425,6 +440,8 @@ class OpenClawWinInstaller(OpenClawOperations):
         _LYRA_PORT = LYRA_HEAD_PORT
 
         class QueuedWorkerClient(LyraWorkerClient):
+            """LyraWorkerClient variant that pulls tasks from a local Queue instead of polling HTTP."""
+
             def __init__(self, head_address, role, model, task_queue,
                          log_fn=None, poll_interval=7, local_server=None):
                 super().__init__(head_address, role, model, log_fn, poll_interval,
@@ -501,6 +518,7 @@ class OpenClawWinInstaller(OpenClawOperations):
     # ──────────────────────────────────────────────────────────────────
 
     def setup_ui(self):
+        """Builds the complete UI: header, install button, progress bar, and role-specific tabs."""
         main_frame = ttk.Frame(self.root, padding="12")
         main_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -1739,6 +1757,7 @@ class OpenClawWinInstaller(OpenClawOperations):
         return "http://127.0.0.1:8080"
 
     def _check_searxng(self, status_label, base_url: str = "http://127.0.0.1:8080"):
+        """Tests SearXNG reachability and JSON format; updates status_label with color-coded result."""
         base_url = base_url.rstrip("/").replace("//localhost:", "//127.0.0.1:")
         url = f"{base_url}/search?q=test&format=json"
         self.log(f"[SearXNG] GET {url} (Timeout 8s)...")
@@ -1933,6 +1952,7 @@ class OpenClawWinInstaller(OpenClawOperations):
         ).start()
 
     def _scan_searxng_port_worker(self, url_entry):
+        """Scans common ports to auto-detect a running SearXNG container and updates url_entry on success."""
         candidates = [8080, 8888, 9000, 7000, 8000, 8090, 5000, 4000, 3000]
         found = None
         for port in candidates:
@@ -2774,6 +2794,7 @@ class OpenClawWinInstaller(OpenClawOperations):
     # ── WORKER SPECIFIC ─────────────────────────────────────────────
 
     def _test_worker_conn(self):
+        """Tests connectivity from worker to LYRA head server; logs detailed error hints on failure."""
         head = self._w_head_entry.get().strip()
         port = self._w_port_entry.get().strip() or str(LYRA_HEAD_PORT)
         url = f"http://{head}:{port}/health"
@@ -2908,6 +2929,7 @@ class OpenClawWinInstaller(OpenClawOperations):
         self.log("[WorkerLoop] Stopped")
 
     def _update_worker_loop_status(self):
+        """Updates the worker loop status label based on whether the polling thread is alive."""
         client = getattr(self, "_worker_client_diag", None) or getattr(self, "_worker_client", None)
         if client and hasattr(client, "_thread") and client._thread and client._thread.is_alive():
             if hasattr(self, "_w_loop_status"):
@@ -3107,6 +3129,7 @@ class OpenClawWinInstaller(OpenClawOperations):
     # ──────────────────────────────────────────────────────────────────
 
     def _copy_sel(self):
+        """Copies the selected log text to clipboard; silently ignores if no selection."""
         try:
             self.root.clipboard_clear()
             self.root.clipboard_append(self.log_text.get(tk.SEL_FIRST, tk.SEL_LAST))
@@ -3114,14 +3137,17 @@ class OpenClawWinInstaller(OpenClawOperations):
             pass
 
     def _copy_all(self):
+        """Copies the entire log text to clipboard."""
         self.root.clipboard_clear()
         self.root.clipboard_append(self.log_text.get("1.0", tk.END))
         self.log("Log copied to clipboard")
 
     def _clear(self):
+        """Clears the log text widget."""
         self.log_text.delete("1.0", tk.END)
 
     def _set_status(self, text):
+        """Updates the status bar label text."""
         self.status_label.config(text=text)
 
     # ──────────────────────────────────────────────────────────────────
@@ -3288,6 +3314,7 @@ class OpenClawWinInstaller(OpenClawOperations):
         return role, head_address
 
     def start_installation(self):
+        """Shows a 15-step confirmation dialog and launches installation_process in a background thread."""
         if self.installation_running:
             return
 
@@ -3714,6 +3741,11 @@ class OpenClawWinInstaller(OpenClawOperations):
         self.log("=" * 70)
 
     def installation_process(self):
+        """
+        Full installation flow. Routes to worker setup for Junior/Senior roles.
+        For Lyra (head): 16-step install covering admin, system prep, Node.js, Ollama, OpenClaw,
+        gateway config, SOUL.md, skills, and Claude Code observer.
+        """
         try:
             machine_role = getattr(self, "machine_role", "Lyra")
             head_address = getattr(self, "head_address", None)
@@ -4332,6 +4364,7 @@ class OpenClawWinInstaller(OpenClawOperations):
         return w
 
     def ask_open_dashboard(self):
+        """Post-installation dialog offering to open the LYRA dashboard in the browser."""
         token = self.cfg._read_token_from_config() or "lyra-local-token"
         dashboard_url = f"http://127.0.0.1:18789/?token={token}"
         msg = (
@@ -4352,6 +4385,7 @@ class OpenClawWinInstaller(OpenClawOperations):
 
 
 def main():
+    """Entry point: creates the Tkinter root, launches the installer, and starts the event loop."""
     root = tk.Tk()
     app = OpenClawWinInstaller(root)
     root.protocol("WM_DELETE_WINDOW", app._on_close)
