@@ -36,6 +36,7 @@ From v1.0.4 the system also supports **external LLM agents** (OpenAI-compatible 
 ## Table of Contents
 
 - [What's New in v1.0.4](#whats-new-in-v104)
+  - [Observer Session 2026-03-21](#-observer-session-2026-03-21)
   - [Observer Session 2026-03-20](#-observer-session-2026-03-20)
   - [Observer Session 2026-03-19](#-soulmd--observer-session-2026-03-19)
 - [What's New in v1.0.3](#whats-new-in-v103)
@@ -56,6 +57,64 @@ From v1.0.4 the system also supports **external LLM agents** (OpenAI-compatible 
 ---
 
 ## What's New in v1.0.4
+
+### 🔭 Observer Session 2026-03-21
+
+#### 💥 DECISION #18 — Compaction VRAM Overflow Fix
+
+**Root cause discovered:** `compaction.model` was set to `qwen2.5:7b-instruct` (fallback) while `primary` was `glm-4.7-flash`. With `OLLAMA_KEEP_ALIVE=10m`, glm-4.7-flash stays in VRAM after the user's message. When compaction fires it loads qwen2.5:7b → both models in VRAM simultaneously → **7.8 GB > 6 GB RTX 3050 limit → `exit status 2` → HTTP 500 → Gateway freezes** showing "Compacting content..." with no Ollama activity.
+
+**Fix:** `compaction.model` is now set dynamically to `f"ollama/{primary_model}"` — always matching the primary. Ollama reuses the already-loaded model for compaction → zero additional VRAM.
+
+| Before | After |
+|---|---|
+| `compaction.model: "ollama/qwen2.5:7b-instruct"` (hardcoded) | `compaction.model: f"ollama/{primary_model}"` (dynamic) |
+| Two models in VRAM → OOM → Gateway freeze | One model reused → no VRAM conflict |
+
+#### 🧠 DECISION #19 — 131 072 Token Context Window (max)
+
+**Root cause of "!" after every message:** OpenClaw reads native Ollama `num_ctx` via `/api/show` → 32 768 for qwen2.5:7b → `threshold = 0.7 × 32768 = 22 937 tokens`. SOUL.md system prompt alone fills ~15K tokens → compaction fires after **every single message**.
+
+**Fix (two-part):**
+1. `agents.defaults.contextTokens: 131072` in `openclaw.json` — overrides the `/api/show` lookup globally
+2. `_extend_ollama_model_context()` — new method that creates an Ollama Modelfile setting `num_ctx 131072` via `docker exec`, so `/api/show` also confirms 131 072
+
+**Result:** `threshold = 0.7 × 131072 = 91 750 tokens` → **~70K usable chat space**. KV-cache lives in RAM (64 GB available). Called automatically in `setup_lyra_agent()` after gateway start.
+
+| Config | Threshold | Usable space |
+|---|---|---|
+| Default (no override) | 22 937 | ~8K → fires every message |
+| `contextTokens: 65536` (interim) | 45 875 | ~30K |
+| `contextTokens: 131072` (current) | 91 750 | ~70K |
+
+#### 🔧 VRAM_TIERS Boundary Fix (-100 MB buffer)
+
+`nvidia-smi` reports **6 143 MB** for RTX 3050 6 GB (not 6 144). The VRAM_TIERS boundary was exactly `6 * 1024 = 6144` → RTX 3050 missed by 1 MB → fell into the 4–6 GB tier → qwen2.5:7b selected instead of glm-4.7-flash.
+
+**Fix:** boundary changed to `6 * 1024 - 100 = 6044 MB` — 100 MB buffer absorbs nvidia-smi rounding.
+
+#### 📦 PyInstaller Spec — tkinter Bundled
+
+`tkinter` is not auto-detected by PyInstaller on this Python installation (`C:/Python/python311-32`). Added explicit bundling to `OpenClawWinInstaller.spec`:
+- `binaries`: `_tkinter.pyd`, `tcl86t.dll`, `tk86t.dll`
+- `datas`: `tcl/tcl8.6`, `tcl/tk8.6`
+- `hiddenimports`: full `collect_submodules('tkinter')` + all used submodules
+
+#### 📋 CLAUDE.md — `_build_force_delegate_content()` Corrected
+
+`_build_force_delegate_content()` was referenced in CLAUDE.md and ClaudeCodeSetup.py but **never existed** as a standalone function. FORCE-DELEGATE.md content is written inline in `write_workspace_files()`.
+
+Fixed in both Track 1 (CLAUDE.md) and Track 2 (ClaudeCodeSetup.py).
+
+#### ❌ VRAM overflow from mismatched compaction model — NEVER REINTRODUCE
+If `compaction.model ≠ primary_model` and `OLLAMA_KEEP_ALIVE=10m`, both models load simultaneously → VRAM OOM → HTTP 500 → Gateway freezes.
+**Fix:** Always set `compaction.model = f"ollama/{primary_model}"` dynamically (DECISION #18).
+
+#### ❌ `contextTokens` not set → compaction after every message — NEVER REINTRODUCE
+Without `agents.defaults.contextTokens` in `openclaw.json`, OpenClaw uses `/api/show` → 32 768 → threshold 22 937 → fires after first message.
+**Fix:** Always write `contextTokens: 131072` + create Modelfile via `_extend_ollama_model_context()` (DECISION #19).
+
+---
 
 ### ♻️ Restart Ollama Button
 
@@ -429,15 +488,15 @@ The original 9005-line monolith split into three focused files:
 ## Three-Module Architecture
 
 ```
-OpenClawWinInstaller.py                    4 396 lines   GUI + installation flow
-OpenClawConfigManagement.py                6 524 lines   All logic, servers, config
+OpenClawWinInstaller.py                    4 397 lines   GUI + installation flow
+OpenClawConfigManagement.py                6 673 lines   All logic, servers, config
 OpenClawAgentMonitoring.py                 1 157 lines   Monitoring Tab (self-contained)
 ──────────────────────────────────────────────────────
-Subtotal (3-module core)                  12 077 lines
+Subtotal (3-module core)                  12 227 lines
 
 Tools/ClaudeCodeSetup/ClaudeCodeSetup.py  1 248 lines   Claude Code ↔ Lyra Setup GUI
 ──────────────────────────────────────────────────────
-Total                                     13 325 lines
+Total                                     13 475 lines
 ```
 
 ---
@@ -519,6 +578,10 @@ python Tools/pytorch_setup_gui/pytorch_setup_gui.py
 - ✅ Ollama model discovery via REST API — WSL, Docker, Windows-native
 - ✅ GPU-hybrid inference: RTX 3050 (6 GB VRAM + 26 GB shared)
 - ✅ `sessions.json` deleted before gateway start — fresh agent state
+- ✅ `contextTokens: 131072` — 70K usable chat space, no compaction after every message (DECISION #19)
+- ✅ `compaction.model` always matches `primary_model` — no VRAM overflow on compaction (DECISION #18)
+- ✅ `_extend_ollama_model_context()` — Ollama Modelfile `num_ctx 131072` set automatically on install
+- ✅ VRAM_TIERS -100MB boundary buffer — RTX 3050 correctly classified despite nvidia-smi rounding
 
 ---
 
@@ -601,6 +664,9 @@ External LLM ──────────────────────�
 | Context persistence | `[CONTEXT]` (F–I) — successful work survives session reset | v1.0.4 |
 | Dynamic model names | Primary + fallback read from `openclaw.json` at generation | v1.0.4 |
 | SOUL.md size limit | `bootstrapMaxChars: 40 000` in `openclaw.json` — DECISION #16 | v1.0.4 |
+| Compaction VRAM overflow | `compaction.model` = `primary_model` — DECISION #18 | v1.0.4 |
+| 131 072 context window | `contextTokens: 131072` + Modelfile `num_ctx` — DECISION #19 | v1.0.4 |
+| VRAM_TIERS RTX 3050 | -100MB boundary buffer — nvidia-smi reports 6143, not 6144 | v1.0.4 |
 | Fehler-Eskalation (HF) | Step 2 includes Hugging Face Discussions — separate from GitHub Issues | v1.0.4 |
 | Transformers error text | Full error string + `AutoTokenizer` in example — diagnostic anchor | v1.0.4 |
 | Kein Erfinden block | Full "NIEMALS erfundenes Ergebnis" rule inline — no cross-reference | v1.0.4 |
@@ -668,6 +734,14 @@ API keys must never appear in answers, tables, or PowerShell examples.
 ### ❌ `delegate_to_worker.js` missing blocks all tasks — NEVER REINTRODUCE
 Skill check was a session blocker. Only delegation via that tool is affected when missing.  
 **Fix:** SOUL.md — task first, one-line note at end, skill check only when delegating.
+
+### ❌ `compaction.model` ≠ primary model — NEVER REINTRODUCE
+With `OLLAMA_KEEP_ALIVE=10m`, the primary model stays in VRAM after every request. If `compaction.model` differs, compaction loads a second model → VRAM OOM → HTTP 500 → Gateway freezes on "Compacting content..." (DECISION #18).
+**Fix:** `write_openclaw_config()` always sets `compaction.model = f"ollama/{primary_model}"` dynamically.
+
+### ❌ Missing `contextTokens` in openclaw.json — NEVER REINTRODUCE
+Without it, OpenClaw reads native Ollama `num_ctx` (32 768) → compaction threshold 22 937 → fires after every single message (DECISION #19).
+**Fix:** Always write `contextTokens: 131072` + call `_extend_ollama_model_context()` to set Ollama Modelfile.
 
 ### ❌ `memorySearch` sentinel returns after every Gateway start — NEVER REINTRODUCE
 **Fix:** `_post_gateway_sentinel_fix()` runs 500ms after every health-check.

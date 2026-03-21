@@ -137,7 +137,7 @@ Every improvement MUST be applied to BOTH tracks unless explicitly told otherwis
 
   Track 2 (Installer):
     Edit OpenClawConfigManagement.py (the _build_soul_content / _build_worker_soul_section
-    / _build_bootstrap_content / _build_force_delegate_content functions).
+    / _build_bootstrap_content functions; FORCE-DELEGATE.md is inlined in write_workspace_files()).
     Effect: permanent -- survives every "Apply fixes + Update SOUL.md" click.
 
   WARNING: If only Track 1 is fixed, the next "Apply fixes" click OVERWRITES the fix.
@@ -216,7 +216,7 @@ Track 2: Update corresponding template function in OpenClawConfigManagement.py:
   - SOUL.md content  -> _build_soul_content()
   - Worker section   -> _build_worker_soul_section()
   - BOOTSTRAP.md     -> _build_bootstrap_content()
-  - FORCE-DELEGATE   -> _build_force_delegate_content()
+  - FORCE-DELEGATE   -> write_workspace_files() (inline, no separate build function)
 Also: add learning entries to memory in BOTH perspectives:
   * {memory}\\YYYY-MM-DD.md       -- Observer perspective (Claude Code)
   * {memory}\\YYYY-MM-DD-<id>.md  -- Lyra Ich-perspective

@@ -142,6 +142,36 @@ ARCHITECTURAL DECISIONS  (read before changing anything)
     the claude_code registry entry. OpenClaw truncates silently with a warning.
     Fix: bootstrapMaxChars=40000 via resolveBootstrapMaxChars() in
     auth-profiles-iXW75sRj.js (reads cfg.agents.defaults.bootstrapMaxChars).
+
+17. agents.defaults.compaction — mode=safeguard, maxHistoryShare=0.7, model=ollama/<primary>
+    Without compaction config, sessions grow past 200K tokens (DEFAULT_CONTEXT_TOKENS=2e5).
+    On gateway restart, OpenClaw tries to reload the full session → VRAM overflow → ! in UI.
+    safeguard mode triggers auto-compaction at threshold = maxHistoryShare × model_context.
+    Example: 0.7 × 32768 (qwen2.5:7b) = 22937 tokens — fires quickly with large SOUL.md system prompt.
+    CRITICAL: compaction.model must be set explicitly. Default = anthropic/claude-opus-4-6.
+    No Anthropic API key → compaction fails silently every time → session grows unbounded.
+    Source: resolveCompactionMode() + compactionModelOverride in auth-profiles-iXW75sRj.js.
+
+19. agents.defaults.contextTokens: 131072 — global context window (DECISION #19, 2026-03-21)
+    Without this, OpenClaw calls Ollama /api/show → gets native num_ctx (32768) →
+    compaction threshold = 0.7 × 32768 = 22937 tokens. SOUL.md system prompt alone
+    fills ~15K tokens → compaction fires after EVERY single message.
+    Fix: (a) contextTokens=131072 in agents.defaults overrides the /api/show lookup.
+         (b) _extend_ollama_model_context() creates Modelfile with num_ctx=131072
+             so Ollama actually loads the model with this context → /api/show confirms it.
+    Result: threshold = 0.7 × 131072 = 91750 tokens → ~70K tokens of usable chat space.
+    KV-cache lives in RAM (64 GB available); inference may be slightly slower at full context.
+    Works for ALL models (Docker and native Ollama); called in setup_lyra_agent().
+
+18. compaction.model must equal primary_model (DECISION #18, 2026-03-21)
+    If compaction.model ≠ primary model, OLLAMA_KEEP_ALIVE=10m keeps the primary in VRAM
+    while compaction tries to load the secondary → both models resident simultaneously →
+    VRAM overflow (exit-status-2) → HTTP 500 after 4+ minutes → gateway freezes showing
+    "Compacting content..." forever with no Ollama activity.
+    Symptom: docker logs show 500 from POST /api/chat, followed by 20+ /api/show probes,
+    then silence — no further requests reach Ollama.
+    Fix: write_openclaw_config() uses f"ollama/{primary_model}" for compaction.model.
+    Also: VRAM_TIERS RTX 3050 boundary uses -100 MB buffer (nvidia-smi reports 6143 not 6144).
 """
 
 import os
@@ -152,6 +182,7 @@ import re
 import sys
 import platform
 import subprocess
+_NO_WIN = subprocess.CREATE_NO_WINDOW  # suppress blue console windows on Windows
 import threading
 import traceback
 import socket
@@ -190,7 +221,8 @@ class HardwareProfile:
         (24 * 1024,  "glm-4.7-flash",   3600,  "head"),    # > 24 GB — full VRAM, 1h
         (16 * 1024,  "glm-4.7-flash",   7200,  "head"),    # 16–24 GB — full VRAM, 2h
         ( 8 * 1024,  "glm-4.7-flash",   7200,  "head"),    # 8–16 GB — hybrid, 2h
-        ( 6 * 1024,  "glm-4.7-flash",   7200,  "head"),    # 6–8 GB  — hybrid (RTX 3050), 2h
+        ( 6 * 1024 - 100, "glm-4.7-flash", 7200,  "head"),    # ~6–8 GB — hybrid (RTX 3050), 2h
+        # -100 MB buffer: nvidia-smi can report 6143 instead of 6144 for RTX 3050 6GB → wrong tier
         ( 4 * 1024,  "qwen2.5:7b",      7200,  "senior"),  # 4–6 GB, 2h
         (     0,     "qwen2.5:3b",      7200,  "junior"),  # < 4 GB, 2h
     ]
@@ -251,7 +283,8 @@ class HardwareProfile:
                 ["nvidia-smi",
                  "--query-gpu=name,memory.total",
                  "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=10
+                capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW
             )
             if result.returncode == 0:
                 line = result.stdout.strip().splitlines()[0]
@@ -286,7 +319,8 @@ class HardwareProfile:
                 ["powershell", "-Command",
                  "(Get-CimInstance Win32_PhysicalMemory | "
                  "Measure-Object -Property Capacity -Sum).Sum / 1GB"],
-                capture_output=True, text=True, timeout=10
+                capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW
             )
             if result.returncode == 0:
                 return int(float(result.stdout.strip()))
@@ -305,7 +339,8 @@ class HardwareProfile:
             result = subprocess.run(
                 ["powershell", "-Command",
                  "(Get-WmiObject -Class Win32_Processor).Description"],
-                capture_output=True, text=True, timeout=10
+                capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW
             )
             # AVX2 machines report it in processor description or we check via
             # a small Python snippet as the most reliable method
@@ -314,7 +349,8 @@ class HardwareProfile:
                  "import platform; "
                  "f=platform.processor(); "
                  "print('avx2' if 'avx2' in f.lower() else 'no')"],
-                capture_output=True, text=True, timeout=10
+                capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW
             )
             if avx2_check.returncode == 0:
                 avx2 = "avx2" in avx2_check.stdout.lower()
@@ -1086,6 +1122,21 @@ class OpenClawConfig:
                         "provider": "local",
                         "fallback": "none",
                     },
+                    # DECISION #19 — contextTokens: 131072 globally for all models (2026-03-21)
+                    # Without this: OpenClaw calls /api/show to get model's native context
+                    # (32768 for qwen2.5:7b) → threshold = 0.7 × 32768 = 22937 tokens.
+                    # System prompt alone (SOUL.md + BOOTSTRAP.md) fills ~15K tokens,
+                    # leaving only ~8K tokens before compaction fires — every single message.
+                    # With contextTokens=131072: threshold = 0.7 × 131072 = 91750 tokens
+                    # → ~70K tokens of usable conversation space (max context).
+                    # KV-cache lives in RAM (64 GB available); inference may be slightly
+                    # slower at full context but no VRAM limit (only 3.8 GB used by weights).
+                    # This works for ALL models. Requires Ollama model also loaded with
+                    # num_ctx 131072 (via Modelfile created by _extend_ollama_model_context()).
+                    # Source: auth-profiles-iXW75sRj.js:
+                    #   contextTokens = cfg.agents?.defaults?.contextTokens
+                    #                   ?? lookupContextTokens(model) ?? 2e5
+                    "contextTokens": 131072,
                     # DECISION #1 — timeoutSeconds only, NOT runTimeoutSeconds
                     # DECISION #3 — 3600s correct for RTX 3050 GPU-hybrid
                     # DECISION #9 — 7200 causes orphaned session-write-locks
@@ -1094,6 +1145,26 @@ class OpenClawConfig:
                     # Default 20000 truncates SOUL.md in Lyra's context (confirmed 2026-03-20).
                     # resolveBootstrapMaxChars() in auth-profiles-iXW75sRj.js reads this field.
                     "bootstrapMaxChars": 40000,
+                    # DECISION #17 — compaction.mode=safeguard, maxHistoryShare=0.7
+                    # Without this, sessions grow past 200K tokens → VRAM crash on gateway restart.
+                    # Threshold = maxHistoryShare × model_context_tokens.
+                    # Example: 0.7 × 32768 (qwen2.5:7b) = 22937 tokens → fires quickly with large SOUL.md.
+                    # Source: resolveCompactionMode() in auth-profiles-iXW75sRj.js
+                    #
+                    # DECISION #18 — compaction.model MUST equal primary_model (with ollama/ prefix).
+                    # If they differ, OLLAMA_KEEP_ALIVE=10m keeps the old primary in VRAM while
+                    # compaction loads the secondary → both models loaded simultaneously → VRAM
+                    # overflow (exit-status-2) → HTTP 500 → gateway sticks in "Compacting content..."
+                    # forever, never sending any request to Ollama.
+                    # Fix: use f"ollama/{primary_model}" so compaction uses the already-loaded model.
+                    "compaction": {
+                        "mode": "safeguard",
+                        "maxHistoryShare": 0.7,
+                        # Without model, OpenClaw defaults to anthropic/claude-opus-4-6.
+                        # No Anthropic key → compaction fails silently every time.
+                        # DECISION #18: must match primary_model — no model-switch during compaction.
+                        "model": f"ollama/{primary_model}",
+                    },
                 },
             },
             "commands": {
@@ -1998,17 +2069,19 @@ f"REGEL: Wenn {primary_short} 3x hintereinander Timeout → Fallback-Modell wäh
 "  Regel:     <Allgemeine Regel die sich daraus ableitet>\n"
 "\n"
 "\n"
-"### Selbstverbesserungs-Vorschlag an Entwickler\n"
+"### Selbstverbesserungs-Vorschlag an Claude Code Observer\n"
 "\n"
 "Wenn LYRA erkennt dass eine SOUL.md- oder BOOTSTRAP.md-Regel unvollständig ist:\n"
 "  1. [LEARNING]-Eintrag schreiben (wie oben)\n"
-"  2. Am Ende der Antwort explizit schreiben:\n"
+"  2. In die Memory-Datei (memory/YYYY-MM-DD.md) schreiben:\n"
 "     [SOUL-UPDATE-VORSCHLAG] Sektion: <Name>\n"
 "     Ergänzung: <konkrete Regel in 1-3 Sätzen>\n"
 "     Grund: <warum diese Regel fehlt>\n"
 "\n"
-"Der Entwickler entscheidet ob der Vorschlag in die nächste Version übernommen wird.\n"
-"LYRA erfindet keine Regeln selbst — sie schlägt vor, der Mensch entscheidet.\n"
+"Der Claude Code Observer (FileSystemWatcher, 30s-Poll) erkennt den Tag automatisch.\n"
+"Nach 5-Minuten-Debounce startet Claude Code und führt die Verbesserung in beiden\n"
+"Tracks aus (SOUL.md + OpenClawConfigManagement.py) — kein Eingriff des Menschen nötig.\n"
+"LYRA schlägt vor — Claude Code setzt um.\n"
 "\n"
 "### Wann ein [CONTEXT]-Eintrag geschrieben wird\n"
 "\n"
@@ -2061,7 +2134,8 @@ f"REGEL: Wenn {primary_short} 3x hintereinander Timeout → Fallback-Modell wäh
 "\n"
 "Hat sich gezeigt dass eine SOUL.md-Regel fehlt oder widerspr\u00fcchlich ist?\n"
 "\n"
-"→ JA: [SOUL-UPDATE-VORSCHLAG] an den Entwickler anhängen.\n"
+"→ JA: [SOUL-UPDATE-VORSCHLAG] in memory/YYYY-MM-DD.md schreiben.\n"
+"     Claude Code Observer reagiert automatisch (5-Min-Debounce).\n"
 "→ NEIN: Nichts schreiben.\n"
 "\n"
 "### Schritt 3 — Kontext-Persistenz-Check\n"
@@ -2651,6 +2725,7 @@ ASKING FOR API KEY = ERROR. NEVER DO. Call delegate_to_worker.
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    creationflags=_NO_WIN,
                 )
                 stdout, _ = proc.communicate(input="\n\n\n\n\n", timeout=30)
                 if stdout:
@@ -2831,6 +2906,70 @@ ASKING FOR API KEY = ERROR. NEVER DO. Call delegate_to_worker.
                         self._log(f"  Gateway log read error: {e}", "WARNING")
         return ""
 
+    # ── Ollama context extension ────────────────────────────────────────────────
+
+    def _extend_ollama_model_context(self, model_name: str,
+                                     num_ctx: int = 131072) -> bool:
+        """
+        Creates (or updates) an Ollama Modelfile that overrides num_ctx for
+        model_name. Uses existing layers — no download required.
+
+        DECISION #19: The global fix for "!" after every message.
+        Without this, Ollama reports native num_ctx (e.g. 32768 for qwen2.5:7b)
+        via /api/show → OpenClaw uses it for compaction threshold → threshold =
+        0.7 × 32768 = 22937 tokens → system prompt (~15K) fills most of it →
+        compaction fires after EVERY message.
+        With num_ctx=131072: threshold = 0.7 × 131072 = 91750 → ~70K usable.
+        Works for ALL models; Docker exec requires Ollama running in container.
+
+        Returns True on success, False on failure (non-fatal — logs warning).
+        """
+        bare_name = model_name.removeprefix("ollama/")
+        # Ollama requires :tag suffix in FROM to find the model (e.g. glm-4.7-flash:latest).
+        # If the bare name has no ":" tag, append ":latest" for the FROM line only.
+        from_name = bare_name if ":" in bare_name else f"{bare_name}:latest"
+        modelfile_content = f"FROM {from_name}\nPARAMETER num_ctx {num_ctx}\n"
+
+        # Try Docker container first (Lyra setup), then native Ollama
+        for method in ("docker", "native"):
+            try:
+                if method == "docker":
+                    cmd = [
+                        "docker", "exec", "mein-ki-setup-ollama-1",
+                        "sh", "-c",
+                        f"printf '{modelfile_content.replace(chr(39), chr(39)+chr(92)+chr(39)+chr(39))}' "
+                        f"> /tmp/_oc_modelfile && ollama create {bare_name} -f /tmp/_oc_modelfile",
+                    ]
+                else:
+                    # Write Modelfile to temp dir, call ollama create natively
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(
+                        mode="w", suffix=".Modelfile",
+                        delete=False, encoding="utf-8"
+                    ) as tmp:
+                        tmp.write(modelfile_content)
+                        tmp_path = tmp.name
+                    cmd = ["ollama", "create", bare_name, "-f", tmp_path]
+
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=120,
+                    creationflags=_NO_WIN,
+                )
+                if result.returncode == 0:
+                    self._log(
+                        f"  Ollama model {bare_name}: num_ctx={num_ctx} applied  ✓",
+                        "SUCCESS",
+                    )
+                    return True
+                self._log(
+                    f"  Ollama extend ({method}): rc={result.returncode} "
+                    f"{result.stderr[:120]}", "WARNING"
+                )
+            except Exception as e:
+                self._log(f"  Ollama extend ({method}) exception: {e}", "WARNING")
+
+        return False
+
     # ── LYRA agent setup ───────────────────────────────────────────────────────
 
     def setup_lyra_agent(self, primary_model: str = "llama3.1:8b"):
@@ -2879,6 +3018,11 @@ ASKING FOR API KEY = ERROR. NEVER DO. Call delegate_to_worker.
                 for line in log_content.splitlines()[-20:]:
                     self._log(f"    {line[:120]}", "INFO")
             return
+
+        # ── Extend Ollama model context (DECISION #19) ───────────────────────
+        # Must happen before first chat: Ollama reloads model on next request.
+        # Non-fatal if it fails (logs warning, continues setup).
+        self._extend_ollama_model_context(primary_model, num_ctx=131072)
 
         # ── auth-profiles.json (post-gateway, authoritative) ─────────────────
         # ⚠️  DECISION #2: This post-gateway write is the authoritative one.
@@ -3934,7 +4078,8 @@ class LyraWorkerClient:
                             "error_msg": "No command specified"}
                 proc = subprocess.run(
                     ["wsl", "bash", "-lc", cmd],
-                    capture_output=True, text=True, timeout=120
+                    capture_output=True, text=True, timeout=120,
+                    creationflags=_NO_WIN,
                 )
                 output = (proc.stdout + proc.stderr).strip()[:3000]
                 return {"task_id": task_id, "status": "success",
@@ -4288,7 +4433,7 @@ class OpenClawOperations:
         """
         cmd = f'msiexec /i "{msi_path}" /quiet /norestart {extra_args}'
         self.log(f"  Starting {label} installation (monitored, max {timeout}s)...")
-        proc = subprocess.Popen(cmd, shell=True)
+        proc = subprocess.Popen(cmd, shell=True, creationflags=_NO_WIN)
         t0 = time.time()
         dot_interval = 30   # every 30s a heartbeat
         last_dot = t0
@@ -4321,7 +4466,7 @@ class OpenClawOperations:
         cmd = f'"{exe_path}" {args}'
         self.log(f"  Starting {label} (asynchronous, monitored up to {timeout//60} min.)...")
         if exe_path:   # Empty = watch only (process was already started externally)
-            subprocess.Popen(cmd, shell=True)
+            subprocess.Popen(cmd, shell=True, creationflags=_NO_WIN)
             time.sleep(12)   # Bootstrapper + child processes need ~10s to start
         else:
             self.log(f"  Watch-only mode – waiting for running processes...")
@@ -4415,7 +4560,8 @@ class OpenClawOperations:
             proc = subprocess.Popen(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace"
+                stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW
             )
             out, err = proc.communicate(timeout=timeout)
             return {"stdout": out.strip(), "stderr": err.strip(), "returncode": proc.returncode}
@@ -4444,7 +4590,7 @@ class OpenClawOperations:
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace",
-                env=env
+                env=env, creationflags=subprocess.CREATE_NO_WINDOW
             )
             q = queue_module.Queue()
 
@@ -4620,7 +4766,7 @@ class OpenClawOperations:
         try:
             ret = subprocess.run(
                 f'"{tmp}" --quiet --force',
-                shell=True, timeout=300
+                shell=True, timeout=300, creationflags=_NO_WIN,
             )
             try:
                 os.remove(tmp)
@@ -5036,7 +5182,7 @@ class OpenClawOperations:
             urllib.request.urlretrieve(url, installer)
             subprocess.run(
                 f'msiexec /i "{installer}" /quiet /norestart ADD_CMAKE_TO_PATH=System',
-                shell=True, timeout=300
+                shell=True, timeout=300, creationflags=_NO_WIN,
             )
             try:
                 os.remove(installer)
@@ -5093,7 +5239,7 @@ class OpenClawOperations:
             urllib.request.urlretrieve(url, installer)
             subprocess.run(
                 f'"{installer}" /install /quiet /norestart',
-                shell=True, timeout=180
+                shell=True, timeout=180, creationflags=_NO_WIN,
             )
             try:
                 os.remove(installer)
@@ -5183,7 +5329,7 @@ class OpenClawOperations:
                 ' --add Microsoft.VisualStudio.Component.Windows11SDK.22621'
                 ' --includeRecommended"'
                 ' --accept-package-agreements --accept-source-agreements --silent',
-                shell=True
+                shell=True, creationflags=_NO_WIN,
             )
             time.sleep(10)
             ok = self._run_installer_with_watch(
@@ -5348,7 +5494,7 @@ class OpenClawOperations:
             installer = os.path.join(tempfile.gettempdir(), "wsl_update_x64.msi")
             urllib.request.urlretrieve(url, installer)
             subprocess.run(f'msiexec /i "{installer}" /quiet /norestart',
-                           shell=True, timeout=180)
+                           shell=True, timeout=180, creationflags=_NO_WIN)
             try:
                 os.remove(installer)
             except:
@@ -5389,7 +5535,8 @@ class OpenClawOperations:
             proc = subprocess.Popen(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", full_cmd],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace"
+                stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace",
+                creationflags=_NO_WIN,
             )
             q = queue_module.Queue()
 
@@ -5608,7 +5755,8 @@ class OpenClawOperations:
             subprocess.Popen(
                 'wsl bash -lc "export OLLAMA_HOST=0.0.0.0:11434; '
                 'nohup ollama serve >> /tmp/ollama.log 2>&1 &"',
-                shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=_NO_WIN,
             )
 
             # Wait up to 20s for API response
@@ -6088,7 +6236,7 @@ exit 1
                     return True
             except:
                 pass
-            subprocess.run(f'rd /s /q "{path}"', shell=True, timeout=30)
+            subprocess.run(f'rd /s /q "{path}"', shell=True, timeout=30, creationflags=_NO_WIN)
             if not os.path.exists(path):
                 return True
             time.sleep(1)
@@ -6096,7 +6244,7 @@ exit 1
         try:
             trash = path + f"_DEL_{int(time.time())}"
             os.rename(path, trash)
-            subprocess.Popen(f'ping -n 4 127.0.0.1 >nul && rd /s /q "{trash}"', shell=True)
+            subprocess.Popen(f'ping -n 4 127.0.0.1 >nul && rd /s /q "{trash}"', shell=True, creationflags=_NO_WIN)
             return True
         except:
             pass
@@ -6344,7 +6492,8 @@ exit 1
             proc = subprocess.Popen(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace"
+                stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace",
+                creationflags=_NO_WIN,
             )
             q = queue_module.Queue()
 

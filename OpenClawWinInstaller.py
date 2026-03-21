@@ -1432,7 +1432,8 @@ class OpenClawWinInstaller(OpenClawOperations):
         try:
             # Windows Terminal — visible, normal window
             subprocess.Popen(
-                ["wt.exe", "powershell", "-ExecutionPolicy", "Bypass", "-File", script]
+                ["wt.exe", "powershell", "-ExecutionPolicy", "Bypass", "-File", script],
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
         except FileNotFoundError:
             # No Windows Terminal — regular PowerShell window (Normal, visible)

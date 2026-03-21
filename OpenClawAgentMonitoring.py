@@ -431,7 +431,7 @@ class MonitoringTab:
         ttk.Label(r4, text="Role:", width=5).pack(side=tk.LEFT)
         self._reg_role_var = tk.StringVar(value="Junior")
         ttk.Combobox(r4, textvariable=self._reg_role_var,
-                     values=["Junior", "Senior", "External"],
+                     values=["Junior", "Senior", "External", "Observer"],
                      width=9, state="readonly").pack(side=tk.LEFT, padx=(4, 0))
 
         # Row 5: Model (hidden for worker)
