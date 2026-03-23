@@ -202,6 +202,165 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # Detects GPU/RAM/CPU at runtime and derives optimal config values.
 # ══════════════════════════════════════════════════════════════════════════════
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Central utility functions — used by all modules
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ANSI_RE = None
+
+def strip_ansi(text: str) -> str:
+    """Removes ANSI escape sequences and terminal control codes.
+    Compiled once and cached for performance.
+    """
+    global _ANSI_RE
+    if _ANSI_RE is None:
+        import re as _re
+        _ANSI_RE = _re.compile(
+            r"\x1b\[[0-9;?]*[a-zA-Z]"
+            r"|\x1b\([A-Z]"
+            r"|\x1b[=>]"
+            r"|\x1b\[[?][0-9]+[hl]"
+            r"|\r"
+        )
+    return _ANSI_RE.sub("", text)
+
+
+def diag_api(url: str, timeout: int = 8,
+             method: str = "GET",
+             data: dict | None = None,
+             api_key: str = "") -> tuple[int, dict | str]:
+    """Central HTTP helper — no external dependencies.
+    Returns (status_code, body). status_code = -1 on connection error.
+    Follows 301/302/307/308 redirects. Replaces localhost->127.0.0.1.
+    """
+    import urllib.parse, urllib.request, urllib.error
+    url = url.replace("//localhost:", "//127.0.0.1:")
+    for _ in range(5):
+        try:
+            body_bytes = json.dumps(data).encode("utf-8") if data else None
+            headers    = ({"User-Agent": "LyraMonitor/1.0",
+                           "Accept":     "application/json, text/html, */*"}
+                          if method == "GET" else
+                          {"Content-Type": "application/json",
+                           "User-Agent":   "LyraMonitor/1.0"})
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            req = urllib.request.Request(
+                url, data=body_bytes, method=method, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                raw = r.read(32_000).decode("utf-8", errors="replace").strip()
+                for c in [raw, raw.lstrip("\ufeff"), raw.split("\n", 1)[-1]]:
+                    try:
+                        return r.status, json.loads(c)
+                    except Exception:
+                        continue
+                return r.status, raw
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 307, 308):
+                loc = e.headers.get("Location", "")
+                if loc:
+                    p   = urllib.parse.urlparse(url)
+                    url = f"{p.scheme}://{p.netloc}{loc}" if loc.startswith("/") else loc
+                    continue
+            try:
+                body = e.read(2000).decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+            try:
+                return e.code, json.loads(body)
+            except Exception:
+                return e.code, body
+        except Exception as e:
+            return -1, str(e)
+    return -1, "Too many redirects"
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Central utility functions — used by all modules
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ANSI_RE = None
+
+def strip_ansi(text: str) -> str:
+    """Removes ANSI escape sequences and terminal control codes.
+
+    Covers: ESC[...m colour/cursor codes, OSC sequences, carriage returns.
+    Regex compiled once on first call and cached for performance.
+    Used by OpenClawOperations._strip_ansi and OpenClawWinInstaller._strip_ansi.
+    """
+    global _ANSI_RE
+    if _ANSI_RE is None:
+        import re as _re
+        _ANSI_RE = _re.compile(
+            r"\x1b\[[0-9;?]*[a-zA-Z]"   # CSI: ESC [ ... X
+            r"|\x1b\([A-Z]"               # charset: ESC ( X
+            r"|\x1b[=>]"                   # keypad mode
+            r"|\x1b\[[?][0-9]+[hl]"       # DEC private: ESC[?25l
+            r"|\r"                          # carriage return
+        )
+    return _ANSI_RE.sub("", text)
+
+
+def diag_api(url: str, timeout: int = 8,
+             method: str = "GET",
+             data: dict | None = None,
+             api_key: str = "") -> tuple[int, dict | str]:
+    """Central HTTP helper — no external dependencies.
+
+    Returns (status_code, body). status_code = -1 on connection error.
+    Replaces localhost -> 127.0.0.1 to work around Python 3.11 IPv6 /
+    Docker Desktop bug where localhost resolves to ::1 instead of 127.0.0.1.
+    Follows HTTP 301/302/307/308 redirects automatically (up to 5 hops).
+    api_key: if non-empty adds Authorization: Bearer <key> header.
+
+    Used by:
+      OpenClawWinInstaller._diag_api (delegation wrapper)
+      OpenClawAgentMonitoring._diag_api (direct import)
+    """
+    import urllib.parse, urllib.request, urllib.error
+    url = url.replace("//localhost:", "//127.0.0.1:")
+    for _ in range(5):
+        try:
+            body_bytes = json.dumps(data).encode("utf-8") if data else None
+            headers    = ({"User-Agent": "LyraMonitor/1.0",
+                           "Accept":     "application/json, text/html, */*"}
+                          if method == "GET" else
+                          {"Content-Type": "application/json",
+                           "User-Agent":   "LyraMonitor/1.0"})
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            req = urllib.request.Request(
+                url, data=body_bytes, method=method, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                raw = r.read(32_000).decode("utf-8", errors="replace").strip()
+                for c in [raw, raw.lstrip("\ufeff"), raw.split("\n", 1)[-1]]:
+                    try:
+                        return r.status, json.loads(c)
+                    except Exception:
+                        continue
+                return r.status, raw
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 307, 308):
+                loc = e.headers.get("Location", "")
+                if loc:
+                    p   = urllib.parse.urlparse(url)
+                    url = f"{p.scheme}://{p.netloc}{loc}" if loc.startswith("/") else loc
+                    continue
+            try:
+                body = e.read(2000).decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+            try:
+                return e.code, json.loads(body)
+            except Exception:
+                return e.code, body
+        except Exception as e:
+            return -1, str(e)
+    return -1, "Too many redirects"
+
+
 class HardwareProfile:
     """
     Detects local hardware and recommends OpenClaw config values.
@@ -247,6 +406,8 @@ class HardwareProfile:
             "recommended_role":     str,   # "head" | "senior" | "junior"
           }
         """
+        if hasattr(self, "_cached_profile") and self._cached_profile:
+            return self._cached_profile
         gpu_name, vram_mb = self._detect_gpu()
         ram_gb             = self._detect_ram()
         cpu_cores, avx2    = self._detect_cpu()
@@ -271,6 +432,7 @@ class HardwareProfile:
             f"  [HW] Recommendation → model={model} "
             f"timeout={timeout}s role={role}", "INFO"
         )
+        self._cached_profile = profile  # cache to prevent double-call
         return profile
 
     # ── Detection helpers ──────────────────────────────────────────────────────
@@ -344,22 +506,51 @@ class HardwareProfile:
             )
             # AVX2 machines report it in processor description or we check via
             # a small Python snippet as the most reliable method
-            avx2_check = subprocess.run(
-                ["python", "-c",
-                 "import platform; "
-                 "f=platform.processor(); "
-                 "print('avx2' if 'avx2' in f.lower() else 'no')"],
-                capture_output=True, text=True, timeout=10,
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-            if avx2_check.returncode == 0:
-                avx2 = "avx2" in avx2_check.stdout.lower()
-            else:
-                # Most modern Intel/AMD i5+ support AVX2 — optimistic default
-                avx2 = True
+            # Check AVX2 via cpuid leaf 7 (most reliable on Windows)
+            try:
+                import ctypes
+                # CPUID leaf 7, sub-leaf 0: EBX bit 5 = AVX2
+                class CPUID(ctypes.Structure):
+                    _fields_ = [("eax","ebx","ecx","edx")]
+                # Use __cpuid via MSVC intrinsic via ctypes on Windows
+                # Simpler: check via PowerShell Get-WmiObject Caption
+                ps_avx2 = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "(Get-WmiObject Win32_Processor).Caption"],
+                    capture_output=True, text=True, timeout=8,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                caption = ps_avx2.stdout.lower()
+                # i7/i5/i9 gen 4+ and Ryzen all support AVX2
+                # i5-2500 (Sandy Bridge, gen 2) does NOT
+                # Detection: check for known no-AVX2 families
+                no_avx2_patterns = [
+                    "sandy bridge", "ivy bridge",
+                    "family 6 model 4",   # Nehalem
+                    "family 6 model 5",   # Westmere
+                    "family 6 model 10",  # Sandy Bridge
+                    "family 6 model 11",  # Ivy Bridge
+                ]
+                # Also check stepping via model number in caption
+                avx2 = not any(p in caption for p in no_avx2_patterns)
+                # Additional check: i5-2xxx / i7-2xxx = Sandy Bridge = no AVX2
+                ps_name = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "(Get-WmiObject Win32_Processor).Name"],
+                    capture_output=True, text=True, timeout=8,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                name_lower = ps_name.stdout.lower()
+                import re as _re
+                # Sandy/Ivy Bridge: Core iX-2xxx or iX-3xxx
+                if _re.search(r"core i[357]-[23]\d{3}", name_lower):
+                    avx2 = False
+                self._log(f"  [HW] CPU: {ps_name.stdout.strip()} | AVX2: {avx2}", "INFO")
+            except Exception:
+                avx2 = False  # conservative default when detection fails
         except Exception as e:
             self._log(f"  [HW] CPU detection failed: {e}", "INFO")
-            avx2 = True  # safe optimistic default
+            avx2 = False  # conservative: assume no AVX2 on failure
         return cores, avx2
 
     def _recommend(self, vram_mb: int) -> tuple[str, int, str]:
@@ -662,6 +853,9 @@ class OpenClawConfig:
         # Stub: run_powershell_fn is required for ENV writes.
         # If not provided, ENV writes are skipped with a warning.
         def _ps_stub(cmd, **kwargs):
+            """Fallback stub when run_powershell_fn is not set.
+            Logs a warning and returns a failed result dict.
+            """
             self._log(
                 "  [Config] run_powershell_fn not set — skipping PS command", "WARNING"
             )
@@ -683,6 +877,166 @@ class OpenClawConfig:
         """Returns ~/.openclaw config directory path."""
         home = os.path.expanduser("~")
         return os.path.join(home, ".openclaw")
+
+
+    # ── Memory System — Tag-basiert, rollenspezifisch ──────────────────────
+
+    def get_memory_paths(self, role: str = None) -> dict:
+        """Returns memory root path and active role for tag-based filtering.
+
+        Flat structure: one .md file per day, all roles in the same file,
+        differentiated by inline tags:
+            [LEARNING:shared]               for ALL roles
+            [LEARNING:pattern_recognition]  DNA/genomics
+            [CONTEXT:cinematic_coordinator] film production
+        """
+        if role is None:
+            role = getattr(self, "_lyra_role", "pattern_recognition")
+        cfg_dir     = self._find_openclaw_config_dir()
+        memory_root = os.path.join(cfg_dir, "workspace", "memory")
+        os.makedirs(memory_root, exist_ok=True)
+        return {"root": memory_root, "role": role}
+
+    def read_memory(self, role: str = None, days: int = 14) -> str:
+        """Reads memory entries for the last `days` days.
+
+        role=None -> all entries (Claude Code Observer)
+        role=str  -> entries tagged [:role] OR [:shared]
+        """
+        import re as _re, datetime as _dt
+        paths       = self.get_memory_paths(role)
+        memory_root = paths["root"]
+        active_role = paths["role"]
+        entries     = []
+
+        for i in range(days):
+            date     = (_dt.datetime.now() - _dt.timedelta(days=i)).strftime("%Y-%m-%d")
+            mem_file = os.path.join(memory_root, f"{date}.md")
+            if not os.path.isfile(mem_file):
+                continue
+            try:
+                with open(mem_file, "r", encoding="utf-8") as f:
+                    content = f.read()
+                if role:
+                    filtered = self._filter_memory_by_role(content, active_role)
+                    if filtered.strip():
+                        entries.append(f"## {date}\n{filtered}")
+                else:
+                    entries.append(f"## {date}\n{content}")
+            except Exception as e:
+                self._log(f"[Memory] Read error {date}: {e}", "WARNING")
+
+        return "\n\n".join(entries)
+
+    def _filter_memory_by_role(self, content: str, role: str) -> str:
+        """Extracts entries tagged [:role] or [:shared].
+
+        Entry block: starts with [TYPE:scope], ends at blank line.
+        :shared entries are included for ALL roles.
+        Untagged legacy entries are skipped (Observer still sees them via role=None).
+        """
+        import re as _re
+        TAG_RE = _re.compile(r"^\[([A-Z_]+):([a-z_]+)\]")
+        lines  = content.splitlines(keepends=True)
+        result = []
+        buf    = []
+        keep   = False
+
+        for line in lines:
+            m = TAG_RE.match(line)
+            if m:
+                if buf and keep:
+                    result.extend(buf)
+                scope = m.group(2)
+                keep  = (scope == role or scope == "shared")
+                buf   = [line]
+            elif buf:
+                buf.append(line)
+                if line.strip() == "":
+                    if keep:
+                        result.extend(buf)
+                    buf  = []
+                    keep = False
+            else:
+                result.append(line)  # pre-tag header lines
+
+        if buf and keep:
+            result.extend(buf)
+        return "".join(result)
+
+    def write_memory(self, content: str, role: str = None,
+                     scope: str = None) -> bool:
+        """Writes a memory entry with automatic role tag injection.
+
+        LYRA writes: write_memory("[LEARNING] my insight")
+        Result:      [LEARNING:pattern_recognition] my insight
+
+        Args:
+            content: Entry text. Existing tag preserved if present.
+            role:    Override active role.
+            scope:   Pass "shared" to force [:shared] tag.
+        """
+        import re as _re, datetime as _dt
+        paths       = self.get_memory_paths(role)
+        active_role = scope if scope == "shared" else paths["role"]
+        text        = content.strip()
+
+        TAG_RE = _re.compile(r"^\[([A-Z_]+):([a-z_]+)\]")
+        if not TAG_RE.match(text):
+            bracket = _re.compile(r"^\[([A-Z_]+)\]")
+            m = bracket.match(text)
+            if m:
+                tag  = m.group(1)
+                rest = text[m.end():]
+                text = f"[{tag}:{active_role}]{rest}"
+            else:
+                text = f"[LEARNING:{active_role}] {text}"
+
+        today    = _dt.datetime.now().strftime("%Y-%m-%d")
+        ts       = _dt.datetime.now().strftime("%H:%M:%S")
+        mem_file = os.path.join(paths["root"], f"{today}.md")
+        entry    = f"\n[{ts}] {text}\n"
+
+        try:
+            with open(mem_file, "a", encoding="utf-8") as f:
+                f.write(entry)
+            self._log(f"[Memory] Written [{active_role}]: {today}.md", "SUCCESS")
+            return True
+        except Exception as e:
+            self._log(f"[Memory] Write failed: {e}", "ERROR")
+            return False
+
+    def set_lyra_role(self, role: str):
+        """Sets the active LYRA role and persists it to lyra_role.json."""
+        import datetime
+        self._lyra_role = role
+        path = os.path.join(self._find_openclaw_config_dir(), "lyra_role.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({
+                "role":         role,
+                "last_changed": datetime.datetime.now().isoformat(),
+            }, f, indent=2, ensure_ascii=False)
+        self._log(f"[Config] LYRA role set to: {role}", "INFO")
+
+    def get_lyra_role(self) -> str:
+        """Returns the currently active LYRA role."""
+        return getattr(self, "_lyra_role", "pattern_recognition")
+
+    def get_memory_for_soul_md(self, days: int = 7) -> str:
+        """Compact role-specific memory summary for SOUL.md injection."""
+        return self.read_memory(role=self._lyra_role, days=days)
+
+    def get_memory_for_observer(self) -> str:
+        """All entries (no filter) for Claude Code Observer."""
+        return self.read_memory(role=None, days=14)
+
+    def _migrate_memory_to_tags(self) -> bool:
+        """Ensures memory dir exists. No file migration — tag system is
+        backward-compatible with legacy untagged entries."""
+        paths = self.get_memory_paths()
+        os.makedirs(paths["root"], exist_ok=True)
+        self._log("[Memory] Tag system active — no migration needed", "INFO")
+        return True
 
     def _workers_json_path(self) -> str:
         """Returns path to ~/.openclaw/workers.json (worker registry)."""
@@ -735,6 +1089,9 @@ class OpenClawConfig:
             return f"{key[:3]}***\u2026***{key[-3:]}"
 
         def _base(a: dict) -> str:
+            """Returns the base URL for an agent dict.
+            Prefers explicit url field; falls back to ip:port.
+            """
             url = a.get("url", "").strip()
             if url:
                 return url if "://" in url else f"https://{url}"
@@ -3313,6 +3670,10 @@ class LyraHeadServer:
         server_ref = self
 
         class Handler(BaseHTTPRequestHandler):
+            """HTTP request handler for LyraHeadServer.
+            Routes: GET /health /tasks /results /result/<id>
+                    POST /tasks (enqueue) /result (worker callback).
+            """
             def log_message(self, fmt, *args):
                 pass   # suppress stdlib logging
 
@@ -3545,7 +3906,14 @@ class LyraHeadServer:
         """Poll memory/ every 30 s; fire claude after 5-min debounce if tags found."""
         POLL_SECS    = 30
         DEBOUNCE_SECS = 300   # 5 minutes
-        TAGS         = ("[SOUL-UPDATE-VORSCHLAG]", "[CORRECTION]")
+        # Match both bare tags and role-tagged variants
+        # e.g. [SOUL-UPDATE-VORSCHLAG] or [SOUL-UPDATE-VORSCHLAG:pattern_recognition]
+        TAGS = (
+            "[SOUL-UPDATE-VORSCHLAG]",
+            "[CORRECTION]",
+            "[SOUL-UPDATE-VORSCHLAG:",  # role-tagged variant prefix
+            "[CORRECTION:",             # role-tagged variant prefix
+        )
 
         self.log(f"[Watcher] Watching {self._watcher_dir}", "INFO")
 
@@ -3564,6 +3932,24 @@ class LyraHeadServer:
                     continue
 
                 now = time.time()
+                # Prune stale entries from _watcher_seen to prevent
+                # unbounded growth during weeks of continuous uptime.
+                if len(self._watcher_seen) > 500:
+                    existing = {fp for fp in self._watcher_seen
+                                if os.path.isfile(fp)}
+                    self._watcher_seen = {fp: mt
+                                          for fp, mt in self._watcher_seen.items()
+                                          if fp in existing}
+                    self.log(f"[Watcher] Cache pruned: {len(self._watcher_seen)} entries.", "INFO")
+                # Prune _watcher_seen entries for files no longer present
+                # (prevents unbounded growth over weeks of uptime)
+                if len(self._watcher_seen) > 500:
+                    existing = {fp for fp in self._watcher_seen
+                                if os.path.isfile(fp)}
+                    self._watcher_seen = {fp: mt
+                                          for fp, mt in self._watcher_seen.items()
+                                          if fp in existing}
+                    self.log(f"[Watcher] Cache pruned: {len(self._watcher_seen)} entries.", "INFO")
 
                 # Detect new/changed .md files
                 for fname in os.listdir(self._watcher_dir):
@@ -3690,6 +4076,9 @@ class WorkerTaskServer:
         server_ref = self
 
         class Handler(BaseHTTPRequestHandler):
+            """HTTP request handler for WorkerTaskServer.
+            Routes: GET /tasks (poll for work) POST /result (submit result).
+            """
             def log_message(self, fmt, *args):
                 pass  # Suppress default logging
 
@@ -4521,11 +4910,8 @@ class OpenClawOperations:
             time.sleep(6)
 
     def _strip_ansi(self, text: str) -> str:
-        """Removes ANSI escape sequences and terminal control codes from WSL output."""
-        import re
-        # Escape sequences: ESC[ ... m, ESC[?25l, ESC[1G, ESC[K etc.
-        ansi_re = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]|\x1b\([A-Z]|\x1b[=>]|\r')
-        return ansi_re.sub('', text)
+        """Delegates to module-level strip_ansi()."""
+        return strip_ansi(text)
 
     def _is_ollama_progress(self, line: str) -> bool:
         """Detects Ollama progress lines (bars, %, pulling etc.)."""
@@ -4595,6 +4981,9 @@ class OpenClawOperations:
             q = queue_module.Queue()
 
             def _reader(pipe, tag):
+                """Reads lines from pipe, puts (tag, line) into queue q.
+                Sends (tag, None) sentinel when pipe is exhausted.
+                """
                 try:
                     for line in pipe:
                         q.put((tag, line.rstrip()))
@@ -5541,6 +5930,9 @@ class OpenClawOperations:
             q = queue_module.Queue()
 
             def _reader(pipe, tag):
+                """Reads lines from pipe, puts (tag, line) into queue q.
+                Sends (tag, None) sentinel when pipe is exhausted.
+                """
                 try:
                     for line in pipe:
                         q.put((tag, line.rstrip()))
@@ -6498,6 +6890,9 @@ exit 1
             q = queue_module.Queue()
 
             def _reader(pipe, tag):
+                """Reads lines from pipe, puts (tag, line) into queue q.
+                Sends (tag, None) sentinel when pipe is exhausted.
+                """
                 try:
                     for line in pipe:
                         q.put((tag, line.rstrip()))

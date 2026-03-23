@@ -38,7 +38,14 @@ from OpenClawConfigManagement import (
     LyraHeadServer, WorkerTaskServer, LyraWorkerClient,
     OpenClawOperations,
     LYRA_HEAD_PORT,
+
+    diag_api as _central_diag_api,
+    strip_ansi as _strip_ansi,
 )
+try:
+    from OpenClawConfigManagement import HardwareProfile
+except ImportError:
+    HardwareProfile = None
 from OpenClawAgentMonitoring import MonitoringTab
 
 import tkinter as tk
@@ -104,6 +111,7 @@ class OpenClawWinInstaller(OpenClawOperations):
         )
 
         self._tray_icon = None          # pystray.Icon when minimized to tray
+        self._tray_icon = None
         self.installation_running = False
         self.auto_scroll = True
         self._diag_tab_built = False
@@ -144,7 +152,9 @@ class OpenClawWinInstaller(OpenClawOperations):
             except Exception:
                 pass
 
-        if autonomous:
+        is_worker = getattr(self, "_saved_role", None) in ("Junior", "Senior")
+
+        if autonomous or is_worker:
             # Guard: don't create a second tray icon if already minimized
             if self._tray_icon is not None:
                 return
@@ -232,6 +242,8 @@ class OpenClawWinInstaller(OpenClawOperations):
         """
         self.log("── HARDWARE PROFILE (v1.0.3) ────────────────────────────────────────────")
         try:
+            if HardwareProfile is None:
+                raise RuntimeError('HardwareProfile not available')
             hw = HardwareProfile(log_fn=self.log)
             profile = hw.detect()
             self._hw_profile = profile
@@ -444,6 +456,7 @@ class OpenClawWinInstaller(OpenClawOperations):
 
             def __init__(self, head_address, role, model, task_queue,
                          log_fn=None, poll_interval=7, local_server=None):
+                """Initialises the autonomous queued worker client with dedicated task queue and stop event."""
                 super().__init__(head_address, role, model, log_fn, poll_interval,
                                  local_server=local_server)
                 self.task_queue = task_queue
@@ -565,6 +578,7 @@ class OpenClawWinInstaller(OpenClawOperations):
 
         # Disable auto-scroll when user scrolls up, re-enable when at bottom
         def _on_scroll(*args):
+            """Syncs log Text widget yview and updates auto_scroll flag based on scroll position."""
             # args from scrollbar: ('moveto', fraction) or ('scroll', n, unit)
             # Check if scrolled to bottom
             self.log_text.yview(*args)
@@ -632,49 +646,11 @@ class OpenClawWinInstaller(OpenClawOperations):
                         if self.notebook.index("end") > 1 else None)
 
     def _diag_api(self, url: str, timeout: int = 8,
-                  method: str = "GET", data: dict | None = None) -> tuple[int, dict | str]:
-        """HTTP test with detailed error logging. Returns (status, body).
-        Important: replaces 'localhost' → '127.0.0.1' (Python 3.11 IPv6 bug with Docker Desktop).
-        For GET: no Content-Type header (SearXNG behaves differently with app/json).
-        body is dict if JSON parsing succeeds, otherwise str.
-        Order: read body first, then status (r.status after read() is stable)."""
-        url = url.replace("//localhost:", "//127.0.0.1:")
-        try:
-            body_bytes = json.dumps(data).encode("utf-8") if data else None
-            # GET requests without Content-Type (some APIs react differently)
-            if method == "GET":
-                headers = {"User-Agent": "LyraDiag/38.91",
-                           "Accept": "application/json, text/html, */*"}
-            else:
-                headers = {"Content-Type": "application/json",
-                           "User-Agent": "LyraDiag/38.91"}
-            req = urllib.request.Request(url, data=body_bytes, method=method, headers=headers)
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                status = r.status          # save status BEFORE read()
-                raw = r.read(32_000).decode("utf-8", errors="replace").strip()
-                # JSON parse: multiple attempts (remove BOM, whitespace)
-                parsed = None
-                for candidate in [raw, raw.lstrip("\ufeff"), raw.split("\n", 1)[-1]]:
-                    try:
-                        parsed = json.loads(candidate)
-                        break
-                    except Exception:
-                        continue
-                return status, (parsed if parsed is not None else raw)
-        except urllib.error.HTTPError as e:
-            try:
-                body = e.read(2000).decode("utf-8", errors="replace")
-            except Exception:
-                body = ""
-            # Try to parse HTTPError body as JSON
-            try:
-                return e.code, json.loads(body)
-            except Exception:
-                return e.code, body
-        except Exception as e:
-            return -1, str(e)
-
-    # ── LYRA CONFIG TAB ───────────────────────────────────────────────
+                  method: str = "GET", data: dict | None = None,
+                  api_key: str = "") -> tuple[int, dict | str]:
+        """Delegates to central diag_api() in OpenClawConfigManagement."""
+        return _central_diag_api(url, timeout=timeout,
+                                 method=method, data=data, api_key=api_key)
 
     def _build_lyra_tab(self, parent):
         """Build the Lyra Config tab with a two-column layout.
@@ -865,6 +841,32 @@ class OpenClawWinInstaller(OpenClawOperations):
                    command=self._refresh_ollama_models).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(btn_row_llm, text="♻️ Restart Ollama",
                    command=self._restart_ollama).pack(side=tk.LEFT)
+
+        ttk.Separator(sec_llm, orient="horizontal").pack(fill=tk.X, pady=4)
+
+        # ── LYRA Role Selector ────────────────────────────────────
+        role_frame = ttk.Frame(sec_llm)
+        role_frame.pack(fill=tk.X, pady=(4, 2))
+        ttk.Label(role_frame, text="🎭 LYRA Role:",
+                  font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT, padx=(0, 8))
+        self._lyra_role_var = tk.StringVar(value="pattern_recognition")
+        self._lyra_role_cb  = ttk.Combobox(
+            role_frame,
+            textvariable=self._lyra_role_var,
+            values=["pattern_recognition", "cinematic_coordinator"],
+            state="readonly", width=24
+        )
+        self._lyra_role_cb.pack(side=tk.LEFT)
+        self._lyra_role_cb.bind("<<ComboboxSelected>>", self._on_lyra_role_changed)
+        ttk.Button(role_frame, text="▶ Start App",
+                   command=self._start_role_app).pack(side=tk.LEFT, padx=(8, 0))
+        self._lyra_role_info = ttk.Label(
+            sec_llm,
+            text="🧬 Pattern Recognition: Suche nach Signaturen im Rauschen der DNA.",
+            font=("Arial", 8), foreground="#888888", wraplength=350
+        )
+        self._lyra_role_info.pack(anchor=tk.W, pady=(2, 6))
+        self.root.after(400, self._load_lyra_role)
 
         ttk.Separator(sec_llm, orient="horizontal").pack(fill=tk.X, pady=4)
 
@@ -1369,6 +1371,7 @@ class OpenClawWinInstaller(OpenClawOperations):
         self.log("\n🔵 Installing Claude Code Observer...")
         import threading
         def _run():
+            """Background thread: runs ClaudeCode install logic."""
             logic = _ClaudeCodeLogic(log_cb=self.log,
                                      status_cb=lambda msg, lvl="info": None)
             logic.install(proj, ocl)
@@ -1466,29 +1469,202 @@ class OpenClawWinInstaller(OpenClawOperations):
         self._cc_start_terminal()
 
 
+    # ── LYRA ROLE SYSTEM ──────────────────────────────────────────────
+
+    def _lyra_role_file(self) -> str:
+        """Returns path to lyra_role.json in .openclaw."""
+        return os.path.join(os.path.expanduser("~"), ".openclaw", "lyra_role.json")
+
+    def _load_lyra_role(self):
+        """Loads saved role from lyra_role.json and updates the UI."""
+        try:
+            with open(self._lyra_role_file(), "r", encoding="utf-8") as f:
+                role = json.load(f).get("role", "pattern_recognition")
+        except Exception:
+            role = "pattern_recognition"
+        if hasattr(self, "_lyra_role_var"):
+            self._lyra_role_var.set(role)
+        self._apply_role_info(role)
+
+    def _save_lyra_role(self, role: str):
+        """Persists role to lyra_role.json."""
+        import datetime
+        try:
+            with open(self._lyra_role_file(), "w", encoding="utf-8") as f:
+                json.dump({"role": role,
+                           "last_changed": datetime.datetime.now().isoformat()},
+                          f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            self.log(f"[Role] Save failed: {e}", "WARNING")
+
+    def _apply_role_info(self, role: str):
+        """Updates the role info label."""
+        labels = {
+            "pattern_recognition": (
+                "🧬 Pattern Recognition — "
+                "Suche nach Signaturen im Rauschen der DNA, des Codes, des Lebens.  "
+                "📚 Memory: [:pattern_recognition] + [:shared]"
+            ),
+            "cinematic_coordinator": (
+                "🎬 Cinematic Coordinator — "
+                "LYRA produziert den Film ueber ihre eigene Entstehung.  "
+                "📚 Memory: [:cinematic_coordinator] + [:shared]"
+            ),
+        }
+        if hasattr(self, "_lyra_role_info"):
+            self._lyra_role_info.config(text=labels.get(role, role))
+        # Sync role into cfg for memory filtering
+        if hasattr(self, "cfg") and hasattr(self.cfg, "_lyra_role"):
+            self.cfg._lyra_role = role
+
+    def _on_lyra_role_changed(self, event=None):
+        """Called when user selects a new role — saves, updates SOUL.md, logs memory paths."""
+        role = self._lyra_role_var.get()
+        self.log(f"\n🎭 LYRA ROLE -> {role}", "INFO")
+        # Ensure memory system is initialized
+        if hasattr(self.cfg, "_migrate_memory_to_tags"):
+            self.cfg._migrate_memory_to_tags()
+        self._save_lyra_role(role)
+        self._apply_role_info(role)
+        # Log active memory paths
+        if hasattr(self.cfg, "get_memory_paths"):
+            paths = self.cfg.get_memory_paths(role)
+            self.log(f"[Memory] Root: {paths['root']}", "INFO")
+            self.log(f"[Memory] Role filter: [{role}] + [:shared]", "INFO")
+        import threading
+        threading.Thread(target=self._role_apply_and_restart,
+                         args=(role,), daemon=True).start()
+
+    def _role_apply_and_restart(self, role: str):
+        """Background: writes SOUL.md role section."""
+        try:
+            self.cfg.set_lyra_role(role)
+            self.cfg.write_soul_md()
+            self.log(f"[Role] SOUL.md updated for role: {role}", "SUCCESS")
+            self.root.after(0, lambda: self._role_restart_prompt(role))
+        except Exception as e:
+            self.log(f"[Role] SOUL.md update failed: {e}", "WARNING")
+
+    def _role_restart_prompt(self, role: str):
+        """Asks user to restart gateway."""
+        import tkinter.messagebox as mb
+        if mb.askyesno("LYRA Role gewechselt",
+                        f"Rolle '{role}' gespeichert.\n\n"
+                        "Gateway neu starten?"):
+            self._restart_gateway()
+
+    def _start_role_app(self):
+        """Launches the standalone app for the selected role."""
+        role = self._lyra_role_var.get() if hasattr(self, "_lyra_role_var") else ""
+        proj = self._cc_project_dir()
+        role_apps = {
+            "cinematic_coordinator": os.path.join(
+                proj, "Tools", "IsonCodexProducer", "IsonCodexProducer.py"),
+        }
+        app_path = role_apps.get(role)
+        if not app_path:
+            self.log(f"[Role] Keine App fuer Rolle '{role}' konfiguriert.", "WARNING")
+            return
+        if not os.path.isfile(app_path):
+            self.log(f"[Role] App nicht gefunden: {app_path}", "ERROR")
+            return
+        import subprocess
+        try:
+            subprocess.Popen(["python", app_path],
+                             creationflags=0x00000010,
+                             cwd=os.path.dirname(app_path))
+            self.log(f"[Role] {os.path.basename(app_path)} gestartet ✓", "SUCCESS")
+        except Exception as e:
+            self.log(f"[Role] Start fehlgeschlagen: {e}", "ERROR")
+
+
+    def _detect_ollama_runtime(self) -> dict:
+        """Detects which Ollama runtime is currently active.
+
+        Returns a dict:
+          {
+            "runtime": "docker" | "wsl" | "windows" | "unknown",
+            "docker_container": str | None,   # container name if docker
+            "wsl_distro":       str | None,   # distro name if wsl
+          }
+
+        Priority: Docker > WSL > Windows-native.
+        Docker is detected via  docker ps  filtering for 'ollama' in name/image.
+        WSL is detected via check_wsl() + check_ollama_wsl().
+        Windows-native is detected via port 11434 owner process.
+        """
+        result = {"runtime": "unknown", "docker_container": None, "wsl_distro": None}
+
+        # ── Docker ───────────────────────────────────────────────────────────
+        try:
+            r = self.run_powershell(
+                'docker ps --format "{{.Names}}\t{{.Image}}" 2>$null')
+            for line in r.get("stdout", "").splitlines():
+                if "ollama" in line.lower():
+                    cname = line.split("\t")[0].strip()
+                    result["runtime"]          = "docker"
+                    result["docker_container"] = cname
+                    return result
+        except Exception:
+            pass
+
+        # ── WSL ──────────────────────────────────────────────────────────────
+        try:
+            wsl_ok, ubuntu_ok = self.check_wsl()
+            if wsl_ok and ubuntu_ok and self.check_ollama_wsl():
+                result["runtime"]    = "wsl"
+                result["wsl_distro"] = "Ubuntu"
+                return result
+        except Exception:
+            pass
+
+        # ── Windows-native (port 11434 owner) ────────────────────────────────
+        try:
+            r = self.run_powershell(
+                "Get-NetTCPConnection -LocalPort 11434 -ErrorAction SilentlyContinue "
+                "| ForEach-Object { Get-Process -Id $_.OwningProcess "
+                "-ErrorAction SilentlyContinue } "
+                "| Select-Object -ExpandProperty Name"
+            )
+            if "ollama" in r.get("stdout", "").lower():
+                result["runtime"] = "windows"
+                return result
+        except Exception:
+            pass
+
+        return result
+
+
     def _restart_ollama(self):
         """
         DECISION #28 (v1.0.5): Restart Ollama dynamically.
 
-        Detects which Ollama runtime is active and restarts it:
-          1. Docker container  — docker ps | grep ollama  → docker restart <name>
-          2. WSL               — wsl bash -lc "ollama serve"
-          3. Windows-native    — taskkill + start ollama.exe
-          4. Windows Service   — Stop-Service / Start-Service ollama
+        Fallback order (first match wins):
+          1. Docker container  -- docker ps | grep ollama -> docker restart <n>
+          2. Windows-native    -- kill process on port 11434 -> start ollama.exe
+          3. WSL               -- pkill ollama -> nohup ollama serve
+          4. Windows Service   -- Stop-Service -> Start-Service ollama
 
-        Also unloads all models via keep_alive=0 API call before restart
-        to free VRAM immediately.
+        If no runtime is detected on port 11434:
+          Logs WARNING "No running Ollama instance found..." and returns.
 
-        Used to recover from "exit status 2" (VRAM-Crash) without manual
-        PowerShell intervention.
+        If API does not respond within 20s after restart:
+          Logs WARNING "API not responding after 20s..." and returns.
 
-        Prevention: OLLAMA_KEEP_ALIVE=10m is injected into gateway.cmd by
-        patch_gateway_cmd() (DECISION #28) so models auto-unload after 10
-        minutes idle — this button is the manual override for immediate relief.
+        Before restart: unloads all models via keep_alive=0 to free VRAM.
+        After restart: verifies VRAM is clear, refreshes model list.
+
+        Prevention: OLLAMA_KEEP_ALIVE=10m injected into gateway.cmd by
+        patch_gateway_cmd() (DECISION #28) for auto-unload after idle.
         """
         self.log("\n♻️  Restarting Ollama...")
 
         def _run():
+            """Background thread: unloads VRAM, detects runtime, restarts Ollama.
+            Step 1: Unload models via keep_alive=0. Step 2: Detect+restart runtime.
+            Step 3: Wait up to 20s for API. Step 4: Verify VRAM clear.
+            If no runtime found on port 11434: logs WARNING and returns.
+            """
             # ── Step 1: Unload all models via API (free VRAM now) ────────────
             self.log("  [Ollama] Unloading models via API (keep_alive=0)...")
             try:
@@ -1988,7 +2164,9 @@ class OpenClawWinInstaller(OpenClawOperations):
                 new_url = f"http://127.0.0.1:{port}"
                 found = port
                 if is_json:
+                    """GUI callback: port scan found valid JSON endpoint -- updates URL field and status label."""
                     def _hit_json(p=port, u=new_url):
+                        """GUI callback: port scan confirmed JSON endpoint -- updates URL field."""
                         self.log(f"[SearXNG-Scan] ✅ Port {p}: JSON valid (query/results ✓)",
                                  "SUCCESS")
                         url_entry.delete(0, tk.END)
@@ -1996,9 +2174,11 @@ class OpenClawWinInstaller(OpenClawOperations):
                         sl = (self._sx_status_lyra if hasattr(self, "_sx_status_lyra")
                               else self._sx_status_worker)
                         self.root.after(300, lambda: self._check_searxng(sl, u))
+                    """GUI callback: port scan found HTML response -- JSON output not yet enabled in SearXNG."""
                     self.root.after(0, _hit_json)
                 else:
                     def _hit_html(p=port, u=new_url):
+                        """GUI callback: port scan got HTML -- JSON not enabled in SearXNG."""
                         self.log(f"[SearXNG-Scan] ⚠ Port {p}: HTTP 200 but no JSON "
                                  f"→ click 'Enable JSON format'!", "WARNING")
                         url_entry.delete(0, tk.END)
@@ -2007,9 +2187,11 @@ class OpenClawWinInstaller(OpenClawOperations):
                 break
 
             elif best_sc == 403:
+                """GUI callback: port scan received HTTP 403 -- SearXNG JSON format is disabled."""
                 new_url = f"http://127.0.0.1:{port}"
                 found = port
                 def _hit_403(p=port, u=new_url):
+                    """GUI callback: port scan got HTTP 403 -- SearXNG JSON format disabled."""
                     self.log(f"[SearXNG-Scan] ⚠ Port {p}: HTTP 403 – JSON disabled "
                              f"→ click 'Enable JSON format'!", "WARNING")
                     url_entry.delete(0, tk.END)
@@ -2421,6 +2603,173 @@ class OpenClawWinInstaller(OpenClawOperations):
         # Reset status callback
         self.cfg._status_cb = lambda **kw: None
 
+    def _offer_ollama_upgrade(self, model: str):
+        """Called on main thread when a pull fails due to outdated Ollama.
+
+        Shows a dialog asking the user to upgrade Ollama via winget.
+        If confirmed, runs the upgrade in a background thread with live log output.
+        """
+        self._pull_status.config(
+            text="⚠ Ollama zu alt fuer dieses Modell — Upgrade verfuegbar.",
+            foreground="orange")
+        self.log("[Ollama Pull] ⚠ Dieses Modell benoetigt eine neuere Ollama-Version.", "WARNING")
+
+        if not messagebox.askyesno(
+            "Ollama Upgrade erforderlich",
+            f"Das Modell '{model}' benoetigt eine neuere Ollama-Version.\n\n"
+            f"Aktive Runtime: {self._detect_ollama_runtime()['runtime']}\n\n"
+            "Upgrade-Befehl wird automatisch gewaehlt:\n"
+            "  Docker  -> docker pull ollama/ollama\n"
+            "  WSL     -> curl -fsSL ollama.com/install.sh | sh\n"
+            "  Windows -> winget upgrade Ollama.Ollama\n\n"
+            "Jetzt upgraden und Pull wiederholen?"
+        ):
+            self.log("[Ollama] Upgrade abgebrochen.", "INFO")
+            return
+
+        self.log("[Ollama] ⬆ Starte Ollama Upgrade via winget...", "INFO")
+        self._pull_status.config(text="⬆ Ollama wird aktualisiert...",
+                                 foreground="#0055cc")
+
+        def _do_upgrade():
+            """Background thread: upgrades Ollama Docker image or native binary.
+            Docker: pull ollama/ollama, stop+rm+run with new image.
+            WSL: curl install script. Windows: winget upgrade.
+            After upgrade: retries the original model pull automatically.
+            """
+            import subprocess as _sp
+            try:
+                rt = self._detect_ollama_runtime()
+                self.log(f"[Ollama Upgrade] Runtime: {rt['runtime']}", "INFO")
+
+                if rt["runtime"] == "docker":
+                    cname = rt["docker_container"]
+                    # Step 1: pull new image
+                    cmd = ["powershell.exe", "-NoProfile", "-NonInteractive",
+                           "-Command",
+                           f"docker pull ollama/ollama 2>&1"]
+                elif rt["runtime"] == "wsl":
+                    # WSL: re-run official install script inside Ubuntu
+                    cmd = ["powershell.exe", "-NoProfile", "-NonInteractive",
+                           "-Command",
+                           "wsl bash -lc \"curl -fsSL https://ollama.com/install.sh | sh\" 2>&1"]
+                else:
+                    # Windows-native: winget upgrade
+                    cmd = ["powershell.exe", "-NoProfile", "-NonInteractive",
+                           "-Command",
+                           "winget upgrade Ollama.Ollama --accept-source-agreements "
+                           "--accept-package-agreements 2>&1"]
+                proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT,
+                                 encoding="utf-8", errors="replace",
+                                 creationflags=0x08000000)  # CREATE_NO_WINDOW
+                upgraded = False
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if line:
+                        self.log(f"  [upgrade] {line}", "INFO")
+                    if any(x in line.lower() for x in [
+                        "successfully installed", "no applicable upgrade",
+                        "bereits aktuell", "already installed",
+                        "status: downloaded newer image",
+                        "status: image is up to date",
+                        "pull complete", "digest:",
+                    ]):
+                        upgraded = True
+                proc.wait()
+
+                # Docker: recreate container with new image
+                # docker restart keeps old image — must stop+rm+run to use new image
+                if rt["runtime"] == "docker" and proc.returncode == 0:
+                    cname = rt["docker_container"]
+                    self.log(f"[Ollama] Recreating container {cname} with new image...", "INFO")
+                    # Get current run config
+                    r_inspect = _sp.run(
+                        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                         f"docker inspect --format "
+                         f"'{{{{json .HostConfig.Binds}}}} {{{{json .HostConfig.DeviceRequests}}}} "
+                         f"{{{{.HostConfig.NetworkMode}}}}' {cname} 2>&1"],
+                        capture_output=True, encoding="utf-8", errors="replace",
+                        creationflags=0x08000000  # CREATE_NO_WINDOW
+                    )
+                    # Recreate container with new image:
+                    # docker inspect -> extract ports/volumes/gpus -> stop+rm+run
+                    import json as _json
+                    r_insp = _sp.run(
+                        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                         f"docker inspect {cname} 2>&1"],
+                        capture_output=True, encoding="utf-8", errors="replace",
+                        creationflags=0x08000000
+                    )
+                    run_args = "--gpus all -v ollama:/root/.ollama -p 11434:11434 -d"
+                    try:
+                        cfg = _json.loads(r_insp.stdout)[0]
+                        hc  = cfg.get("HostConfig", {})
+                        # Ports
+                        ports = " ".join(
+                            f"-p {v[0]['HostPort']}:{k.split('/')[0]}"
+                            for k, v in (hc.get("PortBindings") or {}).items() if v
+                        ) or "-p 11434:11434"
+                        # Volumes
+                        binds = " ".join(
+                            f"-v {b}" for b in (hc.get("Binds") or [])
+                        ) or "-v ollama:/root/.ollama"
+                        # GPUs
+                        gpus = "--gpus all" if hc.get("DeviceRequests") else ""
+                        run_args = f"{gpus} {binds} {ports} -d".strip()
+                    except Exception as e:
+                        self.log(f"[Ollama] inspect parse error: {e} — using defaults", "WARNING")
+                    # Stop + remove old container
+                    for step_cmd, step_label in [
+                        (f"docker stop {cname} 2>&1",  "Stopping"),
+                        (f"docker rm   {cname} 2>&1",  "Removing"),
+                    ]:
+                        self.log(f"[Ollama] {step_label} {cname}...", "INFO")
+                        _sp.run(["powershell.exe", "-NoProfile", "-NonInteractive",
+                                 "-Command", step_cmd],
+                                capture_output=True, encoding="utf-8",
+                                creationflags=0x08000000)
+                    # Run fresh container with new image
+                    self.log(f"[Ollama] Starting new container: docker run {run_args} --name {cname} ollama/ollama", "INFO")
+                    r_run = _sp.run(
+                        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                         f"docker run {run_args} --name {cname} ollama/ollama 2>&1"],
+                        capture_output=True, encoding="utf-8", errors="replace",
+                        creationflags=0x08000000
+                    )
+                    out = r_run.stdout.strip()
+                    if out:
+                        self.log(f"  [Ollama] {out[:80]}", "INFO")
+                    if r_run.returncode == 0:
+                        self.log(f"[Ollama] ✅ Container {cname} running with new image", "SUCCESS")
+                        upgraded = True
+                    else:
+                        self.log(f"[Ollama] ⚠ Recreate failed — bitte manuell: "
+                                 f"docker rm {cname} && docker run ...", "WARNING")
+
+                if proc.returncode == 0:
+                    self.root.after(0, lambda: self.log(
+                        "[Ollama] ✅ Upgrade abgeschlossen — versuche Pull erneut...",
+                        "SUCCESS"))
+                    self.root.after(0, lambda: self._pull_status.config(
+                        text=f"✅ Upgrade fertig — starte Pull fuer {model}...",
+                        foreground="green"))
+                    # Retry pull after short delay
+                    self.root.after(2000, self._pull_ollama_model)
+                else:
+                    self.root.after(0, lambda: self.log(
+                        "[Ollama] ❌ Upgrade fehlgeschlagen — bitte manuell updaten: "
+                        "https://ollama.com/download", "ERROR"))
+                    self.root.after(0, lambda: self._pull_status.config(
+                        text="❌ Upgrade fehlgeschlagen — siehe Log.",
+                        foreground="red"))
+            except Exception as e:
+                self.root.after(0, lambda: self.log(
+                    f"[Ollama] Upgrade Fehler: {e}", "ERROR"))
+
+        import threading
+        threading.Thread(target=_do_upgrade, daemon=True).start()
+
+
     def _pull_ollama_model(self):
         """Pull an Ollama model in a background thread with live log output.
 
@@ -2448,13 +2797,23 @@ class OpenClawWinInstaller(OpenClawOperations):
                  f"may take several minutes.", "INFO")
         self.log(f"[Ollama Pull] ☕ Perfect time for a coffee.", "INFO")
 
-        wsl_ok, ubuntu_ok = self.check_wsl()
-        ollama_in_wsl     = wsl_ok and ubuntu_ok and self.check_ollama_wsl()
+        runtime = self._detect_ollama_runtime()
+        self.log(f"[Ollama Pull] Runtime detected: {runtime['runtime']}" + (f" ({runtime['docker_container']})" if runtime['docker_container'] else ""), "INFO")
 
         def _do_pull():
+            """Background thread: streams ollama pull output live.
+            Routes via Docker exec, WSL bash, or native CLI.
+            On HTTP 412: triggers _do_upgrade() then retries.
+            """
             import subprocess as _sp
             try:
-                if ollama_in_wsl:
+                if runtime["runtime"] == "docker":
+                    cname = runtime["docker_container"]
+                    # -T disables TTY — prevents ANSI escape codes in output
+                    cmd = ["powershell.exe", "-NoProfile", "-NonInteractive",
+                           "-Command",
+                           f'docker exec --env TERM=dumb {cname} ollama pull {model} 2>&1']
+                elif runtime["runtime"] == "wsl":
                     cmd = ["powershell.exe", "-NoProfile", "-NonInteractive",
                            "-Command",
                            f'wsl bash -lc "OLLAMA_HOST=127.0.0.1:11434 ollama pull {model} 2>&1"']
@@ -2463,17 +2822,23 @@ class OpenClawWinInstaller(OpenClawOperations):
                            "-Command", f"ollama pull {model} 2>&1"]
 
                 proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT,
-                                 encoding="utf-8", errors="replace")
-                success = False
+                                 encoding="utf-8", errors="replace",
+                                 creationflags=0x08000000)  # CREATE_NO_WINDOW
+                success       = False
+                needs_upgrade = False
                 for line in proc.stdout:
-                    line = line.rstrip()
+                    line = _strip_ansi(line).rstrip()
                     if line:
                         self.log(f"  [pull] {line}", "INFO")
                     if "success" in line.lower():
                         success = True
+                    if "requires a newer version of ollama" in line.lower():
+                        needs_upgrade = True
                 proc.wait()
 
-                if proc.returncode == 0 or success:
+                if needs_upgrade:
+                    self.root.after(0, lambda: self._offer_ollama_upgrade(model))
+                elif proc.returncode == 0 or success:
                     self.root.after(0, lambda: self._pull_status.config(
                         text=f"✅ {model} ready! Model list updated.",
                         foreground="green"))
@@ -3085,6 +3450,9 @@ class OpenClawWinInstaller(OpenClawOperations):
         ollama_in_wsl = wsl_ok and ubuntu_ok and self.check_ollama_wsl()
 
         def _do_pull():
+            """Background thread: pulls a model via WSL or native Ollama.
+            Streams output live, detects 412 upgrade-required errors.
+            """
             import subprocess as _sp
             try:
                 if ollama_in_wsl:
@@ -3096,15 +3464,23 @@ class OpenClawWinInstaller(OpenClawOperations):
                            "-Command", f"ollama pull {model} 2>&1"]
 
                 proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT,
-                                 encoding="utf-8", errors="replace")
-                success = False
+                                 encoding="utf-8", errors="replace",
+                                 creationflags=0x08000000)  # CREATE_NO_WINDOW
+                success       = False
+                needs_upgrade = False
                 for line in proc.stdout:
-                    line = line.rstrip()
+                    line = _strip_ansi(line).rstrip()
                     if line:
                         self.log(f"  [pull] {line}", "INFO")
                     if "success" in line.lower():
                         success = True
+                    if "requires a newer version of ollama" in line.lower():
+                        needs_upgrade = True
                 proc.wait()
+                if needs_upgrade:
+                    self.root.after(0, lambda m=model:
+                        self._offer_ollama_upgrade(m))
+                    return False
 
                 if proc.returncode == 0 or success:
                     self.root.after(0, lambda: self._w_pull_status.config(

@@ -39,6 +39,7 @@ import threading
 import tkinter as tk
 import urllib.error
 import urllib.request
+from OpenClawConfigManagement import diag_api as _diag_api, strip_ansi as _strip_ansi
 from tkinter import ttk
 from typing import Callable
 
@@ -67,63 +68,7 @@ AGENT_TYPES = list(TYPE_META.keys())
 
 # ── HTTP helper ────────────────────────────────────────────────────────────────
 
-def _diag_api(url: str, timeout: int = 8,
-              method: str = "GET",
-              data: dict | None = None,
-              api_key: str = "") -> tuple[int, dict | str]:
-    """
-    Minimal HTTP helper — no external dependencies.
-    Returns (status_code, body_as_dict_or_str).  status_code = -1 on error.
-    api_key: if non-empty adds Authorization: Bearer header.
-    Follows HTTP 301/302/307/308 redirects automatically (up to 5 hops),
-    preserving method and headers — critical for http→https upgrades.
-    """
-    import urllib.parse
-    url = url.replace("//localhost:", "//127.0.0.1:")
-
-    for _ in range(5):
-        try:
-            body_bytes = json.dumps(data).encode("utf-8") if data else None
-            headers = ({"User-Agent": "LyraMonitor/1.0.5",
-                        "Accept": "application/json, text/html, */*"}
-                       if method == "GET" else
-                       {"Content-Type": "application/json",
-                        "User-Agent": "LyraMonitor/1.0.5"})
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
-            req = urllib.request.Request(
-                url, data=body_bytes, method=method, headers=headers)
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                raw = r.read(32_000).decode("utf-8", errors="replace").strip()
-                for c in [raw, raw.lstrip("\ufeff"), raw.split("\n", 1)[-1]]:
-                    try:
-                        return r.status, json.loads(c)
-                    except Exception:
-                        continue
-                return r.status, raw
-        except urllib.error.HTTPError as e:
-            if e.code in (301, 302, 307, 308):
-                loc = e.headers.get("Location", "")
-                if loc:
-                    if loc.startswith("/"):
-                        p = urllib.parse.urlparse(url)
-                        url = f"{p.scheme}://{p.netloc}{loc}"
-                    else:
-                        url = loc
-                    continue  # follow redirect
-            try:
-                body = e.read(2000).decode("utf-8", errors="replace")
-            except Exception:
-                body = ""
-            try:
-                return e.code, json.loads(body)
-            except Exception:
-                return e.code, body
-        except Exception as e:
-            return -1, str(e)
-
-    return -1, "Too many redirects"
-
+# _diag_api imported from OpenClawConfigManagement
 
 def _agent_base_url(agent: dict) -> str:
     """
@@ -825,6 +770,9 @@ class MonitoringTab:
         btn_frame.pack(fill=tk.X, padx=12, pady=(0, 10), side=tk.BOTTOM)
 
         def _save_rules():
+            """Saves edited delegation rules for the selected agent
+            back to workers.json and updates SOUL.md.
+            """
             rules_text = rules_box.get("1.0", tk.END).strip()
             self._agents[idx]["delegation_rules"] = rules_text
             self._cfg.save_workers(self._agents)
