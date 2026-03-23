@@ -219,6 +219,43 @@ Without `agents.defaults.contextTokens` in `openclaw.json`, OpenClaw uses `/api/
 
 ---
 
+### 🔭 Observer Session 2026-03-23
+
+#### 💥 DECISION #29 — models Block Sync on Primary Model Change
+
+**Root cause:** `_write_llm_to_config()` updated `model.primary` but left `agents.defaults.models` stale. After switching to `voytas26/openclaw-oss-20b-deterministic`, the `models` block still contained `glm-4.7-flash` entries. OpenClaw reads the `models` block and may select any listed model — including stale heavier models.
+
+**Symptom:** After switching primary to `voytas26`, OpenClaw selected `nemotron-3-super:latest` (83.6 GiB required, 38.6 GiB available) → immediate OOM → Lyra silent, no response.
+
+**Fix:** `_write_llm_to_config()` now replaces the entire `models` block with `{bare: {}, p: {}}` whenever the primary model changes.
+
+| Before | After |
+|---|---|
+| `models: {"glm-4.7-flash": {}, "ollama/glm-4.7-flash": {}}` (stale) | `models: {"voytas26/openclaw-oss-20b-deterministic": {}, "ollama/voytas26/...": {}}` (synced) |
+
+#### 🤖 DECISION #30 — Observer Auto-Trigger on LLM Error Silence
+
+**Problem:** The observer only fires when Lyra writes `[SOUL-UPDATE-VORSCHLAG]` or `[CORRECTION]` tags to memory. When the LLM itself crashes (OOM, missing model, network error), Lyra is completely silent — no tags written, observer never fires, user must notice manually.
+
+**Fix:** `_check_session_errors()` — new method called on every watcher poll cycle (30s):
+1. Scans `~/.openclaw/agents/main/sessions/*.jsonl` for changed files
+2. Reads the last 30 lines of each changed JSONL
+3. Counts consecutive `stopReason: "error"` assistant messages
+4. If ≥ 3 consecutive errors → writes `[CORRECTION:shared]` to today's memory file
+5. The existing debounce (5 min) fires → Claude Code observer triggered automatically
+
+Cooldown: 30 min per session file to avoid repeated triggers on the same error burst.
+
+#### ❌ Stale models block → OOM on model change — NEVER REINTRODUCE
+After changing primary model in GUI, always sync `agents.defaults.models` block. Stale entries for heavier models → OpenClaw selects them → OOM crash.
+**Fix:** `_write_llm_to_config()` replaces models block on every primary change (DECISION #29).
+
+#### ❌ Observer blind to LLM crashes — NEVER REINTRODUCE
+If the LLM crashes (OOM, exit-status-2), Lyra cannot write tags → observer never fires without `_check_session_errors()`.
+**Fix:** Always call `_check_session_errors()` in `_watcher_loop()` each cycle (DECISION #30).
+
+---
+
 ### ♻️ Restart Ollama Button
 
 New **`♻️ Restart Ollama`** button next to `🔄 Refresh model list` in both the Lyra Config Tab and Worker Config Tab.
@@ -788,6 +825,8 @@ External LLM ──────────────────────�
 | Fehler-Eskalation (HF) | Step 2 includes Hugging Face Discussions — separate from GitHub Issues | v1.0.4 |
 | Transformers error text | Full error string + `AutoTokenizer` in example — diagnostic anchor | v1.0.4 |
 | Kein Erfinden block | Full "NIEMALS erfundenes Ergebnis" rule inline — no cross-reference | v1.0.4 |
+| models block sync | `_write_llm_to_config()` replaces models block on primary change — no OOM from stale entries (DECISION #29) | v1.0.4 |
+| Session error monitor | `_check_session_errors()` triggers observer after 3× stopReason=error — Lyra silence no longer invisible (DECISION #30) | v1.0.4 |
 
 ---
 

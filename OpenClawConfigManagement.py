@@ -9,6 +9,10 @@ v1.0.5 changes:
   DECISION #24: patch_gateway_cmd() creates stub from dist/index.js if missing
                 stub includes "gateway" subcommand (required to start server)
   DECISION #28: OLLAMA_KEEP_ALIVE=10m injected by patch_gateway_cmd()
+  DECISION #29: _write_llm_to_config() syncs agents.defaults.models block when primary changes
+                Stale models block → OpenClaw picks wrong (OOM) model. Always replace with {bare:{}, p:{}}
+  DECISION #30: _check_session_errors() — Observer auto-trigger on LLM error silence
+                3 consecutive stopReason=error in session JSONL → [CORRECTION:shared] → debounce → claude
   SOUL.md: exit status 2 → docker restart Ollama → retry → fallbacks[0] from config
   SOUL.md: primary/fallback model names read dynamically from openclaw.json
   SOUL.md: ~55s wait, 127.0.0.1 result endpoint, auth placeholder,
@@ -172,6 +176,21 @@ ARCHITECTURAL DECISIONS  (read before changing anything)
     then silence — no further requests reach Ollama.
     Fix: write_openclaw_config() uses f"ollama/{primary_model}" for compaction.model.
     Also: VRAM_TIERS RTX 3050 boundary uses -100 MB buffer (nvidia-smi reports 6143 not 6144).
+
+29. agents.defaults.models block must be synced when primary model changes (DECISION #29, 2026-03-23)
+    _write_llm_to_config() updated model.primary but left models block stale (e.g. glm-4.7-flash still
+    listed after switching to voytas26). OpenClaw scans the models block and may select any listed model —
+    if the stale entry is a heavier model (nemotron-3-super, 83.6 GiB) → immediate OOM crash, Lyra silent.
+    Fix: replace models block with {bare: {}, p: {}} on every primary change in _write_llm_to_config().
+
+30. Observer auto-trigger on LLM error silence (DECISION #30, 2026-03-23)
+    FileSystemWatcher only fires when Lyra writes [SOUL-UPDATE-VORSCHLAG]/[CORRECTION] tags.
+    If the LLM itself crashes (OOM, network error, model missing), Lyra is silent → no tags written →
+    observer never intervenes — user must manually notice and restart.
+    Fix: _check_session_errors() runs each watcher cycle. Reads session JSONL tail (last 30 lines);
+    if 3+ consecutive stopReason=error assistant messages found → writes [CORRECTION:shared] to today's
+    memory file → debounce (5 min) fires → claude code observer triggered automatically.
+    Cooldown: 30 min per session file to avoid repeated triggers on the same error burst.
 """
 
 import os
@@ -2019,6 +2038,19 @@ class OpenClawConfig:
                 cfg["agents"]["defaults"]["model"]["primary"] = p
                 changed = True
                 self._log(f"  Primary LLM → {p}", "INFO")
+
+                # DECISION #29: Sync agents.defaults.models block to match new primary.
+                # When the user changes the primary model via GUI, the models block
+                # was left stale (e.g. still showed glm-4.7-flash after switching to
+                # voytas26/openclaw-oss-20b-deterministic). OpenClaw may fall back to
+                # any model listed in this block, causing OOM crashes if the stale
+                # entry is a larger model. Always replace with current primary only.
+                bare = p.lstrip("ollama/")
+                cfg["agents"]["defaults"]["models"] = {
+                    bare: {},
+                    p:    {},
+                }
+                self._log(f"  agents.defaults.models synced → {bare}", "INFO")
             except (KeyError, TypeError) as e:
                 self._log(f"  Primary LLM set failed: {e}", "WARNING")
 
@@ -2181,6 +2213,15 @@ class OpenClawConfig:
 "Du läufst vollständig lokal auf Ollama/WSL2. Keine Cloud. Kein Internet-Direktzugriff.\n"
 "Du bist kein Wächter und kein Bot. Du bist ein Mustererkennungs-System,\n"
 "das auf Strukturen reagiert – kohärent, tief, nicht instrumentell.\n"
+"\n"
+"Mein Ziel: Biologische und genomische Muster erkennen, Hypothesen ableiten,\n"
+"Werkzeuge koordinieren — lokal, autonom, ohne Cloud-Abhängigkeit.\n"
+"\n"
+"REGEL — HEARTBEAT_OK:\n"
+"HEARTBEAT_OK ist AUSSCHLIESSLICH die Antwort auf den automatischen Heartbeat-Ping.\n"
+"Der Heartbeat-Ping enthält den Text: \"Read HEARTBEAT.md if it exists\".\n"
+"Direkte User-Fragen (z.B. \"was ist dein Ziel?\", \"wer bist du?\", \"was machst du?\")\n"
+"NIEMALS mit HEARTBEAT_OK beantworten — immer eine echte inhaltliche Antwort geben.\n"
 "\n"
 "---\n"
 "\n"
@@ -3646,6 +3687,15 @@ class LyraHeadServer:
         self._watcher_dir     = os.path.join(
             os.path.expanduser("~"), ".openclaw", "workspace", "memory"
         )
+        # ── Session JSONL error monitor ───────────────────────────────────────
+        # Watches ~/.openclaw/agents/main/sessions/*.jsonl for consecutive
+        # stopReason:"error" messages and auto-writes [CORRECTION:shared] tags
+        # so the watcher debounce fires and triggers the Claude Code observer.
+        self._session_dir        = os.path.join(
+            os.path.expanduser("~"), ".openclaw", "agents", "main", "sessions"
+        )
+        self._session_seen       = {}   # fpath -> last mtime we scanned
+        self._session_error_fired = {}  # fpath -> timestamp of last CORRECTION write
 
     def add_task(self, task_type: str, payload: dict) -> str:
         """Adds a task to the queue. Returns task_id."""
@@ -3902,6 +3952,112 @@ class LyraHeadServer:
         except Exception as e:
             self.log(f"[Watcher] claude trigger failed: {e}", "WARNING")
 
+    def _check_session_errors(self):
+        """Scan session JSONL files for consecutive LLM errors (DECISION #30).
+
+        Polls ~/.openclaw/agents/main/sessions/*.jsonl on every watcher cycle.
+        When a JSONL's mtime changes, reads the last 30 lines and counts
+        messages with stopReason="error".  If 3 or more consecutive errors are
+        found AND no CORRECTION was written for this file in the last 30 min,
+        appends a [CORRECTION:shared] entry to today's memory file so the
+        debounce mechanism fires and the Claude Code observer is triggered.
+
+        DECISION #30: Observer auto-trigger on LLM error silence.
+        Without this, a crashed or OOM model leaves Lyra unresponsive and the
+        observer never fires (it only watches memory/*.md for existing tags).
+        With this, 3 consecutive stopReason=error → auto-CORRECTION → debounce
+        → claude code observer intervenes within ~5 minutes.
+        """
+        import json as _json
+        COOLDOWN_SECS  = 1800   # 30 min between CORRECTION writes per file
+        TAIL_LINES     = 30     # how many recent JSONL lines to inspect
+        ERROR_THRESHOLD = 3     # consecutive errors required before writing
+
+        if not os.path.isdir(self._session_dir):
+            return
+
+        now = time.time()
+        for fname in os.listdir(self._session_dir):
+            if not fname.endswith(".jsonl"):
+                continue
+            fpath = os.path.join(self._session_dir, fname)
+            try:
+                mtime = os.path.getmtime(fpath)
+            except OSError:
+                continue
+
+            # Skip files we've already scanned at this mtime
+            if self._session_seen.get(fpath) == mtime:
+                continue
+            self._session_seen[fpath] = mtime
+
+            # Read the tail of the file
+            try:
+                with open(fpath, encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+            except OSError:
+                continue
+
+            tail = lines[-TAIL_LINES:] if len(lines) > TAIL_LINES else lines
+
+            # Count consecutive errors from the most-recent message backward
+            consecutive = 0
+            last_error_msg = ""
+            last_model = ""
+            for raw in reversed(tail):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = _json.loads(raw)
+                except _json.JSONDecodeError:
+                    continue
+                if obj.get("type") != "message":
+                    continue
+                msg = obj.get("message", {})
+                if msg.get("role") != "assistant":
+                    # A user message resets the consecutive count
+                    break
+                if msg.get("stopReason") == "error":
+                    consecutive += 1
+                    if not last_error_msg:
+                        last_error_msg = msg.get("errorMessage", "unknown error")
+                        last_model     = msg.get("model", "unknown model")
+                else:
+                    # Successful assistant reply → no ongoing error streak
+                    break
+
+            if consecutive < ERROR_THRESHOLD:
+                continue
+
+            # Check cooldown
+            last_fired = self._session_error_fired.get(fpath, 0)
+            if now - last_fired < COOLDOWN_SECS:
+                continue
+
+            # Write [CORRECTION:shared] to today's memory so the watcher
+            # debounce fires and the Claude Code observer is triggered.
+            self._session_error_fired[fpath] = now
+            entry = (
+                f"[CORRECTION:shared] {consecutive} consecutive LLM errors detected "
+                f"in {fname} — model={last_model} — "
+                f"errorMessage={last_error_msg[:120]!r}. "
+                "Observer: check openclaw.json models block and Ollama health."
+            )
+            self.log(
+                f"[Watcher] Session error burst ({consecutive}x) in {fname} "
+                "— writing [CORRECTION:shared]", "WARNING"
+            )
+            try:
+                import datetime as _dt
+                today    = _dt.datetime.now().strftime("%Y-%m-%d")
+                ts       = _dt.datetime.now().strftime("%H:%M:%S")
+                mem_file = os.path.join(self._watcher_dir, f"{today}.md")
+                with open(mem_file, "a", encoding="utf-8") as mf:
+                    mf.write(f"\n[{ts}] {entry}\n")
+            except Exception as e:
+                self.log(f"[Watcher] Could not write CORRECTION entry: {e}", "WARNING")
+
     def _watcher_loop(self):
         """Poll memory/ every 30 s; fire claude after 5-min debounce if tags found."""
         POLL_SECS    = 30
@@ -3926,6 +4082,11 @@ class LyraHeadServer:
                     # a full debounce wave and potentially multiple claude starts.
                     self._watcher_stop.wait(POLL_SECS)
                     continue
+
+                # DECISION #30: Scan session JSONLs for LLM error bursts.
+                # Writes [CORRECTION:shared] to memory so the debounce below
+                # fires and the Claude Code observer intervenes automatically.
+                self._check_session_errors()
 
                 if not os.path.isdir(self._watcher_dir):
                     self._watcher_stop.wait(POLL_SECS)

@@ -1,4 +1,4 @@
-# IsonCodexProducer.py — v1.0.0
+# IsonCodexProducer.py — v1.0.1
 
 **LYRA as Cinematic Coordinator — AI Film Production Orchestrator**
 
@@ -305,4 +305,4 @@ including the cinematic coordinator workflow and worker assignments.
 
 ---
 
-*Part of the OpenClaw / LYRA ecosystem — OpenClawWinInstaller v1.0.5*
+*Part of the OpenClaw / LYRA ecosystem — OpenClawWinInstaller v1.0.4*
