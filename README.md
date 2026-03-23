@@ -30,6 +30,11 @@ From v1.0.4 the system also supports **external LLM agents** (OpenAI-compatible 
 - ✅ undici 300s hardcoded timeout patched — synced to GUI setting
 - ✅ Hardware-aware config: timeout + model from HardwareProfile
 - ✅ Clean three-module architecture: Installer · Config · Monitoring
+- ✅ LYRA Roles: Pattern Recognition (genomics) · Cinematic Coordinator (film)
+- ✅ Role-aware memory: tag-based `[LEARNING:role]` system, no data loss on role switch
+- ✅ IsonCodexProducer: full AI film production orchestrator as standalone tool
+- ✅ Script Supervisor: any novel → LLM scene list via multi-turn conversation
+- ✅ Central utility functions: `diag_api()` + `strip_ansi()` — zero duplication across modules
 
 ---
 
@@ -53,6 +58,104 @@ From v1.0.4 the system also supports **external LLM agents** (OpenAI-compatible 
 - [Current Models](#current-models)
 - [File Paths & Ports](#file-paths--ports)
 - [Running the Installer](#running-the-installer)
+
+---
+
+### 🔭 Observer Session 2026-03-23
+### 🎭 LYRA Roles
+
+LYRA now has two operational roles, selectable in the **Lyra Config Tab** via a
+`🎭 LYRA Role:` dropdown:
+
+| Role | Description | Activated Tool |
+|---|---|---|
+| `pattern_recognition` | Genomic pattern intelligence — DNA models, fractal analysis | (default) |
+| `cinematic_coordinator` | Film production proxy — orchestrates IsonCodexProducer | `▶ Start App` |
+
+Role is persisted to `~/.openclaw/lyra_role.json` and written into SOUL.md on every
+switch. Each role appends a dedicated SOUL.md section with authorized models, workflow
+rules, and worker assignments.
+
+**On role switch:**
+1. `lyra_role.json` updated
+2. SOUL.md rewritten with new role section
+3. User prompted to restart the OpenClaw gateway
+
+### 📚 Role-Aware Memory — Tag System
+
+LYRA's memory (`memory/YYYY-MM-DD.md`) now uses inline role tags instead of separate
+folders. One flat file per day — all roles, all entries, no migration required.
+
+```
+[LEARNING:shared]               relevant for ALL roles (OpenClaw bugs, Ollama tips)
+[LEARNING:pattern_recognition]  DNA / genomics specific
+[CONTEXT:cinematic_coordinator] film production specific
+```
+
+**Writing:** LYRA calls `write_memory("[LEARNING] text")` — the role tag is injected
+automatically. No decision required.
+
+**Reading:** `read_memory(role)` returns only entries tagged `[:role]` or `[:shared]`.
+`get_memory_for_observer()` returns all entries (for Claude Code observer).
+
+**Rollenwechsel:** keine Dateien werden verschoben. LYRA liest einfach andere Tags.
+Der Watcher erkennt auch `[SOUL-UPDATE-VORSCHLAG:role]` und `[CORRECTION:role]` Tags.
+
+New methods in `OpenClawConfig`:
+`get_memory_paths()` · `read_memory()` · `_filter_memory_by_role()` · `write_memory()`
+`set_lyra_role()` · `get_lyra_role()` · `get_memory_for_observer()` · `_migrate_memory_to_tags()`
+
+### 🎬 IsonCodexProducer — AI Film Production Tool
+
+New tool `Tools/IsonCodexProducer/IsonCodexProducer.py` — a full standalone GUI
+application for orchestrating AI film production of *The Ison-Codex*.
+
+See **[IsonCodexProducer.md](Tools/IsonCodexProducer/IsonCodexProducer.md)** for
+complete documentation.
+
+**Highlights:**
+- 55 built-in scenes (P1–E4) covering the full Ison-Codex story
+- DeepSeek enhances every scene prompt with Visual DNA before Worker delegation
+- Video Worker API: POST `/generate` → sync URL or async job polling
+- Worker blacklist: failed workers skipped for remainder of session
+- **Script Supervisor:** load any `.txt` novel → LLM generates scene list via
+  multi-turn conversation (chapter by chapter, no output truncation)
+- SceneEditDialog: per-scene attribute + prompt + clip editor
+- TOTAL row: master prompt combining all scene prompts
+- Right-click context menu: produce / delete prompts / delete clips / open folder
+- Multi-select (Ctrl+Click, Shift+Click)
+
+**Visual DNA** (embedded in every enhanced prompt):
+
+| Element | Value |
+|---|---|
+| Color palette | Dark blue `#0A192F` · Amber `#FDB827` · Neon cyan `#00E5FF` · Gold `#FFD700` |
+| Lighting | Cinematic Noir, Volumetric Light, blue-orange contrasts |
+| Camera | Close-ups = intimacy · Flying = data worlds · Wide = power (ref: Mr. Robot) |
+
+### 🔧 Code Quality — Consolidation
+
+| Change | Detail |
+|---|---|
+| `diag_api()` centralized | Module-level function in `OpenClawConfigManagement.py` with redirect support (301/302/307/308) and `api_key` parameter. `OpenClawWinInstaller._diag_api` and `OpenClawAgentMonitoring._diag_api` both delegate to it. |
+| `strip_ansi()` centralized | Module-level function, regex compiled once and cached. `OpenClawOperations._strip_ansi` delegates. Two inline `_ansi_re = re.compile(...)` blocks in Installer replaced. |
+| `_watcher_seen` pruning | Cache pruned when > 500 entries — only existing files kept. Prevents unbounded growth over weeks of uptime. |
+| Docstrings complete | All functions/classes > 3 lines now have docstrings. `_restart_ollama` documents all 4 fallback stages and both early-return conditions. Inner threads (`_run`, `_do_pull`, `_do_upgrade`) documented. |
+
+### 🐛 Bug Fixes
+
+| Bug | Fix |
+|---|---|
+| Docker pull ANSI escape codes in log | `docker exec --env TERM=dumb` → `strip_ansi()` on every output line |
+| Docker upgrade restart kept old image | `docker stop` + `docker rm` + `docker run` (not `docker restart`) |
+| Blue PowerShell windows on upgrade | `CREATE_NO_WINDOW` flag on all `subprocess.Popen` calls |
+| `ollama pull` truncated at 8000 tokens | `max_tokens: 8192` (DeepSeek model maximum) explicitly set |
+| `is_ollama` detection wrong for DeepSeek | URL-based detection only: `:11434` or no key + not deepseek/openai domain |
+| LLM import dropdown only showed DeepSeek | Ollama models fetched from `/api/tags` + all workers with URL shown |
+| Scene import truncated at ~54 scenes | Multi-turn conversation: LLM lists chapters first, then processes one chapter per turn |
+| `SCENES[i]` refs after `_get_active_scenes()` | All 19 remaining `SCENES[` references replaced with `_get_active_scenes()[i]` |
+| `_run_single_scene` used SCENES directly | Fixed to use `_get_active_scenes()` |
+
 
 ---
 
@@ -475,7 +578,7 @@ Both fixes applied at three levels: `write_openclaw_config()` · `setup_lyra_age
 The original 9005-line monolith split into three focused files:
 
 - **`OpenClawWinInstaller.py`** — GUI + installation flow (Steps 1–16, all tkinter)
-- **`OpenClawConfigManagement.py`** — all logic: config, servers, worker client, operations
+- **`OpenClawConfigManagement.py`** — all logic: config, servers, worker client, operations, LYRA roles, memory system
 - **`OpenClawAgentMonitoring.py`** — self-contained Monitoring Tab (no Installer dependency)
 
 ### SOUL.md: Two New Behavioral Sections
@@ -488,15 +591,16 @@ The original 9005-line monolith split into three focused files:
 ## Three-Module Architecture
 
 ```
-OpenClawWinInstaller.py                    4 397 lines   GUI + installation flow
-OpenClawConfigManagement.py                6 673 lines   All logic, servers, config
-OpenClawAgentMonitoring.py                 1 157 lines   Monitoring Tab (self-contained)
+OpenClawWinInstaller.py                    4 773 lines   GUI + installation flow
+OpenClawConfigManagement.py                7 068 lines   All logic, servers, config, roles
+OpenClawAgentMonitoring.py                 1 105 lines   Monitoring Tab (self-contained)
 ──────────────────────────────────────────────────────
-Subtotal (3-module core)                  12 227 lines
+Subtotal (3-module core)                  12 946 lines
 
 Tools/ClaudeCodeSetup/ClaudeCodeSetup.py  1 248 lines   Claude Code ↔ Lyra Setup GUI
+Tools/IsonCodexProducer/IsonCodexProducer.py  2 806 lines   AI Film Production Orchestrator
 ──────────────────────────────────────────────────────
-Total                                     13 475 lines
+Total                                     17 000 lines
 ```
 
 ---
@@ -509,6 +613,7 @@ Standalone utilities in `Tools/` — each in its own subdirectory with `.py` + `
 |---|---|---|
 | Claude Code Setup | `Tools/ClaudeCodeSetup/ClaudeCodeSetup.py` (1 248 lines) | GUI installer for the Claude Code ↔ Lyra self-improvement bridge. Installs, configures, starts, stops and uninstalls the observer layer. Can be run standalone — independent of the main installer. |
 | PyTorch Setup GUI | `Tools/pytorch_setup_gui/pytorch_setup_gui.py` | PyTorch & Transformers Setup GUI (COMPLETE EDITION). Detects CUDA version automatically, creates a virtual environment, installs PyTorch with the correct CUDA build, and runs a comprehensive test suite. Includes `HardwareDetector`, `InstallationTester`, and `PyTorchInstaller` classes. |
+| IsonCodexProducer | `Tools/IsonCodexProducer/IsonCodexProducer.py` (2800+ lines) | AI Film Production Orchestrator — LYRA as Cinematic Coordinator. 55 built-in scenes from *The Ison-Codex*, Script Supervisor (LLM scene import), DeepSeek prompt enhancement, video Worker API delegation, SceneEditDialog, TOTAL master prompt generator. See [IsonCodexProducer.md](Tools/IsonCodexProducer/IsonCodexProducer.md). |
 
 ```bash
 python Tools/ClaudeCodeSetup/ClaudeCodeSetup.py
@@ -563,6 +668,15 @@ python Tools/pytorch_setup_gui/pytorch_setup_gui.py
 - ✅ Session-start: reads `[CONTEXT]` entries from last 14 days — picks up threads without asking
 - ✅ exit status 2: docker restart → retry → dynamic fallback from `openclaw.json`
 - ✅ Model names in SOUL.md always reflect live `openclaw.json` config (dynamic generation)
+
+### LYRA Roles
+- ✅ `pattern_recognition` role: genomics/DNA, authorized model list in SOUL.md
+- ✅ `cinematic_coordinator` role: film production, IsonCodexProducer launcher
+- ✅ Role persisted to `lyra_role.json`, SOUL.md rewritten on switch
+- ✅ Memory tag system: `[LEARNING:role]` auto-injected by `write_memory()`
+- ✅ Role-filtered reading: `read_memory(role)` returns `[:role]` + `[:shared]` only
+- ✅ Observer reads all tags: `get_memory_for_observer()` — no filter
+- ✅ Watcher detects `[SOUL-UPDATE-VORSCHLAG:role]` and `[CORRECTION:role]` tags
 
 ### Autonomous Observer Loop
 - ✅ FileSystemWatcher: `[SOUL-UPDATE-VORSCHLAG]` / `[CORRECTION]` tags auto-trigger Claude Code
@@ -666,7 +780,11 @@ External LLM ──────────────────────�
 | SOUL.md size limit | `bootstrapMaxChars: 40 000` in `openclaw.json` — DECISION #16 | v1.0.4 |
 | Compaction VRAM overflow | `compaction.model` = `primary_model` — DECISION #18 | v1.0.4 |
 | 131 072 context window | `contextTokens: 131072` + Modelfile `num_ctx` — DECISION #19 | v1.0.4 |
-| VRAM_TIERS RTX 3050 | -100MB boundary buffer — nvidia-smi reports 6143, not 6144 | v1.0.4 |
+| VRAM_TIERS RTX 3050 | -100MB boundary buffer -- nvidia-smi reports 6143, not 6144 | v1.0.4 |
+| LYRA Role section | `pattern_recognition` or `cinematic_coordinator` appended to SOUL.md | v1.0.4 |
+| Memory role tags | `[LEARNING:role]` auto-injected, `[:shared]` read by all roles | v1.0.4 |
+| Cinematic workflow | Scene production pipeline, worker assignments, Visual DNA | v1.0.4 |
+| Pattern Recognition | Authorized model list (DNABERT-2, HyenaDNA, ESM-2, BioBERT) | v1.0.4 |
 | Fehler-Eskalation (HF) | Step 2 includes Hugging Face Discussions — separate from GitHub Issues | v1.0.4 |
 | Transformers error text | Full error string + `AutoTokenizer` in example — diagnostic anchor | v1.0.4 |
 | Kein Erfinden block | Full "NIEMALS erfundenes Ergebnis" rule inline — no cross-reference | v1.0.4 |
@@ -803,7 +921,9 @@ Gateway overwrites `skills.json` on startup. **Fix:** `_write_skill_file()` call
 ~\.openclaw\workspace\SOUL.md                       LYRA behavior rules + Agent Registry + Delegation Rules
 ~\.openclaw\workspace\BOOTSTRAP.md                  Diagnostic knowledge base
 ~\.openclaw\workspace\FORCE-DELEGATE.md             Delegation constraints
-~\.openclaw\workspace\memory\YYYY-MM-DD.md          LYRA self-learning entries
+~\.openclaw\workspace\memory\YYYY-MM-DD.md          LYRA self-learning entries (all roles, tag-based)
+~\.openclaw\lyra_role.json                           Active LYRA role (pattern_recognition / cinematic_coordinator)
+~\.openclaw\ison_producer.json                       IsonCodexProducer storage path
 ~\.openclaw\skills\delegate_to_worker.js            Only required skill
 ~\.openclaw\agents\main\agent\auth-profiles.json    Ollama provider (no ollama/ prefix!)
 ~\.openclaw\agents\main\sessions\sessions.json      Delete before gateway start
