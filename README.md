@@ -110,7 +110,7 @@ New methods in `OpenClawConfig`:
 New tool `Tools/IsonCodexProducer/IsonCodexProducer.py` — a full standalone GUI
 application for orchestrating AI film production of *The Ison-Codex*.
 
-See **[IsonCodexProducer.md](Tools/IsonCodexProducer/IsonCodexProducer.md)** for
+See **[IsonCodexProducer](https://github.com/isonwillis/OpenClawWinInstaller/tree/main/Tools/IsonCodexProducer)** for
 complete documentation.
 
 **Highlights:**
@@ -613,7 +613,7 @@ Standalone utilities in `Tools/` — each in its own subdirectory with `.py` + `
 |---|---|---|
 | Claude Code Setup | `Tools/ClaudeCodeSetup/ClaudeCodeSetup.py` (1 248 lines) | GUI installer for the Claude Code ↔ Lyra self-improvement bridge. Installs, configures, starts, stops and uninstalls the observer layer. Can be run standalone — independent of the main installer. |
 | PyTorch Setup GUI | `Tools/pytorch_setup_gui/pytorch_setup_gui.py` | PyTorch & Transformers Setup GUI (COMPLETE EDITION). Detects CUDA version automatically, creates a virtual environment, installs PyTorch with the correct CUDA build, and runs a comprehensive test suite. Includes `HardwareDetector`, `InstallationTester`, and `PyTorchInstaller` classes. |
-| IsonCodexProducer | `Tools/IsonCodexProducer/IsonCodexProducer.py` (2800+ lines) | AI Film Production Orchestrator — LYRA as Cinematic Coordinator. 55 built-in scenes from *The Ison-Codex*, Script Supervisor (LLM scene import), DeepSeek prompt enhancement, video Worker API delegation, SceneEditDialog, TOTAL master prompt generator. See [IsonCodexProducer.md](Tools/IsonCodexProducer/IsonCodexProducer.md). |
+| IsonCodexProducer | `Tools/IsonCodexProducer/IsonCodexProducer.py` (2800+ lines) | AI Film Production Orchestrator — LYRA as Cinematic Coordinator. 55 built-in scenes from *The Ison-Codex*, Script Supervisor (LLM scene import), DeepSeek prompt enhancement, video Worker API delegation, SceneEditDialog, TOTAL master prompt generator. See [IsonCodexProducer](https://github.com/isonwillis/OpenClawWinInstaller/tree/main/Tools/IsonCodexProducer). |
 
 ```bash
 python Tools/ClaudeCodeSetup/ClaudeCodeSetup.py
