@@ -9,6 +9,8 @@ v1.0.5 changes:
   DECISION #24: patch_gateway_cmd() creates stub from dist/index.js if missing
                 stub includes "gateway" subcommand (required to start server)
   DECISION #28: OLLAMA_KEEP_ALIVE=10m injected by patch_gateway_cmd()
+  DECISION #31: _apply_fixes_and_update() deletes sessions.json before gateway restart
+                SOUL.md fixes only apply to NEW sessions; old session resumes with cached system prompt
   DECISION #29: _write_llm_to_config() syncs agents.defaults.models block when primary changes
                 Stale models block → OpenClaw picks wrong (OOM) model. Always replace with {bare:{}, p:{}}
   DECISION #30: _check_session_errors() — Observer auto-trigger on LLM error silence
@@ -1255,6 +1257,15 @@ class OpenClawConfig:
             lines.append(
                 "  → Delegation: exec per PowerShell ODER Monitoring-Tab → 'chat (openai)'\n"
                 "  → NICHT über Gateway-API — direkt per HTTP an den Agenten\n\n"
+                "REGEL — DeepSeek Auth (PFLICHT):\n"
+                "  Key NICHT aus $env:DEEPSEEK_API_KEY lesen — der ist in der Gateway-Umgebung NICHT gesetzt.\n"
+                "  Key aus workers.json lesen:\n"
+                "    $w   = Get-Content \"$env:USERPROFILE\\.openclaw\\workers.json\" | ConvertFrom-Json\n"
+                "    $key = ($w | Where-Object { $_.name -eq 'Deepseek' }).api_key\n"
+                "    Wenn $key leer → sofort melden: \"Deepseek api_key in workers.json nicht gesetzt.\"\n"
+                "    KEIN Retry mit leerem Key.\n"
+                "  Fehlertext \"auth header format should be Bearer sk-...\" = Key leer oder falsches Format.\n"
+                "  → Retry NIEMALS ohne Key-Prüfung.\n\n"
             )
 
         # ── Ollama-Agenten ────────────────────────────────────────────────

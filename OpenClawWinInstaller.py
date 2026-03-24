@@ -3044,7 +3044,8 @@ class OpenClawWinInstaller(OpenClawOperations):
                                 "      ODER lokales Modell (glm/qwen) hat denselben Task 3x nicht geloest\n"
                                 "NICHT: Web-Suchen (→ Worker), lokal loesbare Tasks, Routineanfragen\n"
                                 "GRUND: Externer Dienst, kostenpflichtig pro Token — sparsam einsetzen\n"
-                                "AUTH: $env:DEEPSEEK_API_KEY — niemals Klartext oder <api_key>"
+                                "AUTH: Key aus workers.json lesen (nicht $env: — in Gateway-Umgebung nicht gesetzt)\n"
+                                "  $w=((Get-Content \"$env:USERPROFILE\\.openclaw\\workers.json\"|ConvertFrom-Json)|Where-Object{$_.name -eq 'Deepseek'}).api_key"
                             ),
                         }
 
@@ -3127,6 +3128,22 @@ class OpenClawWinInstaller(OpenClawOperations):
             self._soul_update_status.config(
                 text=f"❌ SOUL.md error: {e}", foreground="red")
             return
+
+        # ── DECISION #31: Delete sessions.json before gateway restart ──────────
+        # SOUL.md changes only take effect in a NEW session. The gateway restart
+        # above would otherwise resume the existing session (same sessionId) which
+        # still holds the old system prompt in context — new rules are never seen.
+        # Deleting sessions.json forces OpenClaw to create a fresh session on next
+        # start, loading the updated SOUL.md as system prompt from scratch.
+        sessions_path = os.path.join(cfg_dir, "agents", "main", "sessions", "sessions.json")
+        if os.path.isfile(sessions_path):
+            try:
+                os.remove(sessions_path)
+                self.log("[Fix] sessions.json deleted — fresh session will load updated SOUL.md ✓", "SUCCESS")
+            except Exception as e:
+                self.log(f"[Fix] sessions.json delete failed: {e}", "WARNING")
+        else:
+            self.log("[Fix] sessions.json not found — nothing to delete", "INFO")
 
         # ── Gateway restart ────────────────────────────────────────────────────
         self.root.after(800, self._restart_gateway)
