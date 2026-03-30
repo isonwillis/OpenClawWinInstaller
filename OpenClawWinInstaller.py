@@ -3,20 +3,8 @@
 """
 OpenClawWinInstaller.py  –  v1.0.4
 ====================================
-Changelog:
-  v1.0.5  DECISION #21: workers.json delegation_rules seeded on Apply fixes
-          DECISION #22: hasattr guard for _gw_status on Worker startup
-          DECISION #23: Node.js version check + upgrade in Worker setup flow
-          DECISION #24: gateway.cmd stub created from dist/index.js if missing
-          DECISION #25: check_openclaw + fix_openclaw_installation in Worker flow
-          DECISION #26: openclaw gateway install --force in Worker flow
-          DECISION #27: write_openclaw_config() always called after onboard
-          DECISION #28: _restart_ollama() — Docker/WSL/native/service detection
-                        OLLAMA_KEEP_ALIVE=10m injected via patch_gateway_cmd()
-          f-string fix: Port {port} refused — missing f-prefix
-          duplicate check_node removed (was: major>=18, correct: >22 or 22+16)
 GUI installer for OpenClaw / LYRA on Windows.
-Handles the "New Installation" flow (Steps 1-16) and all GUI interactions.
+Handles the "New Installation" flow (Steps 1–16) and all GUI interactions.
 
 All non-GUI logic lives in OpenClawConfigManagement.py:
   - OpenClawConfig             : config read/write (openclaw.json, auth-profiles, SOUL.md)
@@ -29,6 +17,34 @@ All non-GUI logic lives in OpenClawConfigManagement.py:
 
 OpenClawWinInstaller inherits OpenClawOperations so all operational methods
 are available as self.X() — no extra wiring needed.
+
+CHANGELOG  (newest first)
+--------------------------
+v1.0.4 (2026-03-25):
+  DECISION #36: DeepSeek API — verified working exec pattern (see OpenClawConfigManagement.py).
+                Root cause of ALL prior DeepSeek failures: $env:DEEPSEEK_API_KEY not inherited
+                by Gateway Scheduled Task. Invoke-RestMethod fails silently for external HTTPS.
+                %USERPROFILE% not expanded in -File args. $headers empty in -Command context.
+                Fix: canonical .ps1 template injected into SOUL.md by _build_agent_registry_section().
+  DECISION #35: Seeded delegation_rules for type=openai corrected in _apply_fixes_and_update():
+                workers.json api_key read pattern replaces $env:DEEPSEEK_API_KEY reference.
+  DECISION #32: _apply_fixes_and_update() strips api_key + cloud model from type=worker entries.
+  DECISION #31: sessions.json deleted before gateway restart in Apply fixes.
+  DECISION #30: _check_session_errors() — observer auto-trigger on 3+ consecutive LLM errors.
+  DECISION #29: _write_llm_to_config() replaces stale models block on every primary model change.
+  DECISION #28: _restart_ollama() — detects Docker/WSL/native/service and restarts accordingly.
+                OLLAMA_KEEP_ALIVE=10m injected via patch_gateway_cmd().
+  DECISION #27: write_openclaw_config() always called after onboard in Worker flow.
+  DECISION #26: openclaw gateway install --force in Worker flow.
+  DECISION #25: check_openclaw() + fix_openclaw_installation() added to Worker flow.
+  DECISION #24: gateway.cmd stub created from dist/index.js if missing after npm reinstall.
+  DECISION #23: Node.js >=22.16.0 enforced before Worker gateway setup.
+  DECISION #22: hasattr guard for _gw_status — Worker role has no status widget.
+  DECISION #21: workers.json delegation_rules seeded with canonical policy on Apply fixes.
+  Bug fix: "Port {port} refused" literal in log — missing f-prefix on f-string.
+  Removed duplicate check_node() with wrong major>=18 check; kept >22 or (==22 and minor>=16).
+
+v1.0.3 and earlier: see README.md
 """
 
 # OpenClawWinInstaller.py  –  v1.0.4
@@ -1637,7 +1653,7 @@ class OpenClawWinInstaller(OpenClawOperations):
 
     def _restart_ollama(self):
         """
-        DECISION #28 (v1.0.5): Restart Ollama dynamically.
+        DECISION #28 (v1.0.4): Restart Ollama dynamically.
 
         Fallback order (first match wins):
           1. Docker container  -- docker ps | grep ollama -> docker restart <n>
@@ -2244,13 +2260,13 @@ class OpenClawWinInstaller(OpenClawOperations):
         Token als Query-Parameter: auth.mode=token, _diag_api sendet bei GET
         keinen Auth-Header (SearXNG-Kompatibilitaet).
 
-        DECISION #22 (v1.0.5): Guard against Worker role.
+        DECISION #22 (v1.0.4): Guard against Worker role.
           _gw_status only exists on Lyra (HEAD) tab — _build_lyra_tab() creates it.
           On Worker machines _build_worker_tab() is used instead and _gw_status is
           never created. _restart_gateway() schedules this method via root.after()
           without role-checking, causing AttributeError on Worker startup.
           Fix: early return when _gw_status widget is absent.
-        DECISION #22 (v1.0.5): Guard against Worker role. _gw_status only
+        DECISION #22 (v1.0.4): Guard against Worker role. _gw_status only
           exists on HEAD tab. Worker tab never creates it.
         """
         if not hasattr(self, "_gw_status"):
@@ -3061,6 +3077,34 @@ class OpenClawWinInstaller(OpenClawOperations):
                                     f"{_agent.get('name','?')} ({_atype})"
                                 )
 
+                        # DECISION #32: Strip api_key + wrong model from local worker entries.
+                        # The Monitoring Tab may accidentally copy the openai api_key into
+                        # worker (type=worker) entries. A local OpenClaw worker never needs
+                        # an API key, and carrying the DeepSeek key there confuses Lyra:
+                        # both agents appear with identical model+key in SOUL.md.
+                        # Fix: for every type=worker entry, clear api_key and correct the
+                        # model to the known local model if it reads like a cloud model name.
+                        _CLOUD_MODELS = {"deepseek-chat", "gpt-4", "gpt-4o", "gpt-3.5-turbo",
+                                         "claude-3", "gemini-pro"}
+                        for _agent in _workers:
+                            if _agent.get("type") != "worker":
+                                continue
+                            if _agent.get("api_key", ""):
+                                _agent["api_key"] = ""
+                                _changed = True
+                                fixes_applied.append(
+                                    f"workers.json {_agent.get('name','?')}: api_key cleared "
+                                    f"(local worker needs no API key)"
+                                )
+                            _mdl = _agent.get("model", "")
+                            if any(_mdl.startswith(cm) for cm in _CLOUD_MODELS):
+                                _agent["model"] = "qwen2.5:0.5b"
+                                _changed = True
+                                fixes_applied.append(
+                                    f"workers.json {_agent.get('name','?')}: model "
+                                    f"{_mdl!r} → qwen2.5:0.5b (cloud model on local worker)"
+                                )
+
                         if _changed:
                             import shutil as _shutil
                             _shutil.copy2(workers_path, workers_path + f".bak_{int(time.time())}")
@@ -3806,7 +3850,7 @@ class OpenClawWinInstaller(OpenClawOperations):
           - ollama not visible in PowerShell: _refresh_path() must be called after
             Windows-native install (handled inside install_ollama_wsl)
 
-        v1.0.5 — Worker gateway setup (full parity with Lyra):
+        v1.0.4 — Worker gateway setup (full parity with Lyra):
           DECISION #23: Node.js >=22.16.0 checked + upgraded before gateway.
           DECISION #25: check_openclaw() + fix_openclaw_installation() run.
           DECISION #26: openclaw gateway install --force → proper gateway.cmd
@@ -3828,7 +3872,7 @@ class OpenClawWinInstaller(OpenClawOperations):
 
         self.log(f"   Model for {role}: {worker_model}")
 
-        # ── DECISION #23: Node.js check + upgrade (v1.0.5) ──────────
+        # ── DECISION #23: Node.js check + upgrade (v1.0.4) ──────────
         # Worker gateway requires Node.js >=22.16.0 (OpenClaw 2026.3.12+).
         self._set_status(f"{role}: Checking Node.js...")
         self.log(f"\n\U0001f4e6 Node.js check for {role}")
@@ -3863,7 +3907,7 @@ class OpenClawWinInstaller(OpenClawOperations):
                 node_ver, _ = self.check_node()
                 self.log(f"  Node.js {node_ver} installed ✓", "SUCCESS")
 
-        # ── DECISION #25: OpenClaw install check (v1.0.5) ────────────
+        # ── DECISION #25: OpenClaw install check (v1.0.4) ────────────
         # OpenClaw npm package must be present on the Worker — it provides
         # the gateway process (dist/index.js). Previously assumed to always
         # be installed; broke silently after npm uninstall/reinstall.
@@ -3919,7 +3963,7 @@ class OpenClawWinInstaller(OpenClawOperations):
         else:
             self.log("  gateway.cmd still missing — patch_gateway_cmd will create stub",
                      "WARNING")
-        # ── DECISION #27: write/fix openclaw.json (v1.0.5) ────────
+        # ── DECISION #27: write/fix openclaw.json (v1.0.4) ────────
         # openclaw onboard may write an incomplete openclaw.json that
         # lacks gateway.mode=local — causing 'Gateway start blocked'.
         # Always call write_openclaw_config() which merges correct values

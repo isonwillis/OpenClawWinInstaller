@@ -1,6 +1,6 @@
 # OpenClawWinInstaller
 
-> **Status: v1.0.4 — PRODUCTION READY** · 2026-03-20
+> **Status: v1.0.4 — PRODUCTION READY** · 2026-03-30
 
 A fully automated Windows installer that sets up **OpenClaw** with a local LLM (LYRA via Ollama).  
 After running the script, LYRA is immediately ready to use — no manual configuration, no token issues, no approval prompts.
@@ -17,7 +17,7 @@ From v1.0.4 the system also supports **external LLM agents** (OpenAI-compatible 
 *"One click and LYRA lives – the rest is history"* 🌀
 
 - ✅ 50+ components automatically installed
-- ✅ 67+ edge cases fixed and documented
+- ✅ 75+ edge cases fixed and documented
 - ✅ 3-stage fallback strategies
 - ✅ Unified agent registry: workers + external LLMs in one interface
 - ✅ Per-agent delegation rules — LYRA knows when to use which agent
@@ -26,6 +26,7 @@ From v1.0.4 the system also supports **external LLM agents** (OpenAI-compatible 
 - ✅ Worker + Task Server auto-start on every app launch
 - ✅ LYRA knows her agents — persistent registry, direct exec access
 - ✅ External LLM delegation: DeepSeek, OpenAI-compatible APIs
+- ✅ DeepSeek API — verified working exec pattern (curl.exe + .ps1 + HTTP_STATUS check)
 - ✅ Dynamic agent timeout — GUI dropdown 30min · 1h · 2h · 4h · 8h · 24h
 - ✅ undici 300s hardcoded timeout patched — synced to GUI setting
 - ✅ Hardware-aware config: timeout + model from HardwareProfile
@@ -41,6 +42,8 @@ From v1.0.4 the system also supports **external LLM agents** (OpenAI-compatible 
 ## Table of Contents
 
 - [What's New in v1.0.4](#whats-new-in-v104)
+  - [Observer Session 2026-03-30](#-observer-session-2026-03-30)
+  - [Observer Session 2026-03-25](#-observer-session-2026-03-25)
   - [Observer Session 2026-03-21](#-observer-session-2026-03-21)
   - [Observer Session 2026-03-20](#-observer-session-2026-03-20)
   - [Observer Session 2026-03-19](#-soulmd--observer-session-2026-03-19)
@@ -160,6 +163,49 @@ complete documentation.
 ---
 
 ## What's New in v1.0.4
+
+### 🔭 Observer Session 2026-03-30
+
+#### 🧹 DECISION #37 & #38 — `ollama pull` Log completely clean
+
+**Root cause:** `ollama pull` outputs `ESC[K` (Erase-to-End-of-Line) and `\x08` (Backspace). PowerShell strips `ESC`, leaving bare `[K`. Backspace is not whitespace — survives `strip()` — was logged as empty `❌` line.
+
+**Fix 1 — `strip_ansi` extended (DECISION #37):** Added `|\[[0-9;?]*[A-Za-z]` (bare `[` sequences) and `|[\x00-\x08...]` (control chars incl. backspace) to both `strip_ansi()` definitions.
+
+**Fix 2 — ordering fix in `run_powershell_live` (DECISION #38):** `strip_ansi` was called at log time — after level decision. Changed to `s = strip_ansi(line.strip())` as first step — control-char-only lines become `""` → filtered before level logic.
+
+#### 🐛 Additional bug fixes (2026-03-30)
+
+| Bug | Fix |
+|---|---|
+| `NameError: primary_short` in `_build_bootstrap_content()` | Added config-read block — same pattern as `_build_soul_content()` |
+| Gateway not reachable after 60s (Step 16) | `/api/health` → 404 since 2026.3.1. Fixed: try `/health` first |
+| ANSI escapes in `ollama pull` log | `strip_ansi()` not applied before logging — fixed ordering |
+| `nvidia-smi [WinError 2]` | Try `C:\Windows\System32\nvidia-smi.exe` before bare name |
+| Test prompt `HTTP 404` (Step 16) | No REST `/api/chat` endpoint. Fixed: log `Gateway running (WebSocket mode)` |
+
+#### ❌ `strip_ansi` after level decision — NEVER REINTRODUCE
+**Fix:** Always `s = strip_ansi(line.strip())` as first step (DECISION #38).
+
+---
+
+### 🔭 Observer Session 2026-03-25
+
+#### 🔑 DECISION #35 & #36 — DeepSeek API: Root Cause Found and Fixed
+
+**Root cause:** `$env:DEEPSEEK_API_KEY` is set in the user's PowerShell profile but the Gateway Scheduled Task does **not** inherit user env vars → empty Bearer token → `"auth header format should be Bearer sk-..."`.
+
+**Only working pattern (verified 2026-03-25):** Read `api_key` live from `workers.json`, write body to `.json` file, call `curl.exe -w "\nHTTP_STATUS:%{http_code}"`, execute via `powershell -ExecutionPolicy Bypass -File "C:\...\script.ps1"`. Verify `HTTP_STATUS:200` in output.
+
+#### ❌ `$env:DEEPSEEK_API_KEY` in exec — NEVER REINTRODUCE
+**Fix:** Read api_key live from `workers.json` (DECISION #35/36).
+
+#### 🔧 Additional fixes
+- **DECISION #32:** `api_key` + cloud model stripped from `type=worker` entries on Apply fixes
+- **DECISION #31:** `sessions.json` deleted before gateway restart
+- **DECISION #30:** `_check_session_errors()` — observer auto-triggers on 3+ consecutive LLM errors
+
+---
 
 ### 🔭 Observer Session 2026-03-21
 
