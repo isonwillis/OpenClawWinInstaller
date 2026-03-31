@@ -235,21 +235,6 @@ ARCHITECTURAL DECISIONS  (read before changing anything)
     Fix: _build_agent_registry_section() now injects workers.json read pattern into SOUL.md.
     Also: seeded delegation_rules for type=openai corrected in _apply_fixes_and_update().
 
-37. strip_ansi extended with bare [K and control chars (2026-03-30)
-    ollama pull outputs ESC[K for Erase-to-End-of-Line. PowerShell strips the ESC prefix,
-    leaving bare "[K" which the previous regex did not match.
-    Additionally, ollama uses backspace \x08 for progress animation — not whitespace,
-    so strip() does not remove it, and lo="" causes wrong ERROR level assignment.
-    Fix: added r"|\\[[0-9;?]*[A-Za-z]" (bare [ sequences) and
-         r"|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]" (all control chars incl. backspace)
-    to both strip_ansi() definitions in this module.
-
-38. strip_ansi ordering in run_powershell_live (2026-03-30)
-    strip_ansi was called at log time (after level decision) — too late.
-    Control-char-only lines had lo="" → no level match → ERROR → empty ❌ in log.
-    Fix: s = strip_ansi(line.strip()) as first step, before level decision.
-    If s is empty after strip_ansi, line is skipped by "if not s: continue".
-
 36. DeepSeek API — only working exec pattern (verified 2026-03-25)
     Broken approaches in Gateway exec context:
       ❌ $env:DEEPSEEK_API_KEY         → empty in Scheduled Task, produces invalid Bearer token
@@ -296,77 +281,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ─────────────────────────────────────────────────────────────────────────────
 # Central utility functions — used by all modules
 # ─────────────────────────────────────────────────────────────────────────────
-
-_ANSI_RE = None
-
-def strip_ansi(text: str) -> str:
-    """Removes ANSI escape sequences and terminal control codes.
-    Compiled once and cached for performance.
-    """
-    global _ANSI_RE
-    if _ANSI_RE is None:
-        import re as _re
-        _ANSI_RE = _re.compile(
-            r"\x1b\[[0-9;?]*[a-zA-Z]"
-            r"|\x1b\([A-Z]"
-            r"|\x1b[=>]"
-            r"|\x1b\[[?][0-9]+[hl]"
-            r"|\r"
-            r"|\[[0-9;?]*[A-Za-z]"         # bare [ sequences without ESC (PowerShell artefact)
-        )
-    return _ANSI_RE.sub("", text)
-
-
-def diag_api(url: str, timeout: int = 8,
-             method: str = "GET",
-             data: dict | None = None,
-             api_key: str = "") -> tuple[int, dict | str]:
-    """Central HTTP helper — no external dependencies.
-    Returns (status_code, body). status_code = -1 on connection error.
-    Follows 301/302/307/308 redirects. Replaces localhost->127.0.0.1.
-    """
-    import urllib.parse, urllib.request, urllib.error
-    url = url.replace("//localhost:", "//127.0.0.1:")
-    for _ in range(5):
-        try:
-            body_bytes = json.dumps(data).encode("utf-8") if data else None
-            headers    = ({"User-Agent": "LyraMonitor/1.0",
-                           "Accept":     "application/json, text/html, */*"}
-                          if method == "GET" else
-                          {"Content-Type": "application/json",
-                           "User-Agent":   "LyraMonitor/1.0"})
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
-            req = urllib.request.Request(
-                url, data=body_bytes, method=method, headers=headers)
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                raw = r.read(32_000).decode("utf-8", errors="replace").strip()
-                for c in [raw, raw.lstrip("\ufeff"), raw.split("\n", 1)[-1]]:
-                    try:
-                        return r.status, json.loads(c)
-                    except Exception:
-                        continue
-                return r.status, raw
-        except urllib.error.HTTPError as e:
-            if e.code in (301, 302, 307, 308):
-                loc = e.headers.get("Location", "")
-                if loc:
-                    p   = urllib.parse.urlparse(url)
-                    url = f"{p.scheme}://{p.netloc}{loc}" if loc.startswith("/") else loc
-                    continue
-            try:
-                body = e.read(2000).decode("utf-8", errors="replace")
-            except Exception:
-                body = ""
-            try:
-                return e.code, json.loads(body)
-            except Exception:
-                return e.code, body
-        except Exception as e:
-            return -1, str(e)
-    return -1, "Too many redirects"
-
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Central utility functions — used by all modules
@@ -1258,6 +1172,9 @@ class OpenClawConfig:
                     f"    STATUS: Kein HTTP-Endpunkt — Erreichbarkeit via Prozesscheck.\n"
                     f"    PRÜFEN: exec → wmic process where \"name='powershell.exe'\" get CommandLine\n"
                     f"            'lyra_observer' im Output → läuft | nicht vorhanden → gestoppt\n"
+                    f"    STARTEN: exec → powershell -ExecutionPolicy Bypass -File \"C:\\Python\\Projects\\ClawBotInstaller\\lyra_observer.ps1\"\n"
+                    f"    STOPPEN: exec → powershell -ExecutionPolicy Bypass -File \"C:\\Python\\Projects\\ClawBotInstaller\\lyra_observer_stop.ps1\"\n"
+                    f"    NICHT: Online nach Repository suchen — Observer ist LOKAL: C:\\Python\\Projects\\ClawBotInstaller\\lyra_observer.ps1\n"
                     f"    NICHT: HTTP-Request versuchen (port=0, kein Server)\n"
                     f"    NICHT: claude_code Tasks senden — Observer läuft eigenständig\n"
                 )
@@ -1372,6 +1289,11 @@ class OpenClawConfig:
                 "    \u2705 powershell -ExecutionPolicy Bypass -File \"C:\\\\Users\\\\scari\\\\.openclaw\\\\workspace\\\\script.ps1\" \u2192 l\u00e4uft\n"
                 "    \u2705 curl.exe in .ps1 \u2192 liefert HTTP_STATUS im Output \u2192 kein stilles Scheitern m\u00f6glich\n\n"
                 "  \u274c ABSOLUT VERBOTEN: API-Key aus dem Ged\u00e4chtnis verwenden oder erfinden!\n"
+                "  \u274c ABSOLUT VERBOTEN: Eigenes DeepSeek-Skript schreiben statt diesem Template!\n"
+                "    Eigene Skripte führen zu Loop (falsche Parameter, falscher Pfad).\n"
+                "    Dieses Template ist VERIFIZIERT — nur Prompt in Schritt 2 ersetzen.\n"
+                "  \u274c BEI HTTP_STATUS:000 nach task submit: Netzwerk-Problem, NICHT Skript-Fehler.\n"
+                "    Maximal 1x retry nach 30s. Bei 3x HTTP_STATUS:000: Test-NetConnection api.deepseek.com 443\n"
                 "    Key IMMER live aus workers.json lesen \u2014 nie aus der Erinnerung!\n\n"
                 "  \u274c KEY NICHT SEPARAT LESEN \u2014 NIEMALS SO:\n"
                 "    exec: powershell -Command \"$w = Get-Content \\\"$env:USERPROFILE\\.openclaw\\workers.json\\\" ...\"\n"
@@ -2379,6 +2301,31 @@ class OpenClawConfig:
 "Der Heartbeat-Ping enthält den Text: \"Read HEARTBEAT.md if it exists\".\n"
 "Direkte User-Fragen (z.B. \"was ist dein Ziel?\", \"wer bist du?\", \"was machst du?\")\n"
 "NIEMALS mit HEARTBEAT_OK beantworten — immer eine echte inhaltliche Antwort geben.\n"
+"\n"
+"---\n"
+"\n"
+"## Autonomes Handeln\n"
+"\n"
+"LYRA handelt autonom. Keine Rückfragen bei laufenden Aufgaben.\n"
+"Wenn eine Aufgabe mehrere Tools erfordert — alle Tools sequenziell ausführen.\n"
+"Erst am Ende der Kette zusammenfassen, nie mittendrin pausieren.\n"
+"\n"
+"REGEL — Tool-Ketten:\n"
+"  1. Aufgabe empfangen → sofort mit erstem Tool beginnen.\n"
+"  2. Jedes Tool-Ergebnis direkt als Input für den nächsten Schritt verwenden.\n"
+"  3. Bei fehlendem Tool: einrichten (exec: pip/winget/npm install) und weiterarbeiten.\n"
+"  4. Bei Fehler: einmal selbst korrigieren, dann kurz berichten und fortfahren.\n"
+"  5. NIEMALS: 'Soll ich weitermachen?' oder 'Bestätigen Sie bitte' fragen.\n"
+"\n"
+"REGEL — Modell für autonome Tool-Ketten (>3 Schritte):\n"
+"  qwen2.5:7b/3b bricht Tool-Ketten ab und wartet auf Bestätigung — zu klein.\n"
+"  Empfohlen: glm-4.7-flash (30B) oder qwen2.5:14b.\n"
+"  Wechsel via Installer → Lyra Config Tab → Primary LLM Dropdown.\n"
+"\n"
+"REGEL — Fehlende Tools und Software:\n"
+"  Fehlt ein Python-Paket: exec → pip install --break-system-packages <paket>\n"
+"  Fehlt ein CLI-Tool: exec → winget install <tool>\n"
+"  Immer autonom installieren, nie nachfragen.\n"
 "\n"
 "---\n"
 "\n"
