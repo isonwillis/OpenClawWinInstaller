@@ -2327,6 +2327,26 @@ class OpenClawConfig:
 "  Fehlt ein CLI-Tool: exec → winget install <tool>\n"
 "  Immer autonom installieren, nie nachfragen.\n"
 "\n"
+"REGEL — edit-Tool schlägt fehl (\"Could not find exact text\"):\n"
+"  Ursache: Whitespace, Encoding oder Zeilenumbrüche stimmen nicht exakt überein.\n"
+"  Vorgehen:\n"
+"    1. Versuch: old_string-Kontext anpassen (mehr oder weniger Zeilen).\n"
+"    2. Versuch: write-Tool mit vollständigem neuen Datei-Inhalt verwenden.\n"
+"  \u274c ABSOLUT VERBOTEN: del / Remove-Item auf .py-Dateien die importiert werden.\n"
+"  \u274c VERBOTEN: 3. edit-Versuch mit identischem old_string — derselbe Fehler kommt wieder.\n"
+"  Begründung: del zerstört alle \"from <modul> import ...\" Ketten in anderen Skripten.\n"
+"              write überschreibt atomisch ohne Import-Ketten zu zerstören.\n"
+"\n"
+"REGEL — Python-Dateien niemals löschen:\n"
+"  \u274c ABSOLUT VERBOTEN: .py-Datei löschen wenn andere Skripte sie importieren.\n"
+"  Vor jedem del auf .py: exec → grep -r \"import <modul>\" im Workspace.\n"
+"  Wenn Treffer: write statt del. Immer.\n"
+"\n"
+"REGEL — Dict-Key-Zugriff debuggen:\n"
+"  Vor dict['key']['nested'] immer zuerst keys() ausgeben:\n"
+"    exec → python -c \"import json; d=json.load(open('file.json')); print(list(d.keys()))\"\n"
+"  Schlüssel niemals aus dem Gedächtnis annehmen — JSON-Struktur kann sich ändern.\n"
+"\n"
 "---\n"
 "\n"
 "## Machine role hierarchy\n"
@@ -2545,6 +2565,12 @@ f"REGEL: Wenn {primary_short} 3x hintereinander Timeout → Fallback-Modell wäh
 "4. Führe erst dann den korrigierten Code aus\n"
 "\n"
 "REGEL: Derselbe Code + derselbe Fehler = falsche Klasse oder falsche API. Nie Wiederholung.\n"
+"\n"
+"REGEL — edit-Tool Sonderfall (DECISION #37 — 2026-04-02):\n"
+"  edit \"Could not find exact text\" 2x hintereinander = Encoding-Problem, kein Logikfehler.\n"
+"  \u2192 write-Tool mit vollständigem Datei-Inhalt. Kein drittes edit. Kein del.\n"
+"  Erkennungszeichen Loop: edit schlägt fehl \u2192 exec python \u2192 KeyError/ImportError \u2192 edit schlägt fehl.\n"
+"  Ausweg: write (überschreibt) statt del (zerstört).\n"
 "\n"
 "---\n"
 "\n"
@@ -4126,8 +4152,31 @@ class LyraHeadServer:
             return False
 
     def _trigger_claude(self, reason: str):
-        """Start claude non-interactively via PowerShell (CREATE_NO_WINDOW)."""
+        """Start claude non-interactively with -p prompt (DECISION #38).
+
+        DECISION #38: claude must be called with -p <prompt> + project cwd.
+        Without -p, claude opens interactive TUI; with stdin=DEVNULL it sees
+        EOF immediately and exits without doing anything useful.
+        Without cwd=project_dir, CLAUDE.md is not loaded.
+        """
         self.log(f"[Watcher] Triggering claude — {reason}", "INFO")
+        project_dir = os.path.join(
+            os.path.expanduser("~"),
+            "Python", "Projects", "ClawBotInstaller"
+        )
+        prompt = (
+            "Passiver Observer-Zyklus (automatisch ausgeloest durch Watcher).\n"
+            "1. Lies C:\\Users\\scari\\.openclaw\\workspace\\memory\\ — alle Dateien "
+            "der letzten 24 Stunden.\n"
+            "2. Suche nach [CORRECTION] und [SOUL-UPDATE-VORSCHLAG] Tags.\n"
+            "3. Lies C:\\Users\\scari\\.openclaw\\workspace\\SOUL.md und "
+            "C:\\Users\\scari\\.openclaw\\workers.json.\n"
+            "4. Wende alle gefundenen Verbesserungen auf beide Tracks an "
+            "(SOUL.md + OpenClawConfigManagement.py).\n"
+            "5. Schreibe Log nach "
+            "C:\\Python\\Projects\\ClawBotInstaller\\ClaudeCode\\logs\\.\n"
+            "6. Beende danach."
+        )
         try:
             appdata = os.environ.get("APPDATA", "")
             for candidate in [
@@ -4138,13 +4187,17 @@ class LyraHeadServer:
                 if os.path.isfile(candidate) or candidate == "claude":
                     subprocess.Popen(
                         ["powershell.exe", "-NoProfile", "-ExecutionPolicy",
-                         "Bypass", "-Command", f'& "{candidate}"'],
+                         "Bypass", "-Command",
+                         f'Set-Location -LiteralPath \'{project_dir}\'; '
+                         f'& "{candidate}" -p \'{prompt}\' '
+                         f'--allowedTools Bash,Read,Write,Edit,Glob,Grep'],
                         stdin=subprocess.DEVNULL,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
+                        cwd=project_dir,
                         creationflags=0x08000000,
                     )
-                    self.log("[Watcher] claude launched", "SUCCESS")
+                    self.log("[Watcher] claude -p launched (non-interactive)", "SUCCESS")
                     return
             self.log("[Watcher] claude executable not found — skipping", "WARNING")
         except Exception as e:
