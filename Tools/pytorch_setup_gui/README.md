@@ -2,12 +2,12 @@
 
 **Version:** 1.1.1  
 **Files:**
-- `pytorch_setup_gui.py` — Windows-only installer (original)
-- `pytorch_setup_gui_wsl.py` — Complete edition with WSL2 support *(current active file)*
+- `pytorch_setup_gui.py` — Current active file (Windows + WSL2 support)
+- `pytorch_setup_gui_wsl.py` — Previous filename (renamed)
 
 **Lines:** 3,769  
 **Python:** 3.8+ (Windows) / 3.10+ (WSL2)  
-**Run:** `python pytorch_setup_gui_wsl.py`
+**Run:** `python pytorch_setup_gui.py`
 
 ---
 
@@ -24,7 +24,7 @@ CUDA version detection, and mode-dependent package configuration. Supports two p
 ## Architecture — Classes & Functions
 
 ```
-pytorch_setup_gui_wsl.py
+pytorch_setup_gui.py
 │
 ├── ensure_package(package_name)              L.30    Auto-pip-installs missing dependencies
 ├── safe_str(obj)                             L.68    Unicode-safe string converter
@@ -338,7 +338,7 @@ passed to GUI via `root.after(0, callback)`. Log queue drained every 100ms.
 ## Running
 
 ```bash
-python pytorch_setup_gui_wsl.py
+python pytorch_setup_gui.py
 ```
 
 Window: 1200×800, resizable (min 1000×700), centered on startup.
