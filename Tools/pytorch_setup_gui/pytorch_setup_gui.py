@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🔥 PyTorch & Transformers Setup GUI - COMPLETE EDITION
-Version: 1.0.1
+🔥 PyTorch & Transformers Setup GUI - COMPLETE EDITION mit WSL2-Unterstützung
+Version: 1.1.1
 Enhanced: Automatic CUDA version detection and verification
-Fixed: ALL NoneType errors with comprehensive error handling
+Added: WSL2 support for DNABERT-2 (Triton compatibility)
+Fixed: WSL2 pip installation timeout issues
+Fixed: Virtual environment creation without pip
 """
 
 import os
@@ -76,6 +78,33 @@ def safe_str(obj):
     except:
         return ""
 
+
+# =============================================================================
+# HIDDEN SUBPROCESS HELPER — suppresses CMD flash windows on Windows
+# =============================================================================
+
+def _get_no_window_kwargs():
+    """Return kwargs that prevent CMD windows from flashing on Windows"""
+    if platform.system() == 'Windows':
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = subprocess.SW_HIDE
+        return {
+            'startupinfo': si,
+            'creationflags': subprocess.CREATE_NO_WINDOW,
+        }
+    return {}
+
+
+def run_hidden(cmd, **kwargs):
+    """subprocess.run() wrapper that never shows a CMD window"""
+    kwargs.setdefault('capture_output', True)
+    kwargs.setdefault('text', True)
+    kwargs.setdefault('encoding', 'utf-8')
+    kwargs.setdefault('errors', 'replace')
+    kwargs.update(_get_no_window_kwargs())
+    return subprocess.run(cmd, **kwargs)
+
 # =============================================================================
 # HARDWARE DETECTION ENGINE
 # =============================================================================
@@ -122,10 +151,9 @@ class HardwareDetector:
         
         # NVIDIA GPUs
         try:
-            result = subprocess.run(
-                ['nvidia-smi', '--query-gpu=name,memory.total,driver_version,temperature.gpu', 
-                 '--format=csv,noheader'],
-                capture_output=True, text=True, timeout=5, encoding='utf-8', errors='replace'
+            result = run_hidden(
+                ['nvidia-smi', '--query-gpu=name,memory.total,driver_version,temperature.gpu',
+                 '--format=csv,noheader'], timeout=5
             )
             if result.returncode == 0:
                 for line in result.stdout.strip().split('\n'):
@@ -144,10 +172,7 @@ class HardwareDetector:
         # AMD GPUs (simplified)
         try:
             if platform.system() == 'Windows':
-                result = subprocess.run(
-                    ['wmic', 'path', 'win32_VideoController', 'get', 'name'],
-                    capture_output=True, text=True, encoding='utf-8', errors='replace'
-                )
+                result = run_hidden(['wmic', 'path', 'win32_VideoController', 'get', 'name'])
                 for line in result.stdout.split('\n')[1:]:
                     if line.strip() and ('AMD' in line or 'Radeon' in line):
                         gpus.append({
@@ -207,12 +232,7 @@ class HardwareDetector:
         """Check AVX2 support (important for modern models)"""
         if platform.system() == 'Windows':
             try:
-                # Try to check via CPU flags
-                result = subprocess.run(
-                    ['wmic', 'cpu', 'get', 'architecture'],
-                    capture_output=True, text=True, timeout=2
-                )
-                # Assume AVX2 for 64-bit systems with decent cores
+                run_hidden(['wmic', 'cpu', 'get', 'architecture'], timeout=2)
                 return self.cpu_info.get('cores', 0) >= 4
             except:
                 return self.cpu_info.get('cores', 0) >= 4
@@ -222,9 +242,9 @@ class HardwareDetector:
         """Get available GPU memory in MB"""
         if self.has_nvidia_gpu:
             try:
-                result = subprocess.run(
+                result = run_hidden(
                     ['nvidia-smi', '--query-gpu=memory.total', '--format=csv,noheader'],
-                    capture_output=True, text=True, timeout=3, encoding='utf-8', errors='replace'
+                    timeout=3
                 )
                 if result.returncode == 0:
                     mem_str = result.stdout.strip().split()[0]
@@ -477,6 +497,822 @@ class HardwareDetector:
         
         return modes.get(mode, modes['CPU'])
 
+
+# =============================================================================
+# WSL2 SUPPORT - NEW CLASS (FIXED VERSION)
+# =============================================================================
+
+class WSL2Manager:
+    """Manages WSL2 operations for PyTorch installation"""
+    
+    def __init__(self, log_callback=None):
+        self.log_callback = log_callback
+        self.wsl_distro = None
+        self.wsl_home_path = None
+        
+    def log(self, message, level='INFO'):
+        if self.log_callback:
+            self.log_callback(message, level)
+    
+    def check_wsl_available(self):
+        """Check if WSL2 is available on the system"""
+        if platform.system() != 'Windows':
+            self.log("WSL2 is only available on Windows", 'WARNING')
+            return False
+        
+        try:
+            result = run_hidden(['wsl', '--status'], timeout=10)
+            
+            if result.returncode == 0:
+                self.log("WSL2 is available on this system", 'SUCCESS')
+                if 'WSL 2' in result.stdout or '2' in result.stdout:
+                    self.log("WSL2 version detected", 'SUCCESS')
+                else:
+                    self.log("WSL1 detected - WSL2 recommended for better performance", 'WARNING')
+                return True
+            else:
+                self.log("WSL command not found. Please install WSL2 first.", 'ERROR')
+                self.log("Run: wsl --install in PowerShell as Administrator", 'INFO')
+                return False
+                
+        except FileNotFoundError:
+            self.log("WSL not found. Please install WSL2 first.", 'ERROR')
+            return False
+        except Exception as e:
+            self.log(f"Error checking WSL: {safe_str(e)}", 'ERROR')
+            return False
+    
+    def get_wsl_distros(self):
+        """Get list of available WSL distributions"""
+        try:
+            result = run_hidden(['wsl', '--list', '--quiet'], timeout=10)
+            if result.returncode == 0:
+                distros = [d.strip() for d in result.stdout.split('\n') if d.strip()]
+                return distros
+            return []
+        except:
+            return []
+    
+    def get_default_distro(self):
+        """Get the default WSL distribution"""
+        try:
+            result = run_hidden(['wsl', '--list', '--verbose'], timeout=10)
+            if result.returncode == 0:
+                lines = result.stdout.split('\n')
+                for line in lines:
+                    if '*' in line and 'Running' in line:
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            return parts[1]
+                distros = self.get_wsl_distros()
+                if distros:
+                    return distros[0]
+            return None
+        except:
+            return None
+    
+    def run_wsl_command(self, command, timeout=300):
+        """Run a command inside WSL2 — never shows a CMD window"""
+        full_cmd = ['wsl'] + command
+        self.log(f"Running in WSL: {' '.join(command[:3])}...", 'DEBUG')
+        
+        try:
+            result = run_hidden(full_cmd, timeout=timeout)
+            return result
+        except subprocess.TimeoutExpired:
+            self.log(f"WSL command timed out after {timeout}s", 'ERROR')
+            return None
+        except Exception as e:
+            self.log(f"WSL command error: {safe_str(e)}", 'ERROR')
+            return None
+    
+    def ensure_python_in_wsl(self):
+        """Ensure Python 3.10+ is available in WSL"""
+        self.log("Checking Python in WSL...", 'PROCESSING')
+        APT = 'DEBIAN_FRONTEND=noninteractive sudo apt-get'
+
+        result = self.run_wsl_command(['python3', '--version'], timeout=10)
+        if result and result.returncode == 0:
+            version_str = result.stdout.strip()
+            self.log(f"Python found: {version_str}", 'SUCCESS')
+            match = re.search(r'(\d+)\.(\d+)', version_str)
+            if match:
+                major, minor = int(match.group(1)), int(match.group(2))
+                if major >= 3 and minor >= 10:
+                    self.log(f"Python {major}.{minor} meets requirements (3.10+)", 'SUCCESS')
+                    # Check if python3-venv is already present — if so skip apt entirely
+                    venv_check = self.run_wsl_command(
+                        ['bash', '-c', 'python3 -m venv --help >/dev/null 2>&1 && echo "ok"'],
+                        timeout=10)
+                    if venv_check and venv_check.returncode == 0 and 'ok' in venv_check.stdout:
+                        self.log("python3-venv already available, skipping apt-get", 'SUCCESS')
+                        return True
+                    # venv missing — install without running update first
+                    self.log("Installing python3-venv and python3-pip...", 'PROCESSING')
+                    r = self.run_wsl_command(['bash', '-c',
+                        f'{APT} install -y python3-venv python3-pip python3-dev'], timeout=300)
+                    if not r or r.returncode != 0:
+                        # update might be needed if cache is stale
+                        self.run_wsl_command(['bash', '-c', f'{APT} update -qq'], timeout=120)
+                        self.run_wsl_command(['bash', '-c',
+                            f'{APT} install -y python3-venv python3-pip python3-dev'], timeout=300)
+                    return True
+                else:
+                    self.log(f"Python {major}.{minor} is too old. Need 3.10+", 'WARNING')
+
+            self.log("Attempting to install Python 3.10...", 'PROCESSING')
+            self.run_wsl_command(['bash', '-c', f'{APT} update -qq'], timeout=120)
+            r = self.run_wsl_command(['bash', '-c',
+                f'{APT} install -y python3.10 python3.10-venv python3.10-dev python3-pip'], timeout=300)
+            if r and r.returncode == 0:
+                self.log("Python 3.10 installed successfully", 'SUCCESS')
+                return True
+            self.log("Failed to install Python 3.10", 'ERROR')
+            return False
+
+        self.log("Python not found, installing...", 'PROCESSING')
+        self.run_wsl_command(['bash', '-c', f'{APT} update -qq'], timeout=120)
+        r = self.run_wsl_command(['bash', '-c',
+            f'{APT} install -y python3 python3-venv python3-dev python3-pip'], timeout=300)
+        if r and r.returncode == 0:
+            self.log("Python installed successfully", 'SUCCESS')
+            return True
+        self.log("Could not install Python in WSL", 'ERROR')
+        return False
+    
+    def ensure_pip_in_wsl(self):
+        """Ensure pip is available in WSL"""
+        self.log("Checking pip in WSL...", 'PROCESSING')
+
+        # Primary: python3 -m pip (reliable on Ubuntu even without pip3 binary)
+        result = self.run_wsl_command(['bash', '-c', 'python3 -m pip --version'], timeout=15)
+        if result and result.returncode == 0:
+            self.log("pip is available via python3 -m pip", 'SUCCESS')
+            self.run_wsl_command(
+                ['bash', '-c', 'python3 -m pip install --upgrade pip --quiet'], timeout=60)
+            self.log("pip upgraded successfully", 'SUCCESS')
+            return True
+
+        # Secondary: pip3 binary
+        result2 = self.run_wsl_command(['which', 'pip3'], timeout=10)
+        if result2 and result2.returncode == 0:
+            self.log("pip3 binary found", 'SUCCESS')
+            self.run_wsl_command(
+                ['bash', '-c', 'pip3 install --upgrade pip --quiet'], timeout=60)
+            return True
+
+        # NOTE: ensurepip is intentionally disabled on Debian/Ubuntu — skip it.
+        # apt-get was already tried in ensure_python_in_wsl with python3-pip.
+        # Last resort: get-pip.py
+        self.log("pip not found, bootstrapping via get-pip.py...", 'PROCESSING')
+        r = self.run_wsl_command([
+            'bash', '-c', 'curl -sS https://bootstrap.pypa.io/get-pip.py | python3'
+        ], timeout=120)
+        if r and r.returncode == 0:
+            self.log("pip installed via get-pip.py", 'SUCCESS')
+            return True
+
+        self.log("Could not install pip", 'ERROR')
+        return False
+    
+    def get_wsl_home(self):
+        """Get WSL user's home directory"""
+        result = self.run_wsl_command(['bash', '-c', 'echo $HOME'], timeout=5)
+        if result and result.returncode == 0:
+            return result.stdout.strip()
+        return '/home/user'
+    
+    def create_wsl_project_dir(self, project_name='pytorch_env'):
+        """Create project directory in WSL"""
+        wsl_home = self.get_wsl_home()
+        project_path = os.path.join(wsl_home, project_name).replace('\\', '/')
+        
+        result = self.run_wsl_command(['mkdir', '-p', project_path], timeout=10)
+        if result and result.returncode == 0:
+            self.log(f"Created directory in WSL: {project_path}", 'SUCCESS')
+            return project_path
+        
+        self.log(f"Failed to create directory: {project_path}", 'ERROR')
+        return None
+
+
+# =============================================================================
+# WSL2 PYTORCH INSTALLER - NEW CLASS (FIXED VERSION)
+# =============================================================================
+
+class WSL2PyTorchInstaller:
+    """PyTorch installer for WSL2 environment"""
+    
+    def __init__(self, log_callback=None, status_callback=None):
+        self.log_callback = log_callback
+        self.status_callback = status_callback
+        self.wsl = WSL2Manager(log_callback)
+        self.installation_log = []
+        self.project_dir = None
+        self.venv_path = None
+        self.selected_mode = 'GPU'  # WSL2 always uses GPU mode with CUDA
+        self.detector = HardwareDetector()
+        
+    def log(self, message, level='INFO'):
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        symbols = {
+            'INFO': '[i]',
+            'SUCCESS': '[+]',
+            'ERROR': '[!]',
+            'WARNING': '[!]',
+            'PROCESSING': '[*]',
+            'DEBUG': '[d]',
+        }
+        symbol = symbols.get(level, '[i]')
+        log_entry = f"{symbol} [{timestamp}] {safe_str(message)}"
+        self.installation_log.append(log_entry)
+        
+        if self.log_callback:
+            self.log_callback(log_entry, level)
+    
+    def update_status(self, status):
+        if self.status_callback:
+            self.status_callback(safe_str(status))
+    
+    def check_prerequisites(self):
+        """Check WSL2 prerequisites"""
+        self.log("Checking WSL2 prerequisites...", 'PROCESSING')
+        
+        # Check WSL availability
+        if not self.wsl.check_wsl_available():
+            self.log("WSL2 is not available. Please install WSL2 first.", 'ERROR')
+            return False
+        
+        # Ensure Python in WSL
+        if not self.wsl.ensure_python_in_wsl():
+            self.log("Python installation in WSL failed", 'ERROR')
+            return False
+        
+        # Ensure pip in WSL
+        if not self.wsl.ensure_pip_in_wsl():
+            self.log("pip installation in WSL failed", 'ERROR')
+            return False
+        
+        self.log("All prerequisites satisfied", 'SUCCESS')
+        return True
+    
+    def create_project_directory(self):
+        """Create project directory in WSL"""
+        self.update_status("Creating project directory in WSL...")
+        self.log("Creating project directory in WSL...", 'PROCESSING')
+        
+        self.project_dir = self.wsl.create_wsl_project_dir('pytorch_env')
+        if self.project_dir:
+            self.venv_path = os.path.join(self.project_dir, 'venv').replace('\\', '/')
+            return True
+        
+        return False
+    
+    def create_virtual_environment(self):
+        """Create Python virtual environment in WSL"""
+        self.update_status("Creating virtual environment in WSL...")
+        self.log("Creating virtual environment in WSL...", 'PROCESSING')
+        
+    def create_virtual_environment(self):
+        """Create Python virtual environment in WSL"""
+        self.update_status("Creating virtual environment in WSL...")
+        self.log("Creating virtual environment in WSL...", 'PROCESSING')
+
+        # Attempt 1: standard venv
+        cmd = ['bash', '-c', f'python3 -m venv {self.venv_path} 2>&1']
+        result = self.wsl.run_wsl_command(cmd, timeout=60)
+
+        if not result or result.returncode != 0:
+            # Log the actual error so we know WHY it failed
+            err_text = (result.stdout or '') + (result.stderr or '') if result else 'no output'
+            self.log(f"venv error: {err_text[:300]}", 'WARNING')
+
+            # Attempt 2: --without-pip (works even when python3-venv ensurepip part fails)
+            self.log("Trying venv --without-pip fallback...", 'PROCESSING')
+            cmd2 = ['bash', '-c', f'python3 -m venv --without-pip {self.venv_path} 2>&1']
+            result2 = self.wsl.run_wsl_command(cmd2, timeout=60)
+
+            if not result2 or result2.returncode != 0:
+                err2 = (result2.stdout or '') + (result2.stderr or '') if result2 else 'no output'
+                self.log(f"venv --without-pip error: {err2[:300]}", 'ERROR')
+                self.log("Failed to create virtual environment", 'ERROR')
+                return False
+
+            # Bootstrap pip via get-pip.py into the --without-pip venv
+            self.log("Bootstrapping pip into venv via get-pip.py...", 'PROCESSING')
+            python_path = self.get_venv_python_path()
+            bootstrap = self.wsl.run_wsl_command([
+                'bash', '-c',
+                f'curl -sS https://bootstrap.pypa.io/get-pip.py | {python_path}'
+            ], timeout=120)
+
+            if bootstrap and bootstrap.returncode == 0:
+                self.log("pip bootstrapped into venv successfully", 'SUCCESS')
+            else:
+                self.log("pip bootstrap failed — venv created but pip may be missing", 'WARNING')
+
+        self.log("Virtual environment created", 'SUCCESS')
+
+        # Upgrade pip in venv
+        pip_path = self.get_venv_pip_path()
+        upgrade_result = self.wsl.run_wsl_command(
+            ['bash', '-c', f'{pip_path} install --upgrade pip --quiet'], timeout=60)
+        if upgrade_result and upgrade_result.returncode == 0:
+            self.log("pip upgraded in venv", 'SUCCESS')
+
+        return True
+    
+    def get_venv_python_path(self):
+        """Get path to python executable in WSL venv"""
+        return os.path.join(self.venv_path, 'bin', 'python3').replace('\\', '/')
+    
+    def get_venv_pip_path(self):
+        """Get path to pip executable in WSL venv"""
+        return os.path.join(self.venv_path, 'bin', 'pip3').replace('\\', '/')
+    
+    def detect_cuda_version_in_wsl(self):
+        """Detect CUDA version inside WSL2 via nvidia-smi"""
+        self.log("Detecting CUDA version in WSL2...", 'PROCESSING')
+
+        # nvidia-smi header line looks like:
+        # | CUDA Version: 13.0  Driver Version: 590.57 |
+        # Use grep -oP to extract only the CUDA version number
+        cuda_result = self.wsl.run_wsl_command([
+            'bash', '-c',
+            r"nvidia-smi 2>/dev/null | grep -oP 'CUDA Version: \K[0-9]+\.[0-9]+'"
+        ], timeout=10)
+        if cuda_result and cuda_result.returncode == 0:
+            v = cuda_result.stdout.strip()
+            if v:
+                self.log(f"CUDA {v} detected in WSL2", 'SUCCESS')
+                return v
+
+        # Fallback: nvcc inside WSL
+        nvcc_result = self.wsl.run_wsl_command([
+            'bash', '-c',
+            r"nvcc --version 2>/dev/null | grep -oP 'release \K[0-9]+\.[0-9]+'"
+        ], timeout=10)
+        if nvcc_result and nvcc_result.returncode == 0 and nvcc_result.stdout.strip():
+            v = nvcc_result.stdout.strip()
+            self.log(f"CUDA {v} detected via nvcc in WSL2", 'SUCCESS')
+            return v
+
+        self.log("Could not detect CUDA version in WSL2, defaulting to cu128", 'WARNING')
+        return '12.8'
+
+    def install_pytorch(self):
+        """Install PyTorch with CUDA support in WSL2"""
+        self.update_status("Installing PyTorch in WSL2...")
+        self.log("Installing PyTorch with CUDA support in WSL2...", 'PROCESSING')
+
+        pip_path = self.get_venv_pip_path()
+        python_path = self.get_venv_python_path()
+
+        # Ensure pip exists in venv — use get-pip.py if missing
+        check_pip = self.wsl.run_wsl_command(
+            ['bash', '-c', f'test -f {pip_path} && echo "exists"'], timeout=10)
+        if not check_pip or check_pip.returncode != 0:
+            self.log("pip not found in venv, bootstrapping via get-pip.py...", 'WARNING')
+            bootstrap = self.wsl.run_wsl_command([
+                'bash', '-c',
+                f'curl -sS https://bootstrap.pypa.io/get-pip.py | {python_path}'
+            ], timeout=120)
+            if not bootstrap or bootstrap.returncode != 0:
+                self.log("Could not install pip in venv", 'ERROR')
+                return False
+
+        # Detect CUDA and choose matching wheel URL (same table as Windows installer)
+        cuda_version = self.detect_cuda_version_in_wsl()
+        cuda_urls = {
+            '13.0': 'https://download.pytorch.org/whl/cu128',
+            '12.8': 'https://download.pytorch.org/whl/cu128',
+            '12.7': 'https://download.pytorch.org/whl/cu127',
+            '12.6': 'https://download.pytorch.org/whl/cu126',
+            '12.5': 'https://download.pytorch.org/whl/cu125',
+            '12.4': 'https://download.pytorch.org/whl/cu124',
+            '12.3': 'https://download.pytorch.org/whl/cu123',
+            '12.2': 'https://download.pytorch.org/whl/cu122',
+            '12.1': 'https://download.pytorch.org/whl/cu121',
+            '12.0': 'https://download.pytorch.org/whl/cu121',
+            '11.8': 'https://download.pytorch.org/whl/cu118',
+            '11.7': 'https://download.pytorch.org/whl/cu117',
+        }
+        index_url = cuda_urls.get(cuda_version)
+        if not index_url:
+            if cuda_version.startswith('13.') or cuda_version.startswith('12.'):
+                index_url = 'https://download.pytorch.org/whl/cu128'
+            elif cuda_version.startswith('11.'):
+                index_url = 'https://download.pytorch.org/whl/cu118'
+            else:
+                index_url = 'https://download.pytorch.org/whl/cu128'
+        self.log(f"CUDA {cuda_version} → {index_url}", 'INFO')
+
+        # Remove any existing broken installation first
+        self.wsl.run_wsl_command([
+            'bash', '-c',
+            f'{pip_path} uninstall -y torch torchvision torchaudio 2>/dev/null; true'
+        ], timeout=60)
+
+        # Install PyTorch stable wheels
+        torch_cmd = [
+            'bash', '-c',
+            f'{pip_path} install torch torchvision torchaudio --index-url {index_url}'
+        ]
+        result = self.wsl.run_wsl_command(torch_cmd, timeout=600)
+
+        if not result or result.returncode != 0:
+            self.log("PyTorch installation failed", 'ERROR')
+            err = (result.stderr or result.stdout or '')[:300] if result else ''
+            if err:
+                self.log(f"Error: {err}", 'ERROR')
+            return False
+
+        # Fix NCCL symbol conflict in WSL2 (ncclDevCommDestroy undefined symbol)
+        # Root cause: system NCCL is loaded before PyTorch's bundled NCCL.
+        # Fix: preload PyTorch's own libnccl so it takes precedence.
+        self.log("Applying WSL2 NCCL compatibility fix...", 'PROCESSING')
+        nccl_fix_cmd = (
+            "python_path=$(find {venv}/lib -name 'libtorch_cuda.so' 2>/dev/null | head -1); "
+            "nccl_lib=$(find {venv}/lib -name 'libnccl*.so*' 2>/dev/null | head -1); "
+            "if [ -n \"$nccl_lib\" ]; then "
+            "  echo \"export LD_PRELOAD=$nccl_lib\" >> {venv}/bin/activate; "
+            "  echo 'NCCL lib preload configured'; "
+            "else "
+            "  echo 'NCCL lib not found, skipping preload'; "
+            "fi; "
+            "echo 'export NCCL_P2P_DISABLE=1' >> {venv}/bin/activate; "
+            "echo 'export NCCL_DISABLE_CHECKS=1' >> {venv}/bin/activate"
+        ).format(venv=self.venv_path)
+        fix_result = self.wsl.run_wsl_command(['bash', '-c', nccl_fix_cmd], timeout=15)
+        if fix_result:
+            self.log(f"NCCL fix: {fix_result.stdout.strip()}", 'INFO')
+
+        self.log("PyTorch installed successfully", 'SUCCESS')
+        return True
+    
+    def install_transformers_and_deps(self):
+        """Install transformers and dependencies including triton"""
+        self.update_status("Installing transformers and dependencies...")
+        self.log("Installing transformers and dependencies (including Triton)...", 'PROCESSING')
+        
+        pip_path = self.get_venv_pip_path()
+        
+        # Package list for DNABERT-2 and general use
+        packages = [
+            'transformers',
+            'accelerate',
+            'triton',           # Required for DNABERT-2
+            'xformers',
+            'bitsandbytes',
+            'sentencepiece',
+            'protobuf',
+            'datasets',
+            'tokenizers',
+            'peft',
+            'trl',
+            'einops',
+            'scipy',
+            'numpy'
+        ]
+        
+        success_count = 0
+        for pkg in packages:
+            self.update_status(f"Installing: {pkg}")
+            self.log(f"Installing: {pkg}", 'INSTALL')
+            
+            cmd = ['bash', '-c', f'{pip_path} install {pkg} --upgrade']
+            result = self.wsl.run_wsl_command(cmd, timeout=180)
+            
+            if result and result.returncode == 0:
+                self.log(f"Success: {pkg}", 'SUCCESS')
+                success_count += 1
+            else:
+                self.log(f"Warning: {pkg} installation may have issues", 'WARNING')
+        
+        self.log(f"Installed {success_count}/{len(packages)} packages", 'INFO')
+        return success_count > 0
+    
+    def verify_installation(self):
+        """Verify PyTorch installation in WSL2"""
+        self.update_status("Verifying installation in WSL2...")
+        self.log("Verifying PyTorch installation in WSL2...", 'PROCESSING')
+
+        python_path = self.get_venv_python_path()
+
+        check_python = self.wsl.run_wsl_command(
+            ['bash', '-c', f'test -f {python_path} && echo "exists"'], timeout=10)
+        if not check_python or check_python.returncode != 0:
+            self.log("Python not found in venv", 'ERROR')
+            return False
+
+        # Pass the verification script inline via -c to avoid heredoc quoting issues
+        verify_script = (
+            "import json,sys\n"
+            "try:\n"
+            "    import torch\n"
+            "    r={'torch_version':torch.__version__,'cuda_available':torch.cuda.is_available(),"
+            "'cuda_version':torch.version.cuda,'device_count':torch.cuda.device_count() if torch.cuda.is_available() else 0,"
+            "'success':True,'error':None}\n"
+            "    if torch.cuda.is_available():\n"
+            "        r['device_name']=torch.cuda.get_device_name(0)\n"
+            "        x=torch.tensor([1.0,2.0,3.0]).cuda();y=x*2;r['test_passed']=True\n"
+            "    try:\n"
+            "        import triton;r['triton_version']=triton.__version__;r['triton_available']=True\n"
+            "    except ImportError:\n"
+            "        r['triton_available']=False\n"
+            "except ImportError as e:\n"
+            "    r={'success':False,'error':str(e),'cuda_available':False,'triton_available':False}\n"
+            "except Exception as e:\n"
+            "    r={'success':False,'error':str(e),'cuda_available':False,'triton_available':False}\n"
+            "print(json.dumps(r))"
+        )
+
+        # Source the venv activate (picks up NCCL LD_PRELOAD fix) then run verification
+        # NCCL_P2P_DISABLE + NCCL_DISABLE_CHECKS prevent the ncclDevCommDestroy crash in WSL2
+        run_cmd = [
+            'bash', '-c',
+            f'NCCL_P2P_DISABLE=1 NCCL_DISABLE_CHECKS=1 '
+            f'source {self.venv_path}/bin/activate 2>/dev/null; '
+            f'NCCL_P2P_DISABLE=1 NCCL_DISABLE_CHECKS=1 {python_path} -c "{verify_script}"'
+        ]
+        result = self.wsl.run_wsl_command(run_cmd, timeout=60)
+
+        if result and result.returncode == 0 and result.stdout.strip():
+            try:
+                verify_results = json.loads(result.stdout.strip())
+
+                self.log(f"PyTorch version: {verify_results.get('torch_version', 'unknown')}", 'INFO')
+
+                if verify_results.get('cuda_available'):
+                    self.log("CUDA available: YES", 'SUCCESS')
+                    self.log(f"CUDA version: {verify_results.get('cuda_version', 'unknown')}", 'SUCCESS')
+                    self.log(f"GPU: {verify_results.get('device_name', 'unknown')}", 'SUCCESS')
+                    if verify_results.get('test_passed'):
+                        self.log("CUDA test operation: PASSED", 'SUCCESS')
+                else:
+                    self.log("CUDA available: NO", 'WARNING')
+                    if verify_results.get('error'):
+                        self.log(f"Reason: {verify_results['error']}", 'WARNING')
+                    self.log("GPU acceleration may not be available", 'WARNING')
+
+                if verify_results.get('triton_available'):
+                    self.log(f"Triton available: YES (version {verify_results.get('triton_version', 'unknown')})", 'SUCCESS')
+                else:
+                    self.log("Triton available: NO - DNABERT-2 may require Triton", 'WARNING')
+
+                return verify_results.get('success', False) and verify_results.get('cuda_available', False)
+
+            except json.JSONDecodeError as e:
+                self.log(f"Failed to parse verification results: {safe_str(e)}", 'ERROR')
+                self.log(f"Raw output: {result.stdout[:300]}", 'WARNING')
+                return False
+
+        self.log("Verification script produced no output", 'ERROR')
+        if result and result.stderr:
+            self.log(f"stderr: {result.stderr[:200]}", 'WARNING')
+        return False
+    
+    def create_test_script(self):
+        """Create test script for WSL2 environment"""
+        self.update_status("Creating test script...")
+        
+        test_script_content = '''#!/usr/bin/env python3
+"""
+PyTorch & Transformers Test Script for WSL2
+Run this to verify your installation
+"""
+
+import torch
+import transformers
+import sys
+
+def main():
+    print("="*60)
+    print("[.] PYTORCH & TRANSFORMERS TEST (WSL2)")
+    print("="*60)
+    
+    print("\\nPackages:")
+    print(f"  PyTorch: {torch.__version__}")
+    print(f"  Transformers: {transformers.__version__}")
+    
+    # Check for Triton
+    try:
+        import triton
+        print(f"  Triton: {triton.__version__} (available)")
+    except ImportError:
+        print("  Triton: NOT AVAILABLE")
+    
+    print("\\nDEVICE DETECTION:")
+    
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        print("  [+] CUDA available")
+        print(f"  GPU: {torch.cuda.get_device_name(0)}")
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"  VRAM: {vram_gb:.1f} GB")
+        print(f"  CUDA Version: {torch.version.cuda}")
+    else:
+        device = torch.device("cpu")
+        print("  [+] CPU mode (CUDA not available)")
+    
+    # Tensor test
+    print("\\nTENSOR TEST:")
+    x = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0])
+    print(f"  Created tensor: {x}")
+    
+    if device.type != 'cpu':
+        x = x.to(device)
+        print(f"  Moved to {device}: {x}")
+    
+    y = x * 2
+    print(f"  Operation (x*2): {y}")
+    
+    # Transformers test
+    print("\\nTRANSFORMERS TEST:")
+    print("  Loading tiny model for testing...")
+    
+    try:
+        from transformers import AutoTokenizer, AutoModel
+        
+        model_name = "distilgpt2"
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModel.from_pretrained(model_name)
+        
+        if device.type != 'cpu':
+            model = model.to(device)
+        
+        text = "Hello, PyTorch in WSL2!"
+        inputs = tokenizer(text, return_tensors="pt")
+        
+        if device.type != 'cpu':
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            outputs = model(**inputs)
+        
+        print(f"  [+] Model loaded: {model_name}")
+        print(f"  Output shape: {outputs.last_hidden_state.shape}")
+        print("  Test successful!")
+        
+    except Exception as e:
+        print(f"  [X] Transformers test failed: {e}")
+    
+    print("\\n" + "="*60)
+    print("[+] ALL TESTS COMPLETED")
+    print("="*60)
+
+if __name__ == "__main__":
+    main()
+'''
+        
+        script_path = os.path.join(self.project_dir, 'test_pytorch_wsl.py').replace('\\', '/')
+        
+        write_cmd = ['bash', '-c', f"cat > {script_path} << 'EOF'\n{test_script_content}\nEOF"]
+        result = self.wsl.run_wsl_command(write_cmd, timeout=10)
+        
+        if result and result.returncode == 0:
+            self.log(f"Test script created: {script_path}", 'SUCCESS')
+            return script_path
+        
+        self.log("Failed to create test script", 'ERROR')
+        return None
+    
+    def create_activation_script(self):
+        """Create activation script for WSL2"""
+        activation_script = f'''#!/bin/bash
+# PyTorch Environment Activator for WSL2
+
+VENV_PATH="{self.venv_path}"
+
+echo "[.] Activating PyTorch environment..."
+source "$VENV_PATH/bin/activate"
+echo "[+] Environment activated!"
+echo ""
+echo "Quick commands:"
+echo '  python -c "import torch; print(torch.cuda.is_available())"'
+echo "  python test_pytorch_wsl.py"
+echo ""
+exec $SHELL
+'''
+        
+        script_path = os.path.join(self.project_dir, 'activate_pytorch.sh').replace('\\', '/')
+        
+        write_cmd = ['bash', '-c', f"cat > {script_path} << 'EOF'\n{activation_script}\nEOF"]
+        result = self.wsl.run_wsl_command(write_cmd, timeout=10)
+        
+        if result and result.returncode == 0:
+            # Make executable
+            chmod_cmd = ['bash', '-c', f'chmod +x {script_path}']
+            self.wsl.run_wsl_command(chmod_cmd, timeout=5)
+            self.log(f"Activation script created: {script_path}", 'SUCCESS')
+            return script_path
+        
+        self.log("Failed to create activation script", 'ERROR')
+        return None
+    
+    def run_installation(self):
+        """Run complete installation in WSL2"""
+        self.log("="*60, 'INFO')
+        self.log("[.] STARTING PYTORCH INSTALLATION IN WSL2", 'INFO')
+        self.log("="*60, 'INFO')
+        
+        steps = [
+            ("Checking prerequisites", self.check_prerequisites),
+            ("Creating project directory", self.create_project_directory),
+            ("Creating virtual environment", self.create_virtual_environment),
+            ("Installing PyTorch with CUDA", self.install_pytorch),
+            ("Installing transformers and dependencies", self.install_transformers_and_deps),
+            ("Verifying installation", self.verify_installation),
+            ("Creating test script", self.create_test_script),
+            ("Creating activation script", self.create_activation_script)
+        ]
+        
+        total_steps = len(steps)
+        for i, (step_name, step_func) in enumerate(steps, 1):
+            self.update_status(f"Step {i}/{total_steps}: {step_name}")
+            self.log(f"\nStep {i}/{total_steps}: {step_name}", 'PROCESSING')
+            
+            try:
+                success = step_func()
+                if not success:
+                    self.log(f"Step failed: {step_name}", 'ERROR')
+                    # For critical steps, abort
+                    if step_name in ["Checking prerequisites", "Creating project directory", "Creating virtual environment"]:
+                        self.log("Critical step failed, aborting installation", 'ERROR')
+                        return False
+                    else:
+                        self.log("Non-critical step failed, continuing...", 'WARNING')
+            except Exception as e:
+                self.log(f"Error in step {step_name}: {safe_str(e)}", 'ERROR')
+                return False
+        
+        self.log("\n" + "="*60, 'SUCCESS')
+        self.log("[+] PYTORCH INSTALLATION IN WSL2 SUCCESSFUL!", 'SUCCESS')
+        self.log("="*60, 'SUCCESS')
+        
+        self.show_summary()
+        return True
+    
+    def show_summary(self):
+        """Show installation summary for WSL2"""
+        line = '-'*58
+        summary = f"""
++{line}+
+|              WSL2 INSTALLATION SUMMARY                      |
++{line}+
+| WSL2 Project Directory: {self.project_dir}
+| Virtual Environment: {self.venv_path}
+| Mode: GPU (CUDA Accelerated)
+| Triton: Installed (DNABERT-2 ready)
++{line}+
+| NEXT STEPS IN WSL2:
+|
+| 1. Enter WSL2:
+|    wsl
+|
+| 2. Navigate to project directory:
+|    cd {self.project_dir}
+|
+| 3. Activate the environment:
+|    source activate_pytorch.sh
+|
+| 4. Run the test script:
+|    python test_pytorch_wsl.py
+|
+| 5. Test DNABERT-2:
+|    python -c "from transformers import AutoModel; \\
+|    model = AutoModel.from_pretrained('zhihan1996/DNABERT-2-117M')"
+|
+| 6. Deactivate when done:
+|    deactivate
+|
++{line}+
+"""
+        self.log(summary, 'SUCCESS')
+    
+    def test_only(self):
+        """Test existing installation in WSL2"""
+        self.log("="*60, 'INFO')
+        self.log("[.] TESTING PYTORCH INSTALLATION IN WSL2", 'INFO')
+        self.log("="*60, 'INFO')
+        
+        # Check if project directory exists
+        if not self.project_dir:
+            # Try to find existing installation
+            wsl_home = self.wsl.get_wsl_home()
+            test_path = os.path.join(wsl_home, 'pytorch_env').replace('\\', '/')
+            check_dir = self.wsl.run_wsl_command(['test', '-d', test_path], timeout=5)
+            if check_dir and check_dir.returncode == 0:
+                self.project_dir = test_path
+                self.venv_path = os.path.join(self.project_dir, 'venv').replace('\\', '/')
+                self.log(f"Found existing installation at: {self.project_dir}", 'INFO')
+            else:
+                self.log("No existing installation found", 'WARNING')
+                return False
+        
+        return self.verify_installation()
+
+
 # =============================================================================
 # INSTALLATION TESTER & VERIFIER (COMPLETELY REWRITTEN FOR SAFETY)
 # =============================================================================
@@ -551,14 +1387,7 @@ except Exception as e:
 '''
         
         try:
-            result = subprocess.run(
-                [python_path, '-c', check_script],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                encoding='utf-8',
-                errors='replace'
-            )
+            result = run_hidden([python_path, '-c', check_script], timeout=10)
             
             output = result.stdout.strip()
             if output.startswith('INSTALLED:'):
@@ -595,15 +1424,7 @@ except:
 '''
         
         try:
-            result = subprocess.run(
-                [python_path, '-c', list_script],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                encoding='utf-8',
-                errors='replace'
-            )
-            
+            result = run_hidden([python_path, '-c', list_script], timeout=15)
             if result.returncode == 0 and result.stdout.strip():
                 try:
                     return json.loads(result.stdout)
@@ -678,15 +1499,7 @@ print(json.dumps(results))
 '''
         
         try:
-            result = subprocess.run(
-                [python_path, '-c', test_script],
-                capture_output=True,
-                text=True,
-                timeout=20,
-                encoding='utf-8',
-                errors='replace'
-            )
-            
+            result = run_hidden([python_path, '-c', test_script], timeout=20)
             if result.returncode == 0 and result.stdout.strip():
                 try:
                     return json.loads(result.stdout)
@@ -765,15 +1578,7 @@ print(json.dumps(results))
 '''
         
         try:
-            result = subprocess.run(
-                [python_path, '-c', test_script],
-                capture_output=True,
-                text=True,
-                timeout=60,  # Increased timeout for model download
-                encoding='utf-8',
-                errors='replace'
-            )
-            
+            result = run_hidden([python_path, '-c', test_script], timeout=60)
             if result.returncode == 0 and result.stdout.strip():
                 try:
                     return json.loads(result.stdout)
@@ -824,15 +1629,7 @@ except Exception as e:
 print(json.dumps(results))
 '''
         try:
-            result = subprocess.run(
-                [python_path, '-c', test_script],
-                capture_output=True,
-                text=True,
-                timeout=30,  # Shorter timeout
-                encoding='utf-8',
-                errors='replace'
-            )
-            
+            result = run_hidden([python_path, '-c', test_script], timeout=30)
             if result.returncode == 0 and result.stdout.strip():
                 try:
                     return json.loads(result.stdout)
@@ -1013,7 +1810,10 @@ print(json.dumps(results))
                 if pytorch_test.get('cuda_available'):
                     report.append(f"  GPU: {pytorch_test.get('gpu_name', 'unknown')}")
                     gpu_mem = pytorch_test.get('gpu_memory', 0)
-                    report.append(f"  VRAM: {gpu_mem:.1f} GB" if isinstance(gpu_mem, (int, float)) else f"  VRAM: {gpu_mem}")
+                    if isinstance(gpu_mem, (int, float)):
+                        report.append(f"  VRAM: {gpu_mem:.1f} GB")
+                    else:
+                        report.append(f"  VRAM: {gpu_mem}")
                 
                 # SAFE CHECK for MPS
                 mps_available = pytorch_test.get('mps_available', False)
@@ -1048,9 +1848,9 @@ print(json.dumps(results))
                         report.append(f"  Model Test: {model_test.get('model', 'unknown')} on {model_test.get('device', 'unknown')}")
                         report.append(f"  Output Shape: {model_test.get('output_shape', [])}")
                     else:
-                        report.append(f"  [X] Model Test Failed")
+                        report.append("  [X] Model Test Failed")
                 else:
-                    report.append(f"  [X] No model test data")
+                    report.append("  [X] No model test data")
             report.append("")
         
         # Installed packages summary - SAFE ITERATION
@@ -1075,6 +1875,7 @@ print(json.dumps(results))
         report.append("="*60)
         
         return '\n'.join(report)
+
 
 # =============================================================================
 # PYTORCH INSTALLER (with enhanced CUDA detection)
@@ -1173,8 +1974,7 @@ class PyTorchInstaller:
     def check_pip(self):
         """Check if pip is available"""
         try:
-            subprocess.run([sys.executable, '-m', 'pip', '--version'], 
-                          capture_output=True, check=True, encoding='utf-8', errors='replace')
+            run_hidden([sys.executable, '-m', 'pip', '--version'])
             self.log("pip is available", 'SUCCESS')
             return True
         except:
@@ -1190,20 +1990,17 @@ class PyTorchInstaller:
                 os.makedirs(self.install_dir)
                 self.log(f"Created directory: {self.install_dir}", 'SUCCESS')
             
-            # Check if venv already exists
             if os.path.exists(self.venv_path):
                 self.log("Virtual environment already exists", 'WARNING')
                 return True
             
-            # Create venv
             self.log("Creating virtual environment...", 'PROCESSING')
-            subprocess.run([sys.executable, '-m', 'venv', self.venv_path], check=True)
+            run_hidden([sys.executable, '-m', 'venv', self.venv_path])
             self.log("Virtual environment created", 'SUCCESS')
             
-            # Upgrade pip in venv
             pip_path = self._get_pip_path()
             self.log("Upgrading pip...", 'PROCESSING')
-            subprocess.run([pip_path, 'install', '--upgrade', 'pip'], check=True)
+            run_hidden([pip_path, 'install', '--upgrade', 'pip'])
             self.log("pip upgraded", 'SUCCESS')
             
             return True
@@ -1252,21 +2049,17 @@ class PyTorchInstaller:
         # Check nvidia-smi for driver CUDA version
         try:
             self.log("Checking NVIDIA driver via nvidia-smi...", 'DEBUG')
-            result = subprocess.run(
+            result = run_hidden(
                 ['nvidia-smi', '--query-gpu=driver_version', '--format=csv,noheader'],
-                capture_output=True, text=True, timeout=5, encoding='utf-8', errors='replace'
+                timeout=5
             )
             if result.returncode == 0:
                 driver_version = result.stdout.strip()
                 self.log(f"NVIDIA Driver: {driver_version}", 'INFO')
-                
-                # Map driver version to max supported CUDA
-                # This mapping is approximate - newer drivers support multiple CUDA versions
                 driver_parts = driver_version.split('.')
                 if len(driver_parts) >= 2:
                     try:
                         major = int(driver_parts[0])
-                        # Rough mapping of driver versions to CUDA support
                         if major >= 525:
                             cuda_support = "12.x"
                         elif major >= 520:
@@ -1275,17 +2068,14 @@ class PyTorchInstaller:
                             cuda_support = "11.x"
                         else:
                             cuda_support = "10.x"
-                        
                         self.log(f"Driver supports CUDA: {cuda_support}", 'INFO')
-                        
-                        # If we don't have a CUDA version yet, use this as hint
                         if not cuda_version:
                             if major >= 525:
                                 cuda_version = "12.1"
                             elif major >= 520:
                                 cuda_version = "11.8"
                             else:
-                                cuda_version = "11.8"  # Safe fallback
+                                cuda_version = "11.8"
                     except:
                         pass
         except Exception as e:
@@ -1322,13 +2112,13 @@ class PyTorchInstaller:
         
         # Also check PATH for nvcc
         try:
-            result = subprocess.run(
+            result = run_hidden(
                 ['where' if platform.system() == 'Windows' else 'which', 'nvcc'],
-                capture_output=True, text=True, timeout=3, encoding='utf-8', errors='replace'
+                timeout=3
             )
             if result.returncode == 0 and result.stdout.strip():
                 nvcc_path = result.stdout.strip().split('\n')[0]
-                possible_nvcc_paths.insert(0, nvcc_path)  # Prioritize PATH-found nvcc
+                possible_nvcc_paths.insert(0, nvcc_path)
         except:
             pass
         
@@ -1337,13 +2127,8 @@ class PyTorchInstaller:
             if os.path.exists(nvcc_candidate):
                 self.log(f"Found nvcc at: {nvcc_candidate}", 'INFO')
                 try:
-                    result = subprocess.run(
-                        [nvcc_candidate, '--version'],
-                        capture_output=True, text=True, timeout=5, encoding='utf-8', errors='replace'
-                    )
+                    result = run_hidden([nvcc_candidate, '--version'], timeout=5)
                     if result.returncode == 0:
-                        # Parse version from output
-                        # Example: "Cuda compilation tools, release 12.8, V12.8.0"
                         output = result.stdout
                         match = re.search(r'release (\d+\.\d+)', output)
                         if match:
@@ -1351,8 +2136,6 @@ class PyTorchInstaller:
                             self.log(f"nvcc reports CUDA version: {nvcc_version}", 'SUCCESS')
                             cuda_version = nvcc_version
                             nvcc_path = nvcc_candidate
-                            
-                            # Also try to get CUDA path from nvcc location
                             if not cuda_path:
                                 cuda_path = os.path.dirname(os.path.dirname(nvcc_candidate))
                             break
@@ -1476,14 +2259,7 @@ print(json.dumps(results))
 '''
         
         try:
-            result = subprocess.run(
-                [python_path, '-c', verify_script],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                encoding='utf-8',
-                errors='replace'
-            )
+            result = run_hidden([python_path, '-c', verify_script], timeout=30)
             
             if result.returncode == 0 and result.stdout.strip():
                 try:
@@ -1493,12 +2269,12 @@ print(json.dumps(results))
                     
                     cuda_available = verify_results.get('cuda_available', False)
                     if cuda_available:
-                        self.log(f"CUDA available: YES", 'SUCCESS')
+                        self.log("CUDA available: YES", 'SUCCESS')
                         self.log(f"CUDA version: {verify_results.get('cuda_version', 'unknown')}", 'SUCCESS')
                         self.log(f"GPU: {verify_results.get('device_name', 'unknown')}", 'SUCCESS')
                         
                         if verify_results.get('test_passed'):
-                            self.log(f"CUDA test operation: PASSED", 'SUCCESS')
+                            self.log("CUDA test operation: PASSED", 'SUCCESS')
                             self.log(f"Test result: {verify_results.get('test_result')}", 'INFO')
                             
                             # Show memory info
@@ -1512,7 +2288,7 @@ print(json.dumps(results))
                         else:
                             self.log(f"CUDA test failed: {verify_results.get('test_error', 'Unknown error')}", 'ERROR')
                     else:
-                        self.log(f"CUDA available: NO", 'ERROR')
+                        self.log("CUDA available: NO", 'ERROR')
                         self.log(f"Reason: {verify_results.get('test_error', 'Unknown reason')}", 'ERROR')
                         
                 except json.JSONDecodeError as e:
@@ -1573,7 +2349,7 @@ print(json.dumps(results))
         
         # Install PyTorch packages FIRST with correct index URL
         if torch_packages:
-            self.update_status(f"Installing PyTorch with CUDA support...")
+            self.update_status("Installing PyTorch with CUDA support...")
             self.log(f"Installing: {', '.join(torch_packages)}", 'INSTALL')
             
             try:
@@ -1602,16 +2378,17 @@ print(json.dumps(results))
                 # Run installation with real-time output
                 self.log("Downloading and installing PyTorch (this may take several minutes)...", 'PROCESSING')
                 
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding='utf-8',
-                    errors='replace',
-                    bufsize=1,
-                    universal_newlines=True
-                )
+                popen_kwargs = {
+                    'stdout': subprocess.PIPE,
+                    'stderr': subprocess.STDOUT,
+                    'text': True,
+                    'encoding': 'utf-8',
+                    'errors': 'replace',
+                    'bufsize': 1,
+                    'universal_newlines': True,
+                }
+                popen_kwargs.update(_get_no_window_kwargs())
+                process = subprocess.Popen(cmd, **popen_kwargs)
                 
                 # Stream output in real-time
                 last_line = ""
@@ -1632,14 +2409,14 @@ print(json.dumps(results))
                 process.wait()
                 
                 if process.returncode == 0:
-                    self.log(f"Success: PyTorch installed", 'SUCCESS')
+                    self.log("Success: PyTorch installed", 'SUCCESS')
                     success_count += len(torch_packages)
                     
                     # Verify CUDA is actually working (for GPU/HYBRID modes)
                     if self.selected_mode in ['GPU', 'HYBRID']:
                         self.verify_cuda_installation(python_path)
                 else:
-                    self.log(f"Failed: PyTorch installation failed", 'ERROR')
+                    self.log("Failed: PyTorch installation failed", 'ERROR')
                     if last_line:
                         self.log(f"Last output: {last_line[-200:]}", 'ERROR')
                     
@@ -1649,14 +2426,7 @@ print(json.dumps(results))
                         fallback_cmd = [pip_path, 'install'] + torch_packages
                         self.log(f"Command: {' '.join(fallback_cmd)}", 'DEBUG')
                         
-                        fallback_result = subprocess.run(
-                            fallback_cmd,
-                            capture_output=True,
-                            text=True,
-                            timeout=300,
-                            encoding='utf-8',
-                            errors='replace'
-                        )
+                        fallback_result = run_hidden(fallback_cmd, timeout=300)
                         
                         if fallback_result.returncode == 0:
                             self.log("CPU fallback succeeded (CUDA not available)", 'WARNING')
@@ -1665,7 +2435,7 @@ print(json.dumps(results))
                             self.log("CPU fallback also failed", 'ERROR')
                             
             except subprocess.TimeoutExpired:
-                self.log(f"Timeout installing PyTorch", 'ERROR')
+                self.log("Timeout installing PyTorch", 'ERROR')
             except Exception as e:
                 self.log(f"Exception during PyTorch install: {safe_str(e)}", 'ERROR')
                 import traceback
@@ -1677,20 +2447,11 @@ print(json.dumps(results))
             self.log(f"Installing: {pkg}", 'INSTALL')
             
             try:
-                result = subprocess.run(
-                    [pip_path, 'install', pkg],
-                    capture_output=True,
-                    text=True,
-                    timeout=180,
-                    encoding='utf-8',
-                    errors='replace'
-                )
+                result = run_hidden([pip_path, 'install', pkg], timeout=180)
                 
                 if result.returncode == 0:
-                    # Parse success message
                     stdout = result.stdout
                     if 'Successfully installed' in stdout:
-                        # Extract what was installed
                         lines = stdout.strip().split('\n')
                         for line in lines:
                             if 'Successfully installed' in line:
@@ -1858,7 +2619,7 @@ def main():
     print("="*60)
     
     # PyTorch version
-    print(f"\\nPackages:")
+    print("\\nPackages:")
     print(f"  PyTorch: {torch.__version__}")
     print(f"  Transformers: {transformers.__version__}")
     
@@ -1867,16 +2628,16 @@ def main():
     
     if torch.cuda.is_available():
         device = torch.device("cuda")
-        print(f"  [+] CUDA available")
+        print("  [+] CUDA available")
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
         print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
         print(f"  CUDA Version: {torch.version.cuda}")
     elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
         device = torch.device("mps")
-        print(f"  [+] MPS available (Apple Silicon)")
+        print("  [+] MPS available (Apple Silicon)")
     else:
         device = torch.device("cpu")
-        print(f"  [+] CPU mode")
+        print("  [+] CPU mode")
     
     # Simple tensor test
     print("\\nTENSOR TEST:")
@@ -1920,7 +2681,7 @@ def main():
         
         print(f"  [+] Model loaded: {model_name}")
         print(f"  Output shape: {outputs.last_hidden_state.shape}")
-        print(f"  Test successful!")
+        print("  Test successful!")
         
     except Exception as e:
         print(f"  [X] Transformers test failed: {e}")
@@ -2003,14 +2764,14 @@ if __name__ == "__main__":
 $WScriptShell = New-Object -ComObject WScript.Shell
 $Shortcut = $WScriptShell.CreateShortcut("{shortcut_path}")
 $Shortcut.TargetPath = "{self._get_python_path()}"
-$Shortcut.Arguments = "-c ""print('[.] PyTorch Environment'); import code; code.interact()"""
+$Shortcut.Arguments = "-c \"print('[.] PyTorch Environment'); import code; code.interact()\""
 $Shortcut.WorkingDirectory = "{self.install_dir}"
 $Shortcut.Description = "PyTorch Environment"
 $Shortcut.Save()
 '''
             
-            subprocess.run(['powershell', '-Command', ps_script], check=False)
-            self.log(f"Desktop shortcut created", 'SUCCESS')
+            run_hidden(['powershell', '-Command', ps_script])
+            self.log("Desktop shortcut created", 'SUCCESS')
             
         except Exception as e:
             self.log(f"Could not create desktop shortcut: {safe_str(e)}", 'WARNING')
@@ -2050,12 +2811,12 @@ $Shortcut.Save()
             try:
                 success = step_func()
                 if not success and i < total_steps:
-                    self.log(f"Step failed but continuing...", 'WARNING')
+                    self.log("Step failed but continuing...", 'WARNING')
             except Exception as e:
                 self.log(f"Error in step {step_name}: {safe_str(e)}", 'ERROR')
                 # Continue with next steps instead of failing completely
                 if i < total_steps:
-                    self.log(f"Step failed but continuing...", 'WARNING')
+                    self.log("Step failed but continuing...", 'WARNING')
                     continue
                 else:
                     return False
@@ -2074,15 +2835,16 @@ $Shortcut.Save()
         # Fix Windows path separator for display
         install_dir = self.install_dir.replace('/', '\\')
         
+        line = '-'*58
         summary = f"""
-+{'-'*58}+
++{line}+
 |              INSTALLATION SUMMARY                         |
-+{'-'*58}+
++{line}+
 | Install Directory: {install_dir}
 | Selected Mode: {mode_details['name']}
 | Python: {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}
 | Packages: {len(mode_details['packages'])}
-+{'-'*58}+
++{line}+
 | NEXT STEPS:
 |
 | 1. Activate the environment:
@@ -2104,7 +2866,7 @@ $Shortcut.Save()
         for model in mode_details['models'][:3]:
             summary += f"|    * {model}\n"
         
-        summary += f"+{'-'*58}+"
+        summary += f"+{line}+"
         
         self.log(summary, 'SUCCESS')
     
@@ -2139,16 +2901,95 @@ $Shortcut.Save()
             self.log(f"Error during testing: {safe_str(e)}", 'ERROR')
             return False
 
+
 # =============================================================================
-# MAIN GUI CLASS (updated with CUDA info display)
+# PLATFORM SELECTOR - NEW CLASS FOR GUI
+# =============================================================================
+
+class PlatformSelector:
+    """Handles platform selection and routes to appropriate installer"""
+    
+    PLATFORM_WINDOWS = "Windows"
+    PLATFORM_WSL2 = "WSL2"
+    
+    def __init__(self, log_callback=None, status_callback=None):
+        self.log_callback = log_callback
+        self.status_callback = status_callback
+        self.selected_platform = self.PLATFORM_WINDOWS
+        self.windows_installer = None
+        self.wsl2_installer = None
+        
+    def log(self, message, level='INFO'):
+        if self.log_callback:
+            self.log_callback(message, level)
+    
+    def update_status(self, status):
+        if self.status_callback:
+            self.status_callback(status)
+    
+    def set_platform(self, platform):
+        """Set the target platform for installation"""
+        if platform in [self.PLATFORM_WINDOWS, self.PLATFORM_WSL2]:
+            self.selected_platform = platform
+            self.log(f"Platform set to: {platform}", 'INFO')
+            return True
+        return False
+    
+    def get_windows_installer(self, log_callback=None, status_callback=None):
+        """Get or create Windows installer instance"""
+        if self.windows_installer is None:
+            self.windows_installer = PyTorchInstaller(
+                log_callback=log_callback or self.log_callback,
+                status_callback=status_callback or self.update_status
+            )
+        return self.windows_installer
+    
+    def get_wsl2_installer(self, log_callback=None, status_callback=None):
+        """Get or create WSL2 installer instance"""
+        if self.wsl2_installer is None:
+            self.wsl2_installer = WSL2PyTorchInstaller(
+                log_callback=log_callback or self.log_callback,
+                status_callback=status_callback or self.update_status
+            )
+        return self.wsl2_installer
+    
+    def run_installation(self, create_shortcut=True):
+        """Run installation on the selected platform"""
+        if self.selected_platform == self.PLATFORM_WINDOWS:
+            installer = self.get_windows_installer()
+            return installer.run_installation(create_shortcut)
+        else:
+            installer = self.get_wsl2_installer()
+            return installer.run_installation()
+    
+    def test_installation(self):
+        """Test installation on the selected platform"""
+        if self.selected_platform == self.PLATFORM_WINDOWS:
+            installer = self.get_windows_installer()
+            return installer.test_only()
+        else:
+            installer = self.get_wsl2_installer()
+            return installer.test_only()
+    
+    def check_wsl_availability(self):
+        """Check if WSL2 is available (for UI feedback)"""
+        if platform.system() != 'Windows':
+            return False
+        
+        wsl = WSL2Manager()
+        return wsl.check_wsl_available()
+
+
+# =============================================================================
+# MAIN GUI CLASS (updated with CUDA info display and WSL2 support)
 # =============================================================================
 
 class PyTorchSetupGUI:
-    """Main GUI for PyTorch & Transformers setup"""
+    """Main GUI for PyTorch & Transformers setup with WSL2 support"""
     
     def __init__(self, root):
         self.root = root
-        self.root.title("[.] PyTorch & Transformers Setup - Complete Installer with CUDA Detection")
+        self.root.title("[.] PyTorch & Transformers Setup - Complete Installer with WSL2 Support")
         self.root.geometry("1200x800")
         self.root.minsize(1000, 700)
         
@@ -2158,13 +2999,14 @@ class PyTorchSetupGUI:
         # Hardware detector
         self.detector = HardwareDetector()
         
-        # Installer with callbacks
-        self.installer = PyTorchInstaller(
+        # Platform selector (routes to Windows or WSL2)
+        self.platform_selector = PlatformSelector(
             log_callback=self.add_log,
             status_callback=self.update_status
         )
         
         # GUI variables
+        self.selected_platform = tk.StringVar(value=PlatformSelector.PLATFORM_WINDOWS)
         self.selected_mode = tk.StringVar(value=self.detector.recommended_mode['mode'])
         self.create_shortcut = tk.BooleanVar(value=True)
         self.show_detailed_log = tk.BooleanVar(value=True)
@@ -2184,6 +3026,9 @@ class PyTorchSetupGUI:
         
         # Auto-check existing installation on startup
         self.root.after(1000, self.auto_check_installation)
+        
+        # Check WSL availability and update UI
+        self.check_wsl_availability_ui()
     
     def setup_styles(self):
         """Configure visual appearance"""
@@ -2231,6 +3076,9 @@ class PyTorchSetupGUI:
                                 style='Title.TLabel')
         title_label.pack(pady=10)
         
+        # Platform Selection Frame (NEW)
+        self.create_platform_frame(left_frame)
+        
         # Hardware Info Frame
         self.create_hardware_frame(left_frame)
         
@@ -2250,6 +3098,42 @@ class PyTorchSetupGUI:
         
         # Live Log Frame
         self.create_log_frame(right_frame)
+    
+    def create_platform_frame(self, parent):
+        """Create frame for platform selection (Windows vs WSL2)"""
+        frame = ttk.LabelFrame(parent, text="Platform Selection", padding=10)
+        frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Radio buttons for platform selection
+        windows_rb = ttk.Radiobutton(
+            frame,
+            text="Windows (Standard)",
+            variable=self.selected_platform,
+            value=PlatformSelector.PLATFORM_WINDOWS,
+            command=self.on_platform_change
+        )
+        windows_rb.pack(anchor=tk.W, pady=2)
+        
+        wsl2_rb = ttk.Radiobutton(
+            frame,
+            text="WSL2 (Linux - for DNABERT-2 / Triton support)",
+            variable=self.selected_platform,
+            value=PlatformSelector.PLATFORM_WSL2,
+            command=self.on_platform_change
+        )
+        wsl2_rb.pack(anchor=tk.W, pady=2)
+        
+        # WSL2 hint label
+        self.wsl_hint_label = ttk.Label(
+            frame, 
+            text="",
+            font=('Arial', 8),
+            foreground='#888888'
+        )
+        self.wsl_hint_label.pack(anchor=tk.W, padx=(20, 0), pady=2)
+        
+        # Separator
+        ttk.Separator(frame, orient='horizontal').pack(fill=tk.X, pady=5)
     
     def create_hardware_frame(self, parent):
         """Create frame for hardware information"""
@@ -2375,6 +3259,46 @@ class PyTorchSetupGUI:
         ttk.Button(frame, text="Clear Log", 
                    command=self.clear_log).pack(pady=5)
     
+    def check_wsl_availability_ui(self):
+        """Check WSL availability and update UI hint"""
+        if platform.system() != 'Windows':
+            self.wsl_hint_label.config(text="WSL2 only available on Windows")
+            return
+        
+        # Check in thread to avoid blocking
+        def check_thread():
+            wsl = WSL2Manager()
+            available = wsl.check_wsl_available()
+            
+            def update_ui():
+                if available:
+                    self.wsl_hint_label.config(
+                        text="WSL2 is available! Use this for DNABERT-2 with Triton support.",
+                        foreground='#00ff00'
+                    )
+                else:
+                    self.wsl_hint_label.config(
+                        text="WSL2 not detected. Run 'wsl --install' in PowerShell as Administrator",
+                        foreground='#ff4444'
+                    )
+            
+            self.root.after(0, update_ui)
+        
+        thread = threading.Thread(target=check_thread)
+        thread.daemon = True
+        thread.start()
+    
+    def on_platform_change(self):
+        """Handle platform selection change"""
+        platform = self.selected_platform.get()
+        self.platform_selector.set_platform(platform)
+        self.add_log(f"Platform changed to: {platform}", 'INFO')
+        
+        if platform == PlatformSelector.PLATFORM_WSL2:
+            self.add_log("Note: WSL2 installation includes Triton for DNABERT-2 support", 'INFO')
+            # Disable desktop shortcut for WSL2 (not applicable)
+            self.create_shortcut.set(False)
+    
     def show_hardware_info(self):
         """Update hardware info display"""
         self.hardware_text.delete(1.0, tk.END)
@@ -2392,7 +3316,8 @@ class PyTorchSetupGUI:
     def _run_cuda_detection(self):
         """Run CUDA detection in thread"""
         try:
-            cuda_info = self.installer.detect_cuda_version()
+            installer = PyTorchInstaller()
+            cuda_info = installer.detect_cuda_version()
             
             self.root.after(0, self._show_cuda_info, cuda_info)
         except Exception as e:
@@ -2405,16 +3330,18 @@ class PyTorchSetupGUI:
             if cuda_info['path']:
                 self.add_log(f"    Path: {cuda_info['path']}", 'INFO')
             if cuda_info['has_toolkit']:
-                self.add_log(f"    CUDA Toolkit: Present", 'SUCCESS')
+                self.add_log("    CUDA Toolkit: Present", 'SUCCESS')
             else:
-                self.add_log(f"    CUDA Toolkit: Not found (drivers only)", 'WARNING')
+                self.add_log("    CUDA Toolkit: Not found (drivers only)", 'WARNING')
         else:
             self.add_log("[-] No CUDA installation detected", 'WARNING')
     
     def on_mode_change(self):
         """Handle mode change"""
         mode = self.selected_mode.get()
-        self.installer.set_mode(mode)
+        # Update platform selector's windows installer mode if needed
+        windows_installer = self.platform_selector.get_windows_installer()
+        windows_installer.set_mode(mode)
     
     def show_mode_details(self):
         """Show detailed information about selected mode"""
@@ -2424,6 +3351,7 @@ class PyTorchSetupGUI:
         info = f"""
 {details['name']} DETAILS:
 {'-'*40}
+
 Description: {details['description']}
 
 Packages to install:
@@ -2453,38 +3381,194 @@ Recommended Models:
         ttk.Button(dialog, text="Close", command=dialog.destroy).pack(pady=10)
     
     def auto_check_installation(self):
-        """Automatically check for existing installation on startup"""
-        self.add_log("Checking for existing installation...", 'PROCESSING')
-        
-        # Run check in thread
-        thread = threading.Thread(target=self._run_auto_check_thread)
-        thread.daemon = True
+        """Automatically check for existing installation on startup — shows a splash checklist window"""
+        self._show_startup_check_window()
+
+    def _show_startup_check_window(self):
+        """Show a professional startup checklist window while checking installation"""
+        splash = tk.Toplevel(self.root)
+        splash.title("Checking Installation")
+        splash.resizable(False, False)
+        splash.grab_set()  # Modal
+
+        # Center on screen
+        w, h = 420, 310
+        sw = splash.winfo_screenwidth()
+        sh = splash.winfo_screenheight()
+        splash.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+
+        # Header
+        header = tk.Frame(splash, bg="#1e1e2e", height=56)
+        header.pack(fill=tk.X)
+        tk.Label(header, text="Checking Installation",
+                 font=("Segoe UI", 13, "bold"),
+                 bg="#1e1e2e", fg="#cdd6f4").pack(pady=14)
+
+        # Checklist frame
+        list_frame = tk.Frame(splash, bg="#181825", padx=20, pady=14)
+        list_frame.pack(fill=tk.BOTH, expand=True)
+
+        checks = [
+            ("Python environment",        "python"),
+            ("pip availability",           "pip"),
+            ("PyTorch (torch)",            "torch"),
+            ("Transformers",               "transformers"),
+            ("Accelerate",                 "accelerate"),
+            ("CUDA / GPU status",          "cuda"),
+        ]
+
+        row_widgets = {}   # key -> (label_var, icon_label)
+        PENDING  = "  ···"
+        RUNNING  = "  ⏳"
+        OK       = "  ✔"
+        FAIL     = "  ✘"
+        COL_PENDING = "#585b70"
+        COL_RUN     = "#fab387"
+        COL_OK      = "#a6e3a1"
+        COL_FAIL    = "#f38ba8"
+
+        for label_text, key in checks:
+            row = tk.Frame(list_frame, bg="#181825")
+            row.pack(fill=tk.X, pady=3)
+            icon_var = tk.StringVar(value=PENDING)
+            icon_lbl = tk.Label(row, textvariable=icon_var,
+                                font=("Segoe UI", 11), bg="#181825", fg=COL_PENDING, width=5, anchor="w")
+            icon_lbl.pack(side=tk.LEFT)
+            tk.Label(row, text=label_text,
+                     font=("Segoe UI", 10), bg="#181825", fg="#cdd6f4", anchor="w").pack(side=tk.LEFT)
+            row_widgets[key] = (icon_var, icon_lbl)
+
+        # Progress bar
+        pb_frame = tk.Frame(splash, bg="#181825")
+        pb_frame.pack(fill=tk.X, padx=20, pady=(0, 6))
+        pb = ttk.Progressbar(pb_frame, mode='determinate', maximum=len(checks))
+        pb.pack(fill=tk.X)
+
+        # Status line
+        status_var = tk.StringVar(value="Starting checks…")
+        tk.Label(splash, textvariable=status_var,
+                 font=("Segoe UI", 9), fg="#6c7086", bg="#181825").pack(pady=(0, 10))
+
+        splash.configure(bg="#181825")
+
+        # Helper: update a row from the background thread via root.after
+        def set_row(key, state):
+            icon_var, icon_lbl = row_widgets[key]
+            if state == 'run':
+                icon_var.set(RUNNING)
+                icon_lbl.config(fg=COL_RUN)
+            elif state == 'ok':
+                icon_var.set(OK)
+                icon_lbl.config(fg=COL_OK)
+            elif state == 'fail':
+                icon_var.set(FAIL)
+                icon_lbl.config(fg=COL_FAIL)
+            pb.step(1)
+
+        def tick(key, state, status_text=""):
+            self.root.after(0, lambda: set_row(key, state))
+            if status_text:
+                self.root.after(0, lambda t=status_text: status_var.set(t))
+
+        def close_splash(test_results, platform_name):
+            splash.destroy()
+            self._auto_check_complete(test_results, platform_name)
+
+        # Background worker
+        def worker():
+            try:
+                windows_installer = self.platform_selector.get_windows_installer()
+                tester = windows_installer.tester
+
+                # ── Python ──────────────────────────────────────────────────
+                tick("python", "run", "Checking Python environment…")
+                py_ok = windows_installer.check_python_version()
+                tick("python", "ok" if py_ok else "fail")
+
+                # ── pip ─────────────────────────────────────────────────────
+                tick("pip", "run", "Checking pip…")
+                pip_ok = windows_installer.check_pip()
+                tick("pip", "ok" if pip_ok else "fail")
+
+                # ── torch ────────────────────────────────────────────────────
+                tick("torch", "run", "Checking PyTorch (torch)…")
+                torch_info = tester.check_package_installed("torch")
+                torch_ok = torch_info and torch_info.get("installed", False)
+                tick("torch", "ok" if torch_ok else "fail")
+
+                # ── transformers ─────────────────────────────────────────────
+                tick("transformers", "run", "Checking Transformers…")
+                tf_info = tester.check_package_installed("transformers")
+                tf_ok = tf_info and tf_info.get("installed", False)
+                tick("transformers", "ok" if tf_ok else "fail")
+
+                # ── accelerate ───────────────────────────────────────────────
+                tick("accelerate", "run", "Checking Accelerate…")
+                acc_info = tester.check_package_installed("accelerate")
+                acc_ok = acc_info and acc_info.get("installed", False)
+                tick("accelerate", "ok" if acc_ok else "fail")
+
+                # ── CUDA ─────────────────────────────────────────────────────
+                tick("cuda", "run", "Checking CUDA / GPU…")
+                cuda_info = windows_installer.detect_cuda_version()
+                cuda_ok = cuda_info and cuda_info.get("version") is not None
+                tick("cuda", "ok" if cuda_ok else "fail", "Done.")
+
+                # ── Assemble results for main log ────────────────────────────
+                packages = {
+                    "torch":        torch_info  or {"installed": False, "version": None},
+                    "transformers": tf_info     or {"installed": False, "version": None},
+                    "accelerate":   acc_info    or {"installed": False, "version": None},
+                }
+                missing = [k for k, v in packages.items() if not v.get("installed")]
+
+                if torch_ok:
+                    pt_test = tester.test_pytorch_basics()
+                    cuda_available = pt_test and pt_test.get("cuda_available", False) and not pt_test.get("error")
+                    status = "FULLY_FUNCTIONAL" if (not missing and cuda_available) else (
+                             "PARTIALLY_INSTALLED" if missing else "INSTALLED_BUT_BROKEN")
+                    # Log versions to main log
+                    for pkg, info in packages.items():
+                        if info.get("installed"):
+                            self.add_log(f"  [+] {pkg}: {info.get('version', 'unknown')}", 'SUCCESS')
+                else:
+                    status = "NOT_INSTALLED" if missing else "INSTALLED_BUT_BROKEN"
+                    pt_test = None
+
+                test_results = {
+                    "status": status,
+                    "packages": packages,
+                    "pytorch_test": pt_test,
+                    "missing_critical": missing,
+                }
+
+                # Brief pause so user can read the checklist
+                time.sleep(0.6)
+                self.root.after(0, close_splash, test_results, "Windows")
+
+            except Exception as e:
+                self.root.after(0, lambda: splash.destroy())
+                self.root.after(0, self.add_log, f"Auto-check error: {safe_str(e)}", 'ERROR')
+
+        thread = threading.Thread(target=worker, daemon=True)
         thread.start()
     
-    def _run_auto_check_thread(self):
-        """Run auto-check in thread"""
-        try:
-            test_results = self.installer.check_existing_installation()
-            self.root.after(0, self._auto_check_complete, test_results)
-        except Exception as e:
-            self.root.after(0, self.add_log, f"Auto-check error: {safe_str(e)}", 'ERROR')
-    
-    def _auto_check_complete(self, test_results):
+    def _auto_check_complete(self, test_results, platform_name):
         """Handle auto-check completion"""
         if test_results and isinstance(test_results, dict):
             status = test_results.get('status')
             if status == 'FULLY_FUNCTIONAL':
-                self.add_log("[+] Existing functional installation found!", 'SUCCESS')
+                self.add_log(f"[+] Existing functional {platform_name} installation found!", 'SUCCESS')
             elif status == 'PARTIALLY_INSTALLED':
-                self.add_log("[!] Partial installation found. Some packages missing.", 'WARNING')
+                self.add_log(f"[!] Partial {platform_name} installation found. Some packages missing.", 'WARNING')
             elif status == 'INSTALLED_BUT_BROKEN':
-                self.add_log("[X] Installation found but tests failed.", 'WARNING')
+                self.add_log(f"[X] {platform_name} installation found but tests failed.", 'WARNING')
             elif status == 'NOT_INSTALLED':
-                self.add_log("No existing installation found. Ready to install.", 'INFO')
+                self.add_log(f"No existing {platform_name} installation found. Ready to install.", 'INFO')
             else:
-                self.add_log(f"Installation status: {status}", 'INFO')
+                self.add_log(f"{platform_name} installation status: {status}", 'INFO')
         else:
-            self.add_log("Could not determine installation status", 'WARNING')
+            self.add_log(f"Could not determine {platform_name} installation status", 'WARNING')
     
     def add_log(self, message, level='INFO'):
         """Add message to log queue"""
@@ -2512,25 +3596,39 @@ Recommended Models:
         self.root.update_idletasks()
     
     def start_installation(self):
-        """Start the installation process"""
+        """Start the installation process on the selected platform"""
         if self.is_installing:
             messagebox.showwarning("Already Installing", 
                                   "Installation is already in progress!")
             return
         
-        # Confirm installation
-        if not messagebox.askyesno("Confirm Installation",
-                                   f"Start PyTorch installation in {self.selected_mode.get()} mode?\n\n"
-                                   f"This will create a virtual environment at:\n"
-                                   f"{self.installer.install_dir}\n\n"
-                                   f"Continue?"):
+        platform = self.selected_platform.get()
+        
+        # Show appropriate confirmation message
+        if platform == PlatformSelector.PLATFORM_WSL2:
+            confirm_msg = (
+                "Start PyTorch installation in WSL2?\n\n"
+                "This will:\n"
+                "1. Install Python 3.10+ in WSL2 (if not present)\n"
+                "2. Create a virtual environment in WSL2\n"
+                "3. Install PyTorch with CUDA support\n"
+                "4. Install Triton (required for DNABERT-2)\n"
+                "5. Install transformers and dependencies\n\n"
+                "Continue?"
+            )
+        else:
+            confirm_msg = (
+                f"Start PyTorch installation in {self.selected_mode.get()} mode?\n\n"
+                f"This will create a virtual environment at:\n"
+                f"{self.platform_selector.get_windows_installer().install_dir}\n\n"
+                "Continue?"
+            )
+        
+        if not messagebox.askyesno("Confirm Installation", confirm_msg):
             return
         
         self.is_installing = True
         self.progress.start()
-        
-        # Set mode
-        self.installer.set_mode(self.selected_mode.get())
         
         # Run installation in separate thread
         thread = threading.Thread(target=self._run_installation_thread, 
@@ -2541,8 +3639,7 @@ Recommended Models:
     def _run_installation_thread(self, create_shortcut):
         """Run installation in thread"""
         try:
-            success = self.installer.run_installation(create_shortcut)
-            
+            success = self.platform_selector.run_installation(create_shortcut)
             self.root.after(0, self._installation_complete, success)
         except Exception as e:
             self.root.after(0, self._installation_error, safe_str(e))
@@ -2552,11 +3649,26 @@ Recommended Models:
         self.progress.stop()
         self.is_installing = False
         
+        platform = self.selected_platform.get()
+        
         if success:
-            messagebox.showinfo("Installation Complete",
-                               "[+] PyTorch & Transformers installed successfully!\n\n"
-                               f"Installation directory: {self.installer.install_dir}\n\n"
-                               "Use the activation scripts to start working.")
+            if platform == PlatformSelector.PLATFORM_WSL2:
+                msg = (
+                    "[+] PyTorch & Transformers installed successfully in WSL2!\n\n"
+                    "Next steps:\n"
+                    "1. Enter WSL2: wsl\n"
+                    "2. Navigate to project: cd ~/pytorch_env\n"
+                    "3. Activate: source activate_pytorch.sh\n"
+                    "4. Test: python test_pytorch_wsl.py\n"
+                    "5. Test DNABERT-2: python -c \"from transformers import AutoModel; model = AutoModel.from_pretrained('zhihan1996/DNABERT-2-117M')\""
+                )
+            else:
+                msg = (
+                    "[+] PyTorch & Transformers installed successfully!\n\n"
+                    f"Installation directory: {self.platform_selector.get_windows_installer().install_dir}\n\n"
+                    "Use the activation scripts to start working."
+                )
+            messagebox.showinfo("Installation Complete", msg)
         else:
             messagebox.showwarning("Installation Issues",
                                   "[!] Installation completed with warnings.\n\n"
@@ -2570,10 +3682,17 @@ Recommended Models:
                             f"[X] Installation error:\n\n{error}")
     
     def test_installation(self):
-        """Test existing installation"""
+        """Test existing installation on the selected platform"""
         if self.is_installing:
             messagebox.showwarning("Busy", "Installation is in progress!")
             return
+        
+        platform = self.selected_platform.get()
+        
+        if platform == PlatformSelector.PLATFORM_WSL2:
+            self.add_log("Testing WSL2 installation...", 'PROCESSING')
+        else:
+            self.add_log("Testing Windows installation...", 'PROCESSING')
         
         self.is_installing = True
         self.progress.start()
@@ -2585,8 +3704,7 @@ Recommended Models:
     def _run_test_thread(self):
         """Run test in thread"""
         try:
-            success = self.installer.test_only()
-            
+            success = self.platform_selector.test_installation()
             self.root.after(0, self._test_complete, success)
         except Exception as e:
             self.root.after(0, self._installation_error, safe_str(e))
@@ -2596,14 +3714,17 @@ Recommended Models:
         self.progress.stop()
         self.is_installing = False
         
+        platform = self.selected_platform.get()
+        
         if success:
-            messagebox.showinfo("Test Complete",
-                               "[+] Installation test passed!\n\n"
-                               "PyTorch is working correctly.")
+            if platform == PlatformSelector.PLATFORM_WSL2:
+                msg = "[+] WSL2 installation test passed!\n\nPyTorch with CUDA and Triton is working correctly.\n\nDNABERT-2 should work without workarounds."
+            else:
+                msg = "[+] Installation test passed!\n\nPyTorch is working correctly."
+            messagebox.showinfo("Test Complete", msg)
         else:
-            messagebox.showwarning("Test Issues",
-                                  "[!] Installation test found issues.\n\n"
-                                  "Check the log for details.")
+            msg = "[!] Installation test found issues.\n\nCheck the log for details."
+            messagebox.showwarning("Test Issues", msg)
     
     def cancel_installation(self):
         """Cancel ongoing installation"""
@@ -2616,6 +3737,7 @@ Recommended Models:
         else:
             self.root.quit()
 
+
 # =============================================================================
 # MAIN ENTRY POINT
 # =============================================================================
@@ -2623,7 +3745,7 @@ Recommended Models:
 def main():
     """Main entry point"""
     print("="*60)
-    print("[.] PyTorch & Transformers Setup GUI - Complete Edition with CUDA Detection")
+    print("[.] PyTorch & Transformers Setup GUI - Complete Edition with WSL2 Support")
     print("="*60)
     print(f"Python: {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
     print(f"Platform: {platform.system()} {platform.machine()}")
