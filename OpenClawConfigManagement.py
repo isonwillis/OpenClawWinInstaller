@@ -1932,6 +1932,24 @@ class OpenClawConfig:
             ]:
                 clean = clean.replace(old_line, "")
 
+            import re  # must be before first re.sub — scoping fix
+            # DECISION #40/#40b: Strip old Ollama wait-loop + warmup blocks (idempotent)
+            # Matches from the rem DECISION #40 comment through the warmup powershell line.
+            clean = re.sub(
+                r'rem DECISION #40[^\r\n]*[\r\n]+'
+                r'(?::wait_ollama[\r\n]+)?'
+                r'curl\.exe[^\r\n]*[\r\n]+'
+                r'if errorlevel[^\r\n]*[\r\n]+'
+                r'(?:[ \t]+[^\r\n]*[\r\n]+)*'
+                r'(?:\)[^\r\n]*[\r\n]+)?'
+                r'(?:echo \[gateway\] Ollama ready[^\r\n]*[\r\n]+)?'
+                r'(?:rem DECISION #40b[^\r\n]*[\r\n]+)?'
+                r'(?:echo \[gateway\] Pre-warm[^\r\n]*[\r\n]+)?'
+                r'(?:powershell[^\r\n]*Invoke-RestMethod[^\r\n]*[\r\n]+)?',
+                '',
+                clean,
+            )
+
             # ── Insert fresh ENV block after @echo off ───────────────────────
             node_opts_line = ""
             if preload_path:
@@ -1953,13 +1971,39 @@ class OpenClawConfig:
                 "SET OLLAMA_KEEP_ALIVE=10m\r\n"
                 # ⚠️  DECISION #20: undici 300s timeout fix
                 f"{node_opts_line}"
+                # DECISION #40: Ollama runs in Docker — container may start
+                # slower than the gateway. If Ollama is not reachable at startup,
+                # buildOllamaProvider() returns models:[] → cached → "Unknown model".
+                # Wait loop ensures Ollama is ready before gateway discovery runs.
+                "rem DECISION #40: Wait for Ollama (Docker) before starting gateway\r\n"
+                ":wait_ollama\r\n"
+                "curl.exe -s -o NUL -w \"%%{http_code}\" http://127.0.0.1:11434/api/tags 2>NUL | findstr \"200\" >NUL 2>&1\r\n"
+                "if errorlevel 1 (\r\n"
+                "    echo [gateway] Waiting for Ollama at http://127.0.0.1:11434 ...\r\n"
+                "    timeout /t 5 /nobreak >NUL\r\n"
+                "    goto wait_ollama\r\n"
+                ")\r\n"
+                "echo [gateway] Ollama ready.\r\n"
+                # DECISION #40b: Pre-warm the model before gateway starts.
+                # pi-embedded has a hardcoded 6e4ms (60s) lane timeout for gateway tool calls.
+                # Cold KV-cache init for contextTokens=131072 takes 53-58s, hitting the limit.
+                # Sending a warmup request here loads the model so the gateway's own
+                # startup-warmup gets an instant response instead of triggering a cold load.
+                # Model name is read dynamically from openclaw.json — survives model changes.
+                "rem DECISION #40b: Pre-warm model before gateway starts (avoids 60s lane timeout)\r\n"
+                "echo [gateway] Pre-warming model (may take ~60s on cold start)...\r\n"
+                "powershell -NoProfile -Command \""
+                "$cfg=Get-Content '$env:USERPROFILE\\.openclaw\\openclaw.json'|ConvertFrom-Json;"
+                "$m=($cfg.agents.defaults.model.primary -replace '^ollama/','');"
+                "$b='{\\\"model\\\":\\\"'+$m+'\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"Hi\\\"}],\\\"stream\\\":false}';"
+                "try{Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/chat' -Method POST -Body $b -ContentType 'application/json' -TimeoutSec 120|Out-Null;"
+                "Write-Host '[gateway] Model warmed up.'}catch{Write-Host '[gateway] Warmup note:' $_.Exception.Message}\"\r\n"
             )
 
-            import re
             if "@echo off" in clean.lower():
                 patched = re.sub(
                     r'@echo off\r?\n',
-                    env_block,
+                    lambda m: env_block,
                     clean, count=1, flags=re.IGNORECASE
                 )
             else:
@@ -2218,17 +2262,20 @@ class OpenClawConfig:
             if auth_model.startswith("ollama/"):
                 auth_model = auth_model[7:]
 
-            auth_profiles = [
-                {
-                    "id":       "ollama-local",
-                    "provider": "ollama",
-                    "label":    f"Ollama local ({auth_model})",
-                    "baseURL":  "http://127.0.0.1:11434",
-                    "model":    auth_model,
-                    "apiKey":   "",
-                    "isDefault": True,
+            # DECISION #39: OpenClaw 2026.4.1 changed auth-profiles.json from array
+            # to versioned object format. resolveProviderApiKey() reads
+            # store.profiles["ollama:default"].key — old array format returns null
+            # → provider not registered → "Unknown model" on every gateway start.
+            auth_profiles = {
+                "version": 1,
+                "profiles": {
+                    "ollama:default": {
+                        "type":     "api_key",
+                        "provider": "ollama",
+                        "key":      "ollama-local",
+                    }
                 }
-            ]
+            }
             try:
                 if os.path.isfile(auth_path):
                     shutil.copy2(auth_path, auth_path + f".bak_{int(time.time())}")
@@ -2236,7 +2283,7 @@ class OpenClawConfig:
                 with open(auth_path, "w", encoding="utf-8") as f:
                     json.dump(auth_profiles, f, indent=2)
                 self._log(
-                    f"  auth-profiles.json: ollama:default / key=ollama-local  ✓",
+                    f"  auth-profiles.json: ollama:default / key=ollama-local (v1 format)  ✓",
                     "SUCCESS",
                 )
             except Exception as e:
@@ -2441,6 +2488,9 @@ f"REGEL: Wenn {primary_short} 3x hintereinander Timeout → Fallback-Modell wäh
 "  Stop-Process -Name node -Force -ErrorAction SilentlyContinue ; Start-Sleep 3\n"
 "  cmd /c \"$env:USERPROFILE\\.openclaw\\gateway.cmd\" &\n"
 "  ```\n"
+"  DECISION #40: gateway.cmd enthält automatischen Warte-Loop (curl alle 5s bis Ollama HTTP 200).\n"
+"  Kein manuelles Warten nötig — Gateway startet erst wenn Ollama erreichbar ist.\n"
+"  Ohne diesen Loop: Ollama-Discovery läuft zu früh → models:[] gecacht → \"Unknown model\" bei jedem Start.\n"
 "\n"
 "  User informieren: \"[MODELL-WECHSEL] Primary \u2192 $fallback (VRAM-Crash exit status 2, Ollama-Neustart+Retry fehlgeschlagen).\"\n"
 "  Zurueck zum konfigurierten Primary: nvidia-smi pruefen, dann Installer \u2192 Primary LLM Dropdown.\n"
@@ -3426,17 +3476,20 @@ ASKING FOR API KEY = ERROR. NEVER DO. Call delegate_to_worker.
         if auth_model.startswith("ollama/"):
             auth_model = auth_model[7:]
 
-        auth_profiles = [
-            {
-                "id":       "ollama-local",
-                "provider": "ollama",
-                "label":    f"Ollama local ({auth_model})",
-                "baseURL":  "http://127.0.0.1:11434",
-                "model":    auth_model,
-                "apiKey":   "",
-                "isDefault": True,
+        # DECISION #39/#42: versioned object format required since 2026.4.1
+        auth_profiles = {
+            "version": 1,
+            "profiles": {
+                "ollama:default": {
+                    "type":     "api_key",
+                    "provider": "ollama",
+                    "label":    f"Ollama local ({auth_model})",
+                    "baseURL":  "http://127.0.0.1:11434",
+                    "model":    auth_model,
+                    "key":      "ollama-local",
+                }
             }
-        ]
+        }
         try:
             if os.path.isfile(auth_profiles_path):
                 shutil.copy2(
@@ -3650,24 +3703,27 @@ ASKING FOR API KEY = ERROR. NEVER DO. Call delegate_to_worker.
         if auth_model.startswith("ollama/"):
             auth_model = auth_model[7:]
 
-        auth_profiles = [
-            {
-                "id":       "ollama-local",
-                "provider": "ollama",
-                "label":    f"Ollama local ({auth_model})",
-                "baseURL":  "http://127.0.0.1:11434",
-                "model":    auth_model,
-                "apiKey":   "",
-                "isDefault": True,
+        # DECISION #39/#42: versioned object format required since 2026.4.1
+        auth_profiles = {
+            "version": 1,
+            "profiles": {
+                "ollama:default": {
+                    "type":     "api_key",
+                    "provider": "ollama",
+                    "label":    f"Ollama local ({auth_model})",
+                    "baseURL":  "http://127.0.0.1:11434",
+                    "model":    auth_model,
+                    "key":      "ollama-local",
+                }
             }
-        ]
+        }
         try:
             if os.path.isfile(auth_path):
                 shutil.copy2(auth_path, auth_path + f".bak_{int(time.time())}")
             with open(auth_path, "w", encoding="utf-8") as f:
                 json.dump(auth_profiles, f, indent=2)
             self._log(
-                f"  auth-profiles.json: ollama:default / key=ollama-local  ✓", "SUCCESS"
+                f"  auth-profiles.json: ollama:default / key=ollama-local (v1 format)  ✓", "SUCCESS"
             )
         except Exception as e:
             self._log(f"  auth-profiles.json (post-gateway): {e}", "WARNING")
@@ -4160,10 +4216,21 @@ class LyraHeadServer:
         Without cwd=project_dir, CLAUDE.md is not loaded.
         """
         self.log(f"[Watcher] Triggering claude — {reason}", "INFO")
-        project_dir = os.path.join(
-            os.path.expanduser("~"),
-            "Python", "Projects", "ClawBotInstaller"
-        )
+        # Determine project_dir dynamically — avoid hardcoded path (WinError 267)
+        project_dir = None
+        for _candidate in [
+            # 1. Same dir as this .py file
+            os.path.dirname(os.path.abspath(__file__)) if "__file__" in dir() else None,
+            # 2. Hardcoded known location as fallback
+            os.path.join(os.path.expanduser("~"), "Python", "Projects", "ClawBotInstaller"),
+        ]:
+            if _candidate and os.path.isfile(
+                    os.path.join(_candidate, "OpenClawWinInstaller.py")):
+                project_dir = _candidate
+                break
+        if not project_dir:
+            self.log("[Watcher] claude trigger skipped: project_dir not found", "WARNING")
+            return
         prompt = (
             "Passiver Observer-Zyklus (automatisch ausgeloest durch Watcher).\n"
             "1. Lies C:\\Users\\scari\\.openclaw\\workspace\\memory\\ — alle Dateien "

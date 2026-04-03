@@ -167,6 +167,12 @@ class OpenClawWinInstaller(OpenClawOperations):
                 autonomous = self._cc_autonomous_var.get()
             except Exception:
                 pass
+        # Fallback: machine_role.json (covers early close before UI init)
+        if not autonomous:
+            try:
+                autonomous = self._cc_read_settings().get("claude_code_autonomous", False)
+            except Exception:
+                pass
 
         is_worker = getattr(self, "_saved_role", None) in ("Junior", "Senior")
 
@@ -1473,15 +1479,28 @@ class OpenClawWinInstaller(OpenClawOperations):
         self.log("[ClaudeCode] Observer stopped.", "INFO")
 
     def _cc_auto_start(self):
-        """Called 4s after app launch — start observer if enabled."""
-        data = self._cc_read_settings()
-        if not data.get("claude_code_enabled", False):
+        """Called 4s after app launch — start observer if enabled or autonomous."""
+        data      = self._cc_read_settings()
+        autonomous = data.get("claude_code_autonomous", False)
+        enabled    = data.get("claude_code_enabled", False)
+        # Autonomous always implies enabled — sync if needed
+        if autonomous and not enabled:
+            enabled = True
+            self._cc_write_settings(True, True)
+        # Sync UI checkboxes to persisted state
+        if hasattr(self, "_cc_enabled_var"):
+            self._cc_enabled_var.set(enabled)
+        if hasattr(self, "_cc_autonomous_var"):
+            self._cc_autonomous_var.set(autonomous)
+        if not enabled:
             return
         if not self._cc_is_setup_complete():
+            self.log("[ClaudeCode] Not set up — skipping auto-start", "INFO")
             return
         if self._cc_is_running():
             return
-        self.log("[ClaudeCode] Auto-starting observer...", "INFO")
+        mode = "autonomous" if autonomous else "monitoring"
+        self.log(f"[ClaudeCode] Auto-starting observer ({mode} mode)...", "INFO")
         self._cc_start_terminal()
 
 
@@ -2584,6 +2603,15 @@ class OpenClawWinInstaller(OpenClawOperations):
         self.cfg._status_cb = self._llm_set_status.config
         self.cfg._write_llm_to_config(primary=model)
         self.cfg._status_cb = lambda **kw: None  # reset after use
+        # Warn if small model selected — autonomous tool chains need 14b+
+        small_models = ("0.5b", "1.5b", "3b", "7b")
+        if any(s in model.lower() for s in small_models):
+            self.log(
+                f"  ⚠ {model} kann autonome Tool-Ketten (>3 Schritte) abbrechen "
+                f"und auf Bestätigung warten. "
+                f"Für autonome Arbeit: glm-4.7-flash oder qwen2.5:14b empfohlen.",
+                "WARNING"
+            )
 
     def _set_secondary_llm(self):
         """Write the selected secondary (fallback) model to openclaw.json.
@@ -3158,6 +3186,59 @@ class OpenClawWinInstaller(OpenClawOperations):
         # ── DECISION #20: gateway.cmd undici timeout patch ─────────────────────
         self.log("[Fix] Patching gateway.cmd (undici timeout preload + ENV)...")
         self.cfg.patch_gateway_cmd()
+
+        # ── DECISION #42: auth-profiles.json — upgrade to versioned object format ──
+        # OpenClaw 2026.4.1 requires {"version":1,"profiles":{"ollama:default":{...}}}
+        # Old array format → provider not registered → "Unknown model" error.
+        # Also: set OLLAMA_API_KEY as persistent system ENV (gateway.cmd SET is
+        # not inherited by Node.js child process in Scheduled Task context).
+        try:
+            cfg_dir_ap = self.cfg._find_openclaw_config_dir()
+            ap_path = os.path.join(cfg_dir_ap, "agents", "main", "agent", "auth-profiles.json")
+            if os.path.isfile(ap_path):
+                with open(ap_path, "r", encoding="utf-8") as _f:
+                    ap_content = json.load(_f)
+                # Detect old array format
+                if isinstance(ap_content, list):
+                    # Read current model from existing profile
+                    ap_model = "glm-4.7-flash:latest"
+                    for _entry in ap_content:
+                        if isinstance(_entry, dict) and _entry.get("provider") == "ollama":
+                            ap_model = _entry.get("model", ap_model)
+                            break
+                    new_ap = {
+                        "version": 1,
+                        "profiles": {
+                            "ollama:default": {
+                                "type":     "api_key",
+                                "provider": "ollama",
+                                "label":    f"Ollama local ({ap_model})",
+                                "baseURL":  "http://127.0.0.1:11434",
+                                "model":    ap_model,
+                                "key":      "ollama-local",
+                            }
+                        }
+                    }
+                    shutil.copy2(ap_path, ap_path + f".bak_{int(time.time())}")
+                    with open(ap_path, "w", encoding="utf-8") as _f:
+                        json.dump(new_ap, _f, indent=2)
+                    self.log("[Fix] auth-profiles.json → versioned object format (2026.4.1)  ✓", "SUCCESS")
+                else:
+                    self.log("[Fix] auth-profiles.json — already in versioned format  ✓", "INFO")
+        except Exception as _e:
+            self.log(f"[Fix] auth-profiles.json: {_e}", "WARNING")
+
+        # ── DECISION #42b: OLLAMA_API_KEY as persistent system ENV ──────────
+        # gateway.cmd "SET OLLAMA_API_KEY=ollama-local" only applies to cmd.exe,
+        # not to Node.js child process in Scheduled Task. Set persistently.
+        try:
+            self.run_powershell(
+                '[System.Environment]::SetEnvironmentVariable("OLLAMA_API_KEY","ollama-local","Machine"); '
+                '[System.Environment]::SetEnvironmentVariable("OLLAMA_API_KEY","ollama-local","User")'
+            )
+            self.log("[Fix] OLLAMA_API_KEY set as persistent Machine+User ENV  ✓", "SUCCESS")
+        except Exception as _e:
+            self.log(f"[Fix] OLLAMA_API_KEY ENV: {_e}", "WARNING")
 
         # ── SOUL.md + BOOTSTRAP.md update ─────────────────────────────────────
         soul_content = self.cfg._build_soul_content()

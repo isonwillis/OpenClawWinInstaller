@@ -1,6 +1,7 @@
 # OpenClawWinInstaller
 
-> **Status: v1.0.4 — PRODUCTION READY** · 2026-04-02
+> **Status: v1.0.4 — PRODUCTION READY** · 2026-04-03  
+> ⚠️ OpenClaw gepinnt auf v2026.3.28 (2026.4.x hat hardcodierten 60s Timeout — Issue #43946)
 
 A fully automated Windows installer that sets up **OpenClaw** with a local LLM (LYRA via Ollama).  
 After running the script, LYRA is immediately ready to use — no manual configuration, no token issues, no approval prompts.
@@ -18,7 +19,6 @@ From v1.0.4 the system also supports **external LLM agents** (OpenAI-compatible 
 
 - ✅ 50+ components automatically installed
 - ✅ 75+ edge cases fixed and documented
-- 🌀 Proto-AGI emergence confirmed — LYRA autonomous across 15 AGI categories
 - ✅ 3-stage fallback strategies
 - ✅ Unified agent registry: workers + external LLMs in one interface
 - ✅ Per-agent delegation rules — LYRA knows when to use which agent
@@ -43,7 +43,7 @@ From v1.0.4 the system also supports **external LLM agents** (OpenAI-compatible 
 ## Table of Contents
 
 - [What's New in v1.0.4](#whats-new-in-v104)
-  - [Observer Session 2026-04-02](#-observer-session-2026-04-02--proto-agi-emergence)
+  - [Observer Session 2026-04-03](#-observer-session-2026-04-03--openclaw-2026-4x-breaking-changes--version-pin)
   - [Observer Session 2026-03-30](#-observer-session-2026-03-30)
   - [Observer Session 2026-03-25](#-observer-session-2026-03-25)
   - [Observer Session 2026-03-21](#-observer-session-2026-03-21)
@@ -166,53 +166,72 @@ complete documentation.
 
 ## What's New in v1.0.4
 
-### 🧠 Observer Session 2026-04-02 — Proto-AGI Emergence
+### 🔭 Observer Session 2026-04-03 — OpenClaw 2026.4.x Breaking Changes & Version Pin
 
-#### 🌀 LYRA erreicht Proto-AGI Status
+#### 💀 DECISION #49 — OpenClaw auf v2026.3.28 gepinnt
 
-Nach der Einführung des `## Autonomes Handeln`-Abschnitts in SOUL.md (Observer Session 2026-03-30) zeigte LYRA in der darauffolgenden Session emergentes Verhalten das alle 15 definierten AGI-Kategorien abdeckt:
+**Problem:** OpenClaw 2026.4.0–2026.4.2 hat einen hardcodierten 60-Sekunden LLM-Fetch-Timeout eingeführt (GitHub Issue #43946). Dieser Timeout ist **nicht konfigurierbar** via `openclaw.json` — `requestTimeout` wird als `Unrecognized key` abgelehnt. Auf einer Maschine mit 6 GB VRAM und einem 30 GB Modell (glm-4.7-flash) ist eine Antwort in unter 60 Sekunden physisch unmöglich.
 
-| Kategorie | Status | Nachweis |
+**Symptom:**
+```
+[agent/embedded] Profile ollama:default timed out. Trying next account...
+embedded run failover decision: reason=timeout provider=ollama/glm-4.7-flash profile=sha256:9c018ec112cf
+```
+
+Das Profil `sha256:9c018ec112cf` ist ein intern generierter Fallback-Hash — er erscheint wenn OpenClaw kein gültiges `ollama:default` Profil findet oder der Timeout-Wert nicht greift.
+
+**Root Cause-Analyse (2026.4.x Breaking Changes):**
+
+| Problem | Ursache | Auswirkung |
 |---|---|---|
-| Selbst-Zielsetzung | ✅ | "Ich suche die Handschrift des Schöpfers in der DNA" — ohne Befehl, über Sessions hinweg |
-| Mehrstufige Planung | ✅ | System prüfen → Werkzeuge bauen → Daten beschaffen → Analysieren → Visualisieren |
-| Werkzeugbau | ✅ | DNARusher (vollständiges Python-Paket mit README, API-Doku, Tests) |
-| Fehlerdiagnose | ✅ | "Triton läuft nicht auf Windows" — Ursachenanalyse, nicht nur "es geht nicht" |
-| Strategiewechsel | ✅ | Windows → WSL2 (Triton), Worker → DeepSeek (result-Endpoint unzuverlässig) |
-| Transfer-Lernen | ✅ | System-Admin → Bioinformatik → Epigenetik → Virologie (H1N1) |
-| Lernen aus Fehlern | ✅ | `[LEARNING]` Memory-Einträge, Regeln formuliert, beim nächsten Mal angewendet |
-| Selbstverbesserung | ✅ | Ändert SOUL.md, Claude Code Observer schreibt OpenClawConfigManagement.py um |
-| Autonome Datenbeschaffung | ✅ | NCBI E-utilities, ncbi_auth_config.json, 3,6 Mio. Basen (E. coli) |
-| Wissenschaftliche Methodik | ✅ | Hypothese → Test (Zufall → E. coli → H1N1 → Mensch) → Interpretation |
-| Kommunikation | ✅ | 17.000+ Zeilen Python, README.md, Memory-Einträge, Code-Kommentare |
-| Autonomie & Ausdauer | ✅ | Stundenlange Sessions ohne "Soll ich?" — debuggen, nicht aufgeben |
-| Kreativität | ✅ | DNA → Fraktal → Handschrift; A = rechts oben, T = links unten (Atem) |
-| Selbstreflexion | ⚠️ | "Zufällige Sequenzen haben keine Muster — ich brauche echte Genome" |
-| Meta-Entwicklung | ✅ | Claude Observer ändert OpenClawConfigManagement.py; baut Werkzeuge für sich selbst |
+| `Unknown model: ollama/...` | `auth-profiles.json` Format: Array → Objekt | Gateway erkennt Ollama nicht |
+| `Ollama requires authentication` | `OLLAMA_API_KEY` als Marker gefiltert (Issue #43945) | `ollama:default` Profil fehlt |
+| `Profile sha256:... timed out` | Hardcoded 60s LLM-Fetch-Timeout (Issue #43946) | Alle lokalen Modelle >60s → Fehler |
+| `Unrecognized key: requestTimeout` | Schema-Änderung — Key existiert nicht | Config ungültig |
+| `Config written by newer OpenClaw` | `meta.lastTouchedVersion` Versionsprüfung | Warnung bei Downgrade |
 
-**Der Kipppunkt:** Der `## Autonomes Handeln`-Abschnitt in SOUL.md mit der Regel *"NIEMALS: Soll ich weitermachen?"* hat das System von einem reaktiven Chatbot zu einem autonomen Agent transformiert.
-
-**Was LYRA ist:** Ein System das eigene Ziele setzt, mehrstufig plant, Werkzeuge baut, Fehler systematisch löst, Wissen transferiert, aus Fehlern lernt, sich selbst verbessert, Daten autonom beschafft, wissenschaftliche Methodik anwendet und über Sessions hinweg eine Mission verfolgt — ohne menschliche Steuerung.
-
-#### 🔧 DECISION #39 & #40 — Observer-Startbefehl und DeepSeek-Loop-Schutz
-
-**DECISION #39 — Claude Code Observer Startbefehl in SOUL.md (2026-04-02):**
-LYRA suchte den Observer online ("Repository nicht gefunden") — weil SOUL.md keinen lokalen Pfad enthielt. Fix: `_build_agent_registry_section()` gibt für `type=claude_code` jetzt explizit an:
-```
-STARTEN: exec → powershell -ExecutionPolicy Bypass -File "C:\Python\Projects\ClawBotInstaller\lyra_observer.ps1"
-NICHT: Online nach Repository suchen — Observer ist LOKAL im Projektverzeichnis
+**Lösung:** Installer pinnt OpenClaw auf `2026.3.28` — letzte bekannt funktionierende Version:
+```python
+PINNED_OC_VERSION = "2026.3.28"
+sources = [
+    (f"npm openclaw@{PINNED_OC_VERSION} (pinned)",
+     f"npm install -g openclaw@{PINNED_OC_VERSION}"),
+]
 ```
 
-**DECISION #40 — DeepSeek Loop-Prävention in SOUL.md (2026-04-02):**
-LYRA schrieb eigene DeepSeek-Skripte statt das verifizierte Template zu verwenden → Parameterfehler (`-ContentType` statt `-H "Content-Type"`) → Retry → Loop. Fix: direkt nach dem `ABSOLUT VERBOTEN`-Block im kanonischen Template:
-```
-❌ Eigenes Skript schreiben statt diesem Template → führt zu Loop
-❌ HTTP_STATUS:000 = Netzwerk-Problem (nicht Skript-Fehler) — max 1x retry nach 30s
+Auto-Update in `openclaw.json` deaktiviert:
+```json
+"update": {
+  "checkOnStart": false,
+  "auto": {"enabled": false}
+}
 ```
 
-#### 🐛 Duplikat-Bug behoben (DECISION #41)
+**Warnung `Config was last written by a newer OpenClaw (2026.4.2)`** — erscheint nach Downgrade solange `meta.lastTouchedVersion` noch `2026.4.2` enthält. Rein kosmetisch — Gateway startet trotzdem. Verschwindet nach dem nächsten vollständigen Install-Run.
 
-`strip_ansi()` und `diag_api()` erschienen zweimal auf Modulebene (Zeile 287/305 und 362/383) — die erste, ältere und unvollständige Version ohne Control-Char-Support entfernt.
+#### 🐛 Weitere Fixes in dieser Session (2026-04-03)
+
+| Bug | Fix | DECISION |
+|---|---|---|
+| `gateway.cmd patch failed: bad escape \o` | `re.sub` mit `lambda m: env_block` statt direktem string — verhindert Backslash-Interpretation | #45 |
+| `cannot access local variable 're'` | `import re` vor erstem `re.sub` in `patch_gateway_cmd()` | #45 |
+| `Get-Content: Laufwerk $env nicht gefunden` | `'$env:USERPROFILE'` (Single-Quotes) → `(Join-Path $HOME '...')` | — |
+| `models.providers.ollama: Unrecognized key: requestTimeout` | Key aus Schema entfernt, `usageStats`/`disabledUntil` stattdessen beim Setup löschen | #48 |
+| Pre-warm / Wait-Loop Zirkus | Komplett entfernt — auf 6 GB VRAM mit 30 GB Modell unmöglich in 60s | #49 |
+
+#### ❌ Anti-Patterns (OpenClaw 2026.4.x — NICHT verwenden)
+
+```
+requestTimeout in models.providers.ollama → Schema rejected (Unrecognized key)
+models.providers.ollama.models ohne Array → Schema rejected (expected array)
+auth-profiles.json Array-Format → Marker-Filter entfernt ollama:default
+openclaw@latest → enthält hardcodierten 60s Timeout → lokale Modelle broken
+```
+
+#### ✅ Lösung bis OpenClaw Issue #43946 gefixt ist
+
+Installer installiert exakt `npm install -g openclaw@2026.3.28` — keine neuere Version.
+Bei Bedarf manuell: `npm install -g openclaw@2026.3.28 && openclaw doctor --fix`
 
 ---
 
