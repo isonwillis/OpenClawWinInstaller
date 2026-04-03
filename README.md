@@ -1,7 +1,7 @@
 # OpenClawWinInstaller
 
 > **Status: v1.0.4 — PRODUCTION READY** · 2026-04-03  
-> ⚠️ OpenClaw gepinnt auf v2026.3.28 (2026.4.x hat hardcodierten 60s Timeout — Issue #43946)
+> ⚠️ OpenClaw pinned on v2026.3.28 (2026.4.x has hardcoded 60s Timeout — Issue #43946)
 
 A fully automated Windows installer that sets up **OpenClaw** with a local LLM (LYRA via Ollama).  
 After running the script, LYRA is immediately ready to use — no manual configuration, no token issues, no approval prompts.
