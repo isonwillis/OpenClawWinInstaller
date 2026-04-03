@@ -1537,14 +1537,29 @@ class OpenClawConfig:
         # hw_profile comes from HardwareProfile.detect() when available.
         # Falls back to 7200s (2h) — glm-4.7-flash on CPU offloading needs > 1h.
         # DECISION #3 updated v1.0.4: Default raised from 3600 to 7200.
-        timeout_seconds = (
-            hw_profile.get("recommended_timeout", 7200)
-            if hw_profile else 7200
-        )
-        self._log(
-            f"  Config: timeoutSeconds={timeout_seconds} "
-            f"({'from HW profile' if hw_profile else 'default'})", "INFO"
-        )
+        # DECISION #44: preserve user-set timeoutSeconds (GUI dropdown)
+        existing_timeout = None
+        if os.path.isfile(cfg_path):
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as _f:
+                    existing_timeout = (
+                        json.load(_f).get("agents",{}).get("defaults",{})
+                        .get("timeoutSeconds", None)
+                    )
+            except Exception:
+                pass
+        if existing_timeout is not None and existing_timeout >= 3600:
+            timeout_seconds = existing_timeout
+            self._log(f"  Config: timeoutSeconds={timeout_seconds} (preserved — set via GUI)", "INFO")
+        else:
+            timeout_seconds = (
+                hw_profile.get("recommended_timeout", 7200)
+                if hw_profile else 7200
+            )
+            self._log(
+                f"  Config: timeoutSeconds={timeout_seconds} "
+                f"({'from HW profile' if hw_profile else 'default'})", "INFO"
+            )
 
         config = {
             # DECISION #9: meta block required by 2026.3.1
@@ -1933,6 +1948,7 @@ class OpenClawConfig:
                 clean = clean.replace(old_line, "")
 
             import re  # must be before first re.sub — scoping fix
+            import re  # must be before first re.sub — scoping fix
             # DECISION #40/#40b: Strip old Ollama wait-loop + warmup blocks (idempotent)
             # Matches from the rem DECISION #40 comment through the warmup powershell line.
             clean = re.sub(
@@ -1971,33 +1987,7 @@ class OpenClawConfig:
                 "SET OLLAMA_KEEP_ALIVE=10m\r\n"
                 # ⚠️  DECISION #20: undici 300s timeout fix
                 f"{node_opts_line}"
-                # DECISION #40: Ollama runs in Docker — container may start
-                # slower than the gateway. If Ollama is not reachable at startup,
-                # buildOllamaProvider() returns models:[] → cached → "Unknown model".
-                # Wait loop ensures Ollama is ready before gateway discovery runs.
-                "rem DECISION #40: Wait for Ollama (Docker) before starting gateway\r\n"
-                ":wait_ollama\r\n"
-                "curl.exe -s -o NUL -w \"%%{http_code}\" http://127.0.0.1:11434/api/tags 2>NUL | findstr \"200\" >NUL 2>&1\r\n"
-                "if errorlevel 1 (\r\n"
-                "    echo [gateway] Waiting for Ollama at http://127.0.0.1:11434 ...\r\n"
-                "    timeout /t 5 /nobreak >NUL\r\n"
-                "    goto wait_ollama\r\n"
-                ")\r\n"
-                "echo [gateway] Ollama ready.\r\n"
-                # DECISION #40b: Pre-warm the model before gateway starts.
-                # pi-embedded has a hardcoded 6e4ms (60s) lane timeout for gateway tool calls.
-                # Cold KV-cache init for contextTokens=131072 takes 53-58s, hitting the limit.
-                # Sending a warmup request here loads the model so the gateway's own
-                # startup-warmup gets an instant response instead of triggering a cold load.
-                # Model name is read dynamically from openclaw.json — survives model changes.
-                "rem DECISION #40b: Pre-warm model before gateway starts (avoids 60s lane timeout)\r\n"
-                "echo [gateway] Pre-warming model (may take ~60s on cold start)...\r\n"
-                "powershell -NoProfile -Command \""
-                "$cfg=Get-Content '$env:USERPROFILE\\.openclaw\\openclaw.json'|ConvertFrom-Json;"
-                "$m=($cfg.agents.defaults.model.primary -replace '^ollama/','');"
-                "$b='{\\\"model\\\":\\\"'+$m+'\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"Hi\\\"}],\\\"stream\\\":false}';"
-                "try{Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/chat' -Method POST -Body $b -ContentType 'application/json' -TimeoutSec 120|Out-Null;"
-                "Write-Host '[gateway] Model warmed up.'}catch{Write-Host '[gateway] Warmup note:' $_.Exception.Message}\"\r\n"
+
             )
 
             if "@echo off" in clean.lower():
