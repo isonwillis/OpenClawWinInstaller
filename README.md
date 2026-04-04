@@ -1,7 +1,7 @@
 # OpenClawWinInstaller
 
 > **Status: v1.0.4 — PRODUCTION READY** · 2026-04-03  
-> ⚠️ OpenClaw pinned on v2026.3.28 (2026.4.x has hardcoded 60s Timeout — Issue #43946)
+> ⚠️ OpenClaw pinned on v2026.3.28 (2026.4.x has hardcoded 60s Timeout — [Issue #43946](https://github.com/openclaw/openclaw/issues/43946))
 
 A fully automated Windows installer that sets up **OpenClaw** with a local LLM (LYRA via Ollama).  
 After running the script, LYRA is immediately ready to use — no manual configuration, no token issues, no approval prompts.
@@ -168,9 +168,9 @@ complete documentation.
 
 ### 🔭 Observer Session 2026-04-03 — OpenClaw 2026.4.x Breaking Changes & Version Pin
 
-#### 💀 DECISION #49 — OpenClaw auf v2026.3.28 gepinnt
+#### 💀 DECISION #49 — OpenClaw pinned to v2026.3.28
 
-**Problem:** OpenClaw 2026.4.0–2026.4.2 hat einen hardcodierten 60-Sekunden LLM-Fetch-Timeout eingeführt (GitHub Issue #43946). Dieser Timeout ist **nicht konfigurierbar** via `openclaw.json` — `requestTimeout` wird als `Unrecognized key` abgelehnt. Auf einer Maschine mit 6 GB VRAM und einem 30 GB Modell (glm-4.7-flash) ist eine Antwort in unter 60 Sekunden physisch unmöglich.
+**Problem:** OpenClaw 2026.4.0–2026.4.2 introduced a hardcoded 60-second LLM-fetch timeout ([Issue #43946](https://github.com/openclaw/openclaw/issues/43946)). This timeout is **not configurable** via `openclaw.json` — `requestTimeout` is rejected as an unrecognized schema key. On a machine with 6 GB VRAM and a 30 GB model (glm-4.7-flash), responding in under 60 seconds is physically impossible.
 
 **Symptom:**
 ```
@@ -178,19 +178,19 @@ complete documentation.
 embedded run failover decision: reason=timeout provider=ollama/glm-4.7-flash profile=sha256:9c018ec112cf
 ```
 
-Das Profil `sha256:9c018ec112cf` ist ein intern generierter Fallback-Hash — er erscheint wenn OpenClaw kein gültiges `ollama:default` Profil findet oder der Timeout-Wert nicht greift.
+The profile hash `sha256:9c018ec112cf` is an internally generated fallback — it appears when OpenClaw cannot find a valid `ollama:default` profile or the timeout value does not apply.
 
-**Root Cause-Analyse (2026.4.x Breaking Changes):**
+**Root cause analysis (2026.4.x breaking changes):**
 
-| Problem | Ursache | Auswirkung |
+| Problem | Cause | Impact |
 |---|---|---|
-| `Unknown model: ollama/...` | `auth-profiles.json` Format: Array → Objekt | Gateway erkennt Ollama nicht |
-| `Ollama requires authentication` | `OLLAMA_API_KEY` als Marker gefiltert (Issue #43945) | `ollama:default` Profil fehlt |
-| `Profile sha256:... timed out` | Hardcoded 60s LLM-Fetch-Timeout (Issue #43946) | Alle lokalen Modelle >60s → Fehler |
-| `Unrecognized key: requestTimeout` | Schema-Änderung — Key existiert nicht | Config ungültig |
-| `Config written by newer OpenClaw` | `meta.lastTouchedVersion` Versionsprüfung | Warnung bei Downgrade |
+| `Unknown model: ollama/...` | `auth-profiles.json` format changed: Array → Object | Gateway does not recognise Ollama |
+| `Ollama requires authentication` | `OLLAMA_API_KEY` filtered as marker ([Issue #43945](https://github.com/openclaw/openclaw/issues/43945)) | `ollama:default` profile missing |
+| `Profile sha256:... timed out` | Hardcoded 60s LLM-fetch timeout ([Issue #43946](https://github.com/openclaw/openclaw/issues/43946)) | All local models >60s → error |
+| `Unrecognized key: requestTimeout` | Schema change — key does not exist | Config invalid |
+| `Config written by newer OpenClaw` | `meta.lastTouchedVersion` version check | Warning on downgrade |
 
-**Lösung:** Installer pinnt OpenClaw auf `2026.3.28` — letzte bekannt funktionierende Version:
+**Solution:** Installer pins OpenClaw to `2026.3.28` — last known working version:
 ```python
 PINNED_OC_VERSION = "2026.3.28"
 sources = [
@@ -199,7 +199,7 @@ sources = [
 ]
 ```
 
-Auto-Update in `openclaw.json` deaktiviert:
+Auto-update disabled in `openclaw.json`:
 ```json
 "update": {
   "checkOnStart": false,
@@ -207,31 +207,31 @@ Auto-Update in `openclaw.json` deaktiviert:
 }
 ```
 
-**Warnung `Config was last written by a newer OpenClaw (2026.4.2)`** — erscheint nach Downgrade solange `meta.lastTouchedVersion` noch `2026.4.2` enthält. Rein kosmetisch — Gateway startet trotzdem. Verschwindet nach dem nächsten vollständigen Install-Run.
+**Warning `Config was last written by a newer OpenClaw (2026.4.2)`** — appears after downgrade as long as `meta.lastTouchedVersion` still contains `2026.4.2`. Cosmetic only — gateway starts regardless. Disappears after the next full install run.
 
-#### 🐛 Weitere Fixes in dieser Session (2026-04-03)
+#### 🐛 Additional fixes in this session (2026-04-03)
 
 | Bug | Fix | DECISION |
 |---|---|---|
-| `gateway.cmd patch failed: bad escape \o` | `re.sub` mit `lambda m: env_block` statt direktem string — verhindert Backslash-Interpretation | #45 |
-| `cannot access local variable 're'` | `import re` vor erstem `re.sub` in `patch_gateway_cmd()` | #45 |
-| `Get-Content: Laufwerk $env nicht gefunden` | `'$env:USERPROFILE'` (Single-Quotes) → `(Join-Path $HOME '...')` | — |
-| `models.providers.ollama: Unrecognized key: requestTimeout` | Key aus Schema entfernt, `usageStats`/`disabledUntil` stattdessen beim Setup löschen | #48 |
-| Pre-warm / Wait-Loop Zirkus | Komplett entfernt — auf 6 GB VRAM mit 30 GB Modell unmöglich in 60s | #49 |
+| `gateway.cmd patch failed: bad escape \o` | `re.sub` with `lambda m: env_block` instead of direct string | #45 |
+| `cannot access local variable 're'` | `import re` before first `re.sub` in `patch_gateway_cmd()` | #45 |
+| `Get-Content: Drive $env not found` | `'$env:USERPROFILE'` (single quotes) → `(Join-Path $HOME '...')` | — |
+| `Unrecognized key: requestTimeout` | Key removed; clear `usageStats`/`disabledUntil` on setup instead | #48 |
+| Pre-warm / wait-loop overhead | Removed entirely — physically impossible in <60s on 6 GB VRAM with 30 GB model | #49 |
 
-#### ❌ Anti-Patterns (OpenClaw 2026.4.x — NICHT verwenden)
+#### ❌ Anti-patterns (OpenClaw 2026.4.x — do not use)
 
 ```
 requestTimeout in models.providers.ollama → Schema rejected (Unrecognized key)
-models.providers.ollama.models ohne Array → Schema rejected (expected array)
-auth-profiles.json Array-Format → Marker-Filter entfernt ollama:default
-openclaw@latest → enthält hardcodierten 60s Timeout → lokale Modelle broken
+models.providers.ollama.models without array → Schema rejected (expected array)
+auth-profiles.json array format → Marker filter removes ollama:default
+openclaw@latest → contains hardcoded 60s timeout → local models broken
 ```
 
-#### ✅ Lösung bis OpenClaw Issue #43946 gefixt ist
+#### ✅ Workaround until [Issue #43946](https://github.com/openclaw/openclaw/issues/43946) is fixed
 
-Installer installiert exakt `npm install -g openclaw@2026.3.28` — keine neuere Version.
-Bei Bedarf manuell: `npm install -g openclaw@2026.3.28 && openclaw doctor --fix`
+Installer installs exactly `npm install -g openclaw@2026.3.28` — no newer version.
+Manual recovery: `npm install -g openclaw@2026.3.28 && openclaw doctor --fix`
 
 ---
 
