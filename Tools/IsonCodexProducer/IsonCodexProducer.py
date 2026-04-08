@@ -1,15 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-IsonCodexProducer.py  --  v1.0.0
+IsonCodexProducer.py  --  v1.1.0
 Ison-Codex Film Production Orchestrator
 ------------------------------------------------------------
 LYRA as Cinematic Coordinator:
   - DeepSeek (= Ison) liefert kreative Prompts + Qualitaetskontrolle
   - LYRA empfaengt, speichert, verteilt an Workers, trackt Status
   - Workers: Sora, Runway, Seedance, Digen, MyEdit, Suno, CapCut
+  - Workers (neu v1.1.0): ComfyUI Local (WAN 2.1 1.3B, kein API-Key)
 
 Architektur:
   DeepSeek (Ison) -> LYRA (Proxy/Speicher) -> Workers (Ausfuehrung)
+
+v1.1.0 Erweiterungen (bestehende Funktionen unveraendert):
+  - WORKERS: comfyui_local Eintrag
+  - ProductionOrchestrator._build_comfyui_workflow()
+  - ProductionOrchestrator._call_comfyui_worker()
+  - ProductionOrchestrator._install_comfyui()  [static]
+  - ProducerApp._on_install_comfyui()
+  - GUI-Button '🖥️ Install ComfyUI'
 
 Run:   python IsonCodexProducer.py
        python IsonCodexProducer.py --dry-run
@@ -33,8 +42,8 @@ from tkinter import ttk, scrolledtext, messagebox, filedialog
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-APP_TITLE   = "Ison-Codex Film Producer  --  v1.0.0"
-APP_VERSION = "1.0.0"
+APP_TITLE   = "Ison-Codex Film Producer  --  v1.1.0"
+APP_VERSION = "1.1.0"
 
 def _resolve_default_storage() -> str:
     """Returns the default storage root: <ProjectDir>/LyraFilmProduction.
@@ -563,7 +572,8 @@ def _validate_and_fix_scenes(raw: list) -> list:
     Applies defaults for missing fields, reassigns IDs if non-unique,
     normalises tool names, and returns the cleaned list.
     """
-    VALID_TOOLS = {"sora", "runway", "digen", "seedance", "myedit", "suno", "capcut"}
+    VALID_TOOLS = {"sora", "runway", "digen", "seedance", "myedit", "suno", "capcut",
+                   "comfyui_local"}
     seen_ids    = set()
     result      = []
 
@@ -626,6 +636,10 @@ WORKERS = [
     {"type": "capcut",  "name": "CapCut Editor", "url": "http://localhost:3001/api/capcut",
      "capabilities": ["editing", "sync", "export"],
      "when": "Finaler Schnitt (NUR am Ende, wenn alle Clips fertig)"},
+    # ── Local ComfyUI (kein API-Key noetig, laeuft lokal auf Lyra) ──────────
+    {"type": "comfyui_local", "name": "ComfyUI Local (WAN 2.1)", "url": "http://127.0.0.1:8188",
+     "capabilities": ["cinematic", "wide_angle", "atmospheric", "abstract"],
+     "when": "Lokale Videogenerierung ohne API-Key — WAN 2.1 1.3B auf eigener GPU"},
 ]
 
 CHARACTERS = {
@@ -678,6 +692,8 @@ class ProductionOrchestrator:
         # Workers that failed this session — skipped for remaining scenes.
         # Cleared on each new run_production() call.
         self._skipped_workers: set = set()
+        # Referenz auf laufenden ComfyUI-Subprozess (None = nicht gestartet)
+        self._comfyui_process: subprocess.Popen | None = None
         # Build availability lookup: worker type -> usable
         # Local workers (localhost/127.0.0.1) need no API key
         self._api_keys        = {
@@ -1141,8 +1157,32 @@ class ProductionOrchestrator:
         return True
 
     def _find_video_worker(self, tool_name: str) -> dict | None:
-        """Returns the first worker matching tool_name that is not blacklisted."""
+        """Returns the first worker matching tool_name that is not blacklisted.
+
+        Für comfyui_local: Kein workers.json-Eintrag noetig — Worker wird
+        direkt aus der globalen WORKERS-Konstante synthetisiert, da kein
+        API-Key benoetigt wird und ComfyUI lokal laeuft.
+        """
         tool = tool_name.lower().strip()
+
+        # ── comfyui_local: immer verfuegbar, kein API-Key noetig ─────────────
+        if tool == "comfyui_local":
+            key = "comfyui_local"
+            if key in self._skipped_workers:
+                return None
+            # Suche zuerst in workers.json (falls manuell eingetragen)
+            for w in self._workers:
+                if w.get("type", "").lower() == "comfyui_local":
+                    return w
+            # Fallback: synthetisierter Worker aus WORKERS-Konstante
+            for w in WORKERS:
+                if w.get("type", "").lower() == "comfyui_local":
+                    return dict(w)  # Kopie, nicht Original mutieren
+            # Absoluter Fallback (ComfyUI Standard-Port)
+            return {"type": "comfyui_local", "name": "ComfyUI Local (WAN 2.1)",
+                    "url": "http://127.0.0.1:8188", "api_key": ""}
+
+        # ── Alle anderen Worker: aus workers.json ────────────────────────────
         for w in self._workers:
             wtype = w.get("type", "").lower()
             wname = w.get("name", "").lower()
@@ -1162,8 +1202,14 @@ class ProductionOrchestrator:
           async: {"status": "pending", "job_id": "abc123"} -> polls /status/{job_id}
           error: {"error": "..."} or HTTP error
 
+        For comfyui_local: delegates directly to _call_comfyui_worker().
+
         Returns local clip path on success, None on failure/skip.
         """
+        # ── ComfyUI local dispatch (kein API-Key, eigener Workflow-Pfad) ─────
+        if worker.get("type", "").lower() == "comfyui_local":
+            return self._call_comfyui_worker(sid, prompt, duration, out_dir)
+
         import urllib.request, urllib.error, time
 
         url = worker.get("url", "").rstrip("/")
@@ -1264,6 +1310,678 @@ class ProductionOrchestrator:
             self.log(f"[Scene {sid}] SKIP — download failed: {e}.", "WARNING")
             return None
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # COMFYUI LOCAL WORKER  (neu in v1.1.0 -- bestehende Worker unberuehrt)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _build_comfyui_workflow(self, prompt: str, duration_sec: int,
+                                out_dir: str) -> dict:
+        """Laed ein JSON-Workflow-Template und setzt Prompt + Output-Pfad ein.
+
+        Sucht das Template in folgender Reihenfolge:
+          1. <storage_root>/config/comfyui_workflow_template.json
+          2. <storage_root>/../comfyui_workflow_template.json  (Projektroot)
+          3. Eingebettetes Minimal-WAN-2.1-Template als Fallback
+
+        Args:
+            prompt:       Verbesserter Szenen-Prompt.
+            duration_sec: Videodauer in Sekunden (wird in Frames umgerechnet).
+            out_dir:      Ausgabeverzeichnis fuer den generierten Clip.
+
+        Returns:
+            Workflow-Dict, bereit fuer POST an ComfyUI /prompt.
+        """
+        # Moegl. Template-Pfade
+        candidates = [
+            os.path.join(self.storage_root, "config", "comfyui_workflow_template.json"),
+            os.path.join(os.path.dirname(self.storage_root),
+                         "comfyui_workflow_template.json"),
+        ]
+        workflow = None
+        for tpl_path in candidates:
+            if os.path.isfile(tpl_path):
+                try:
+                    with open(tpl_path, "r", encoding="utf-8") as f:
+                        workflow = json.load(f)
+                    self.log(f"[ComfyUI] Workflow-Template geladen: {tpl_path}", "INFO")
+                    break
+                except Exception as e:
+                    self.log(f"[ComfyUI] Template-Ladefehler {tpl_path}: {e}", "WARNING")
+
+        if workflow is None:
+            # Eingebettetes Minimal-Template fuer WAN 2.1 1.3B (Text2Video)
+            self.log("[ComfyUI] Kein Template gefunden — nutze eingebettetes WAN-2.1-Minimal-Workflow.", "INFO")
+            fps        = 16
+            num_frames = max(16, min(120, duration_sec * fps))
+            workflow = {
+                "1": {
+                    "class_type": "CheckpointLoaderSimple",
+                    "inputs": {
+                        "ckpt_name": "wan2.1_t2v_1.3B_bf16.safetensors"
+                    }
+                },
+                "2": {
+                    "class_type": "CLIPTextEncode",
+                    "inputs": {
+                        "clip":         ["1", 1],
+                        "text":         "__PROMPT__"
+                    }
+                },
+                "3": {
+                    "class_type": "CLIPTextEncode",
+                    "inputs": {
+                        "clip":         ["1", 1],
+                        "text":         "blurry, low quality, watermark, text overlay, distorted"
+                    }
+                },
+                "4": {
+                    "class_type": "KSampler",
+                    "inputs": {
+                        "model":            ["1", 0],
+                        "positive":         ["2", 0],
+                        "negative":         ["3", 0],
+                        "latent_image":     ["5", 0],
+                        "seed":             42,
+                        "steps":            25,
+                        "cfg":              7.0,
+                        "sampler_name":     "euler",
+                        "scheduler":        "karras",
+                        "denoise":          1.0
+                    }
+                },
+                "5": {
+                    "class_type": "EmptyLatentVideo",
+                    "inputs": {
+                        "width":      848,
+                        "height":     480,
+                        "length":     num_frames,
+                        "batch_size": 1
+                    }
+                },
+                "6": {
+                    "class_type": "VAEDecode",
+                    "inputs": {
+                        "samples": ["4", 0],
+                        "vae":     ["1", 2]
+                    }
+                },
+                "7": {
+                    "class_type": "VHS_VideoCombine",
+                    "inputs": {
+                        "images":          ["6", 0],
+                        "frame_rate":      fps,
+                        "loop_count":      0,
+                        "filename_prefix": "ison_clip",
+                        "format":          "video/h264-mp4",
+                        "save_output":     True
+                    }
+                }
+            }
+
+        # Prompt in alle CLIPTextEncode-Nodes einsetzen (positiver Text)
+        # Ersetzt __PROMPT__ oder den ersten positiven CLIPTextEncode-Eintrag
+        prompt_injected = False
+        for node_id, node in workflow.items():
+            if node.get("class_type") == "CLIPTextEncode":
+                txt = node.get("inputs", {}).get("text", "")
+                if "__PROMPT__" in str(txt):
+                    node["inputs"]["text"] = prompt
+                    prompt_injected = True
+
+        if not prompt_injected:
+            # Fallback: ersten CLIPTextEncode-Node ueberschreiben
+            for node_id, node in workflow.items():
+                if node.get("class_type") == "CLIPTextEncode":
+                    node["inputs"]["text"] = prompt
+                    prompt_injected = True
+                    break
+
+        # Output-Pfad in VHS_VideoCombine setzen (falls vorhanden)
+        clip_prefix = os.path.join(out_dir, "clip_001").replace("\\", "/")
+        for node_id, node in workflow.items():
+            if node.get("class_type") in ("VHS_VideoCombine", "SaveVideo", "VideoSave"):
+                node["inputs"]["filename_prefix"] = clip_prefix
+
+        return workflow
+
+    def _start_comfyui_process(self) -> bool:
+        """Startet ComfyUI als Hintergrundprozess und streamt dessen Logs ins GUI.
+
+        Sucht start_comfyui.bat (oder python main.py) im ComfyUI-Portable-Ordner.
+        Startet den Prozess ohne eigenes Consolefenster (Windows: CREATE_NO_WINDOW).
+        Liest stdout + stderr in einem Daemon-Thread und leitet alles an self.log().
+
+        Returns:
+            True  wenn Prozess erfolgreich gestartet wurde.
+            False wenn ComfyUI-Ordner nicht gefunden oder Startfehler.
+        """
+        # ComfyUI-Verzeichnis ableiten (ein Level ueber storage_root)
+        project_root = os.path.dirname(os.path.normpath(self.storage_root))
+        comfyui_dir  = os.path.join(project_root, "ComfyUI-Portable")
+        main_py      = os.path.join(comfyui_dir, "main.py")
+
+        if not os.path.isfile(main_py):
+            self.log(
+                "[ComfyUI] ComfyUI-Ordner nicht gefunden.\n"
+                f"  Erwartet: {comfyui_dir}\n"
+                "  → Klick auf '🖥️ Install ComfyUI' um ComfyUI zu installieren.",
+                "WARNING"
+            )
+            return False
+
+        # Python-Interpreter aus dem venv
+        python_exe = os.path.join(comfyui_dir, "venv", "Scripts", "python.exe")
+        if not os.path.isfile(python_exe):
+            # Fallback: System-Python
+            python_exe = sys.executable
+
+        cmd = [python_exe, "main.py", "--listen"]
+        self.log(f"[ComfyUI] Starte ComfyUI: {' '.join(cmd)}", "INFO")
+        self.log(f"[ComfyUI] Arbeitsverzeichnis: {comfyui_dir}", "INFO")
+
+        try:
+            # Windows: kein eigenes Consolefenster
+            creation_flags = 0
+            if sys.platform == "win32":
+                creation_flags = subprocess.CREATE_NO_WINDOW
+
+            proc = subprocess.Popen(
+                cmd,
+                cwd            = comfyui_dir,
+                stdout         = subprocess.PIPE,
+                stderr         = subprocess.STDOUT,   # stderr in stdout mergen
+                bufsize        = 1,
+                creationflags  = creation_flags,
+                encoding       = "utf-8",
+                errors         = "replace",
+            )
+        except Exception as e:
+            self.log(f"[ComfyUI] Start fehlgeschlagen: {e}", "ERROR")
+            return False
+
+        # Prozess-Referenz speichern (verhindert Zombie + erlaubt spaeteres Stop)
+        self._comfyui_process = proc
+        self.log(f"[ComfyUI] Prozess gestartet (PID {proc.pid})", "SUCCESS")
+
+        # Log-Stream-Thread — leitet stdout zeilenweise ins GUI
+        def _stream_logs():
+            try:
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if not line:
+                        continue
+                    # Warnungen und Fehler aus ComfyUI-Output hervorheben
+                    if any(w in line.lower() for w in ("error", "exception", "traceback")):
+                        level = "ERROR"
+                    elif any(w in line.lower() for w in ("warn", "missing")):
+                        level = "WARNING"
+                    elif any(w in line.lower() for w in ("loaded", "ready", "started", "listening")):
+                        level = "SUCCESS"
+                    else:
+                        level = "INFO"
+                    self.log(f"  [ComfyUI] {line}", level)
+            except Exception:
+                pass  # Prozess beendet
+            self.log("[ComfyUI] Prozess beendet.", "WARNING")
+
+        t = threading.Thread(target=_stream_logs, daemon=True)
+        t.start()
+        return True
+
+    def _ensure_comfyui_running(self, tag: str = "[ComfyUI]") -> bool:
+        """Prueft ob ComfyUI erreichbar ist — startet es automatisch falls nicht.
+
+        Ablauf:
+          1. Ping GET /system_stats → sofort True wenn erreichbar.
+          2. Nicht erreichbar: _start_comfyui_process() aufrufen.
+          3. Bis zu 60 Sekunden auf Ready warten (Ping alle 3s).
+          4. True wenn ComfyUI innerhalb der Wartezeit antwortet.
+
+        Args:
+            tag: Log-Prefix fuer alle Meldungen dieser Methode.
+
+        Returns:
+            True wenn ComfyUI erreichbar, False nach Timeout/Startfehler.
+        """
+        import urllib.request
+
+        COMFYUI_URL = "http://127.0.0.1:8188"
+
+        def _ping() -> bool:
+            try:
+                with urllib.request.urlopen(
+                    f"{COMFYUI_URL}/system_stats", timeout=4
+                ) as r:
+                    r.read()
+                return True
+            except Exception:
+                return False
+
+        # ── Schritt 1: Sofort-Check ───────────────────────────────────────────
+        if _ping():
+            self.log(f"{tag} ComfyUI laeuft bereits.", "INFO")
+            return True
+
+        # ── Schritt 2: Automatisch starten ───────────────────────────────────
+        self.log(f"{tag} ComfyUI nicht erreichbar — starte automatisch...", "INFO")
+        if not self._start_comfyui_process():
+            return False  # Startfehler bereits geloggt
+
+        # ── Schritt 3: Warten bis Ready (max 60s) ────────────────────────────
+        max_wait = 60
+        interval = 3
+        waited   = 0
+        self.log(f"{tag} Warte auf ComfyUI-Start (max {max_wait}s)...", "INFO")
+
+        while waited < max_wait:
+            time.sleep(interval)
+            waited += interval
+            if _ping():
+                self.log(f"{tag} ComfyUI bereit nach {waited}s. ✅", "SUCCESS")
+                return True
+            self.log(f"{tag}   ... {waited}s", "INFO")
+
+        self.log(
+            f"{tag} Timeout — ComfyUI nach {max_wait}s noch nicht erreichbar.\n"
+            "  Starte ComfyUI manuell und versuche es erneut.",
+            "WARNING"
+        )
+        return False
+
+    def _call_comfyui_worker(self, sid: str, prompt: str, duration_sec: int,
+                             out_dir: str) -> str | None:
+        """Rendert eine Szene ueber eine lokal laufende ComfyUI-Instanz.
+
+        Workflow:
+          1. Prueft ob ComfyUI erreichbar ist (GET /system_stats).
+          2. Baut den Workflow mit _build_comfyui_workflow().
+          3. Sendet POST /prompt.
+          4. Pollt GET /history/<prompt_id> bis fertig (max 20 min).
+          5. Laedt den fertigen Clip aus ComfyUI-Output-Ordner.
+
+        Args:
+            sid:          Szenen-ID (fuer Log-Prefix).
+            prompt:       Verbesserter Szenen-Prompt.
+            duration_sec: Videodauer in Sekunden.
+            out_dir:      Zielordner fuer den heruntergeladenen Clip.
+
+        Returns:
+            Lokaler Clip-Pfad (str) bei Erfolg, None bei Fehler.
+        """
+        import urllib.request
+        import urllib.error
+
+        COMFYUI_URL = "http://127.0.0.1:8188"
+        TAG         = f"[Scene {sid}][ComfyUI]"
+
+        # ── 1. ComfyUI sicherstellen (automatisch starten falls noetig) ────────
+        if not self._ensure_comfyui_running(TAG):
+            return None
+
+        self.log(f"{TAG} ComfyUI bereit. Baue Workflow...", "INFO")
+
+        # ── 2. Workflow bauen ─────────────────────────────────────────────────
+        workflow = self._build_comfyui_workflow(prompt, duration_sec, out_dir)
+
+        # ── 3. Job abschicken ─────────────────────────────────────────────────
+        payload = json.dumps({"prompt": workflow}).encode("utf-8")
+        req     = urllib.request.Request(
+            f"{COMFYUI_URL}/prompt",
+            data    = payload,
+            headers = {"Content-Type": "application/json"},
+            method  = "POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                resp_data = json.loads(r.read().decode("utf-8"))
+        except Exception as e:
+            self.log(f"{TAG} POST /prompt fehlgeschlagen: {e}.", "WARNING")
+            return None
+
+        prompt_id = resp_data.get("prompt_id")
+        if not prompt_id:
+            self.log(f"{TAG} Keine prompt_id in Antwort: {resp_data}", "WARNING")
+            return None
+
+        self.log(f"{TAG} Job gestartet — prompt_id={prompt_id}", "INFO")
+
+        # ── 4. Polling bis fertig ─────────────────────────────────────────────
+        max_wait = 1200   # 20 Minuten
+        interval = 8      # alle 8 Sekunden
+        waited   = 0
+
+        while waited < max_wait:
+            time.sleep(interval)
+            waited += interval
+            try:
+                with urllib.request.urlopen(
+                    f"{COMFYUI_URL}/history/{prompt_id}", timeout=15
+                ) as r:
+                    hist = json.loads(r.read().decode("utf-8"))
+            except Exception as e:
+                self.log(f"{TAG} Polling-Fehler nach {waited}s: {e} — weiter...", "WARNING")
+                continue
+
+            if prompt_id not in hist:
+                self.log(f"{TAG} Warte auf Ergebnis... ({waited}s)", "INFO")
+                continue
+
+            job_data = hist[prompt_id]
+            outputs  = job_data.get("outputs", {})
+            status   = job_data.get("status", {})
+
+            # Fehler abfangen
+            if status.get("status_str") in ("error", "failed"):
+                msgs = status.get("messages", [])
+                self.log(f"{TAG} Job fehlgeschlagen: {msgs}", "WARNING")
+                return None
+
+            # Erfolgreich: Output-Datei suchen
+            clip_filename = None
+            for node_id, node_out in outputs.items():
+                # VHS_VideoCombine liefert {"gifs": [{"filename": "...", ...}]}
+                for gifs in node_out.get("gifs", []):
+                    clip_filename = gifs.get("filename")
+                    if clip_filename:
+                        break
+                if not clip_filename:
+                    # Fallback: "videos" key
+                    for vid in node_out.get("videos", []):
+                        clip_filename = vid.get("filename")
+                        if clip_filename:
+                            break
+                if clip_filename:
+                    break
+
+            if not clip_filename:
+                self.log(f"{TAG} Noch keine Output-Datei nach {waited}s...", "INFO")
+                continue
+
+            # ── 5. Clip herunterladen ─────────────────────────────────────────
+            self.log(f"{TAG} ✅ Render fertig — lade '{clip_filename}' herunter...", "SUCCESS")
+            clip_url  = f"{COMFYUI_URL}/view?filename={clip_filename}&type=output"
+            clip_path = os.path.join(out_dir, "clip_001.mp4")
+            try:
+                urllib.request.urlretrieve(clip_url, clip_path)
+                self.log(f"{TAG} ✅ Clip gespeichert: {clip_path}", "SUCCESS")
+                return clip_path
+            except Exception as e:
+                self.log(f"{TAG} Download fehlgeschlagen: {e}.", "WARNING")
+                return None
+
+        self.log(f"{TAG} Timeout nach {max_wait}s — kein Clip empfangen.", "WARNING")
+        return None
+
+    @staticmethod
+    def _install_comfyui(storage_root: str, log_cb=None) -> bool:
+        """Installiert ComfyUI Portable + WAN 2.1 1.3B + Custom Nodes einmalig.
+
+        Schritte:
+          1. Prueft ob ComfyUI-Ordner bereits existiert (ueberspringt dann).
+          2. Laedt ComfyUI Portable ZIP von GitHub.
+          3. Entpackt ins <storage_root>/ComfyUI-Portable Verzeichnis.
+          4. Erstellt venv, installiert torch (CUDA 12.1) + requirements.
+          5. Laedt WAN 2.1 1.3B Modell (safetensors) herunter.
+          6. Klont ComfyUI-Manager + ComfyUI-AudioTools als Custom Nodes.
+
+        Plattform: Windows 10/11, NVIDIA GPU (6 GB+ VRAM empfohlen).
+
+        Args:
+            storage_root: Basis-Ordner der Produktion (ComfyUI-Portable landet daneben).
+            log_cb:       Callable(msg, level) fuer Log-Ausgabe.
+
+        Returns:
+            True bei Erfolg, False bei Fehler.
+        """
+        import urllib.request
+        import zipfile
+        import shutil
+
+        log = log_cb or (lambda m, l="INFO": print(f"[{l}] {m}"))
+
+        # Zielordner: ein Level ueber storage_root (Projektroot)
+        project_root  = os.path.dirname(os.path.normpath(storage_root))
+        comfyui_dir   = os.path.join(project_root, "ComfyUI-Portable")
+        zip_tmp       = os.path.join(project_root, "_comfyui_download.zip")
+
+        # ── 1. Bereits vorhanden? ─────────────────────────────────────────────
+        main_py = os.path.join(comfyui_dir, "main.py")
+        if os.path.isfile(main_py):
+            log("[ComfyUI-Install] ComfyUI bereits installiert — ueberspringe.", "INFO")
+            log(f"  → Pfad: {comfyui_dir}", "INFO")
+            return True
+
+        # ── 2. ComfyUI Portable ZIP laden ────────────────────────────────────
+        COMFYUI_ZIP_URL = (
+            "https://github.com/comfyanonymous/ComfyUI/releases/latest/download/"
+            "ComfyUI_windows_portable_nvidia.7z"
+        )
+        # Fallback auf GitHub-Archiv (zip, kein 7z-Tool noetig)
+        COMFYUI_ZIP_FALLBACK = (
+            "https://github.com/comfyanonymous/ComfyUI/archive/refs/heads/master.zip"
+        )
+
+        log("[ComfyUI-Install] Schritt 1/6: Lade ComfyUI von GitHub...", "INFO")
+        log(f"  URL: {COMFYUI_ZIP_FALLBACK}", "INFO")
+
+        try:
+            urllib.request.urlretrieve(COMFYUI_ZIP_FALLBACK, zip_tmp)
+            log(f"[ComfyUI-Install] ZIP heruntergeladen: {zip_tmp}", "INFO")
+        except Exception as e:
+            log(f"[ComfyUI-Install] Download fehlgeschlagen: {e}", "ERROR")
+            return False
+
+        # ── 3. Entpacken ─────────────────────────────────────────────────────
+        log("[ComfyUI-Install] Schritt 2/6: Entpacke ZIP...", "INFO")
+        try:
+            with zipfile.ZipFile(zip_tmp, "r") as zf:
+                zf.extractall(project_root)
+            # GitHub-Archive haben einen Unterordner 'ComfyUI-master'
+            extracted = os.path.join(project_root, "ComfyUI-master")
+            if os.path.isdir(extracted) and not os.path.isdir(comfyui_dir):
+                shutil.move(extracted, comfyui_dir)
+            os.remove(zip_tmp)
+            log(f"[ComfyUI-Install] Entpackt nach: {comfyui_dir}", "SUCCESS")
+        except Exception as e:
+            log(f"[ComfyUI-Install] Entpacken fehlgeschlagen: {e}", "ERROR")
+            return False
+
+        # ── 4. Venv + Torch installieren ─────────────────────────────────────
+        log("[ComfyUI-Install] Schritt 3/6: Erstelle venv und installiere torch...", "INFO")
+        venv_dir = os.path.join(comfyui_dir, "venv")
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "venv", venv_dir],
+                timeout=120
+            )
+        except Exception as e:
+            log(f"[ComfyUI-Install] Venv-Erstellung fehlgeschlagen: {e}", "ERROR")
+            return False
+
+        pip_exe = (
+            os.path.join(venv_dir, "Scripts", "pip.exe")  # Windows
+            if sys.platform == "win32" else
+            os.path.join(venv_dir, "bin", "pip")
+        )
+        python_exe = (
+            os.path.join(venv_dir, "Scripts", "python.exe")
+            if sys.platform == "win32" else
+            os.path.join(venv_dir, "bin", "python")
+        )
+
+        torch_cmd = [
+            pip_exe, "install",
+            "torch", "torchvision", "torchaudio",
+            "--index-url", "https://download.pytorch.org/whl/cu121",
+        ]
+        log("[ComfyUI-Install] Installiere torch (CUDA 12.1) — kann einige Minuten dauern...", "INFO")
+        try:
+            subprocess.check_call(torch_cmd, timeout=600)
+            log("[ComfyUI-Install] torch installiert ✓", "SUCCESS")
+        except Exception as e:
+            log(f"[ComfyUI-Install] torch-Installation fehlgeschlagen: {e}", "ERROR")
+            return False
+
+        # requirements.txt
+        req_file = os.path.join(comfyui_dir, "requirements.txt")
+        if os.path.isfile(req_file):
+            log("[ComfyUI-Install] Installiere requirements.txt...", "INFO")
+            try:
+                subprocess.check_call(
+                    [pip_exe, "install", "-r", req_file],
+                    timeout=300
+                )
+                log("[ComfyUI-Install] requirements.txt installiert ✓", "SUCCESS")
+            except Exception as e:
+                log(f"[ComfyUI-Install] requirements.txt fehlgeschlagen (nicht kritisch): {e}", "WARNING")
+
+        # ── 5. WAN 2.1 1.3B Modell laden ─────────────────────────────────────
+        log("[ComfyUI-Install] Schritt 4/6: Lade WAN 2.1 1.3B Modell...", "INFO")
+        models_dir = os.path.join(comfyui_dir, "models", "checkpoints")
+        os.makedirs(models_dir, exist_ok=True)
+        model_name = "wan2.1_t2v_1.3B_bf16.safetensors"
+        model_path = os.path.join(models_dir, model_name)
+
+        # Comfy-Org repackaged version — korrekter Dateiname fuer ComfyUI CheckpointLoader
+        WAN_MODEL_URL = (
+            "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/"
+            "split_files/diffusion_models/wan2.1_t2v_1.3B_bf16.safetensors"
+        )
+        # Fallback: fp16-Variante (kleinere Datei, gleiche Quelle)
+        WAN_MODEL_URL_FP16 = (
+            "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/"
+            "split_files/diffusion_models/wan2.1_t2v_1.3B_fp16.safetensors"
+        )
+
+        if os.path.isfile(model_path):
+            log(f"[ComfyUI-Install] Modell bereits vorhanden: {model_path}", "INFO")
+        else:
+            log(f"  URL: {WAN_MODEL_URL}", "INFO")
+            log("  (ca. 2-3 GB — Geduld...)", "INFO")
+            downloaded = False
+            for attempt_url, attempt_label in [
+                (WAN_MODEL_URL,      "bf16"),
+                (WAN_MODEL_URL_FP16, "fp16"),
+            ]:
+                try:
+                    log(f"  Versuche {attempt_label}: {attempt_url}", "INFO")
+                    urllib.request.urlretrieve(attempt_url, model_path)
+                    log(f"[ComfyUI-Install] Modell geladen ✓ ({attempt_label}) → {model_path}", "SUCCESS")
+                    downloaded = True
+                    break
+                except Exception as e:
+                    log(f"  {attempt_label} fehlgeschlagen: {e}", "WARNING")
+            if not downloaded:
+                log(
+                    "[ComfyUI-Install] ⚠️  Modell-Download fehlgeschlagen.\n"
+                    "  Manuell laden und speichern nach:\n"
+                    f"  {model_path}\n"
+                    "  Quelle: https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged",
+                    "WARNING"
+                )
+
+        # ── 6. Custom Nodes klonen ────────────────────────────────────────────
+        custom_nodes_dir = os.path.join(comfyui_dir, "custom_nodes")
+        os.makedirs(custom_nodes_dir, exist_ok=True)
+
+        custom_nodes = [
+            ("ComfyUI-Manager",
+             "https://github.com/ltdrdata/ComfyUI-Manager.git"),
+            ("ComfyUI-AudioTools",
+             "https://github.com/eigenpunk/ComfyUI-audio.git"),
+        ]
+
+        log("[ComfyUI-Install] Schritt 5/6: Klone Custom Nodes...", "INFO")
+        for node_name, node_url in custom_nodes:
+            node_dir = os.path.join(custom_nodes_dir, node_name)
+            if os.path.isdir(node_dir):
+                log(f"[ComfyUI-Install] {node_name} bereits vorhanden — ueberspringe.", "INFO")
+                continue
+            log(f"  Klone {node_name}...", "INFO")
+            try:
+                subprocess.check_call(
+                    ["git", "clone", "--depth=1", node_url, node_dir],
+                    timeout=120
+                )
+                log(f"  {node_name} geklont ✓", "SUCCESS")
+            except FileNotFoundError:
+                log("  git nicht gefunden — Custom Nodes muessen manuell installiert werden.", "WARNING")
+                break
+            except Exception as e:
+                log(f"  {node_name} fehlgeschlagen (nicht kritisch): {e}", "WARNING")
+
+        # ── Startskript erstellen ─────────────────────────────────────────────
+        log("[ComfyUI-Install] Schritt 6/6: Erstelle Startskript...", "INFO")
+        bat_path = os.path.join(comfyui_dir, "start_comfyui.bat")
+        bat_content = (
+            "@echo off\n"
+            "echo Starte ComfyUI...\n"
+            f'"{python_exe}" main.py --listen\n'
+            "pause\n"
+        )
+        try:
+            with open(bat_path, "w", encoding="utf-8") as f:
+                f.write(bat_content)
+            log(f"[ComfyUI-Install] Startskript: {bat_path}", "INFO")
+        except Exception:
+            pass
+
+        log("", "INFO")
+        log("══════════════════════════════════════════════════════", "SUCCESS")
+        log("  ComfyUI-Installation abgeschlossen! ✅", "SUCCESS")
+        log(f"  Pfad: {comfyui_dir}", "SUCCESS")
+        log("══════════════════════════════════════════════════════", "SUCCESS")
+
+        # ── Schritt 7: ComfyUI direkt starten ────────────────────────────────
+        log("[ComfyUI-Install] Schritt 7/7 (Bonus): Starte ComfyUI...", "INFO")
+        try:
+            creation_flags = 0
+            if sys.platform == "win32":
+                creation_flags = subprocess.CREATE_NO_WINDOW
+
+            proc = subprocess.Popen(
+                [python_exe, "main.py", "--listen"],
+                cwd           = comfyui_dir,
+                stdout        = subprocess.PIPE,
+                stderr        = subprocess.STDOUT,
+                bufsize       = 1,
+                creationflags = creation_flags,
+                encoding      = "utf-8",
+                errors        = "replace",
+            )
+            log(f"[ComfyUI] Prozess gestartet (PID {proc.pid})", "SUCCESS")
+            log(f"[ComfyUI] Erreichbar unter: http://127.0.0.1:8188", "INFO")
+            log("[ComfyUI] Logs folgen — warte auf 'To see the GUI go to:'", "INFO")
+
+            # Log-Stream-Thread (daemon — endet mit Hauptprozess)
+            def _stream():
+                try:
+                    for line in proc.stdout:
+                        line = line.rstrip()
+                        if not line:
+                            continue
+                        if any(w in line.lower() for w in ("error", "exception", "traceback")):
+                            lvl = "ERROR"
+                        elif any(w in line.lower() for w in ("warn", "missing")):
+                            lvl = "WARNING"
+                        elif any(w in line.lower() for w in ("loaded", "ready", "started",
+                                                              "listening", "to see the gui")):
+                            lvl = "SUCCESS"
+                        else:
+                            lvl = "INFO"
+                        log(f"  [ComfyUI] {line}", lvl)
+                except Exception:
+                    pass
+                log("[ComfyUI] Prozess beendet.", "WARNING")
+
+            threading.Thread(target=_stream, daemon=True).start()
+
+        except Exception as e:
+            log(f"[ComfyUI] Auto-Start fehlgeschlagen: {e}", "WARNING")
+            log(f"  → Manuell starten: {bat_path}", "INFO")
+
+        return True
+
     def run_production(self, scene_filter: str = None) -> dict:
         """Runs the full production pipeline.
 
@@ -1345,7 +2063,8 @@ class SceneEditDialog(tk.Toplevel):
     """
 
     # All known cinematic worker types including local ones
-    ALL_TOOLS = ["sora", "runway", "seedance", "digen", "myedit", "suno", "capcut"]
+    ALL_TOOLS = ["sora", "runway", "seedance", "digen", "myedit", "suno", "capcut",
+                 "comfyui_local"]
 
     def __init__(self, parent, scene: dict, storage_root: str,
                  loaded_workers: list, on_save=None):
@@ -2025,6 +2744,9 @@ class ProducerApp(tk.Tk):
                          self._run_full_production, COLORS["gold"]).pack(side="left", padx=4)
         self._action_btn(bf, "\U0001f4c2  Open Storage",
                          self._open_storage, COLORS["accent"]).pack(side="left", padx=4)
+        # ── ComfyUI-Installations-Button (neu v1.1.0) ─────────────────────────
+        self._action_btn(bf, "\U0001f5a5\ufe0f  Install ComfyUI",
+                         self._on_install_comfyui, COLORS["success"]).pack(side="left", padx=4)
         self._flat_btn(bf, "\U0001f5d1  Clear Log", self._clear_log).pack(side="right", padx=4)
         self._action_btn(bf, "\u25a0  STOP",
                          self._stop_production, COLORS["error"]).pack(side="right", padx=4)
@@ -2786,6 +3508,70 @@ class ProducerApp(tk.Tk):
         if self._orchestrator:
             self._orchestrator.stop()
             self._log("Stopping production...", "WARNING")
+
+    def _on_install_comfyui(self):
+        """GUI-Handler fuer den '🖥️ Install ComfyUI'-Button.
+
+        Prueft ob bereits installiert, fragt Benutzer, startet Installation
+        in einem Daemon-Thread damit das GUI responsiv bleibt.
+        """
+        storage = os.path.normpath(self._storage_var.get().strip())
+        project_root = os.path.dirname(storage)
+        comfyui_dir  = os.path.join(project_root, "ComfyUI-Portable")
+        main_py      = os.path.join(comfyui_dir, "main.py")
+
+        if os.path.isfile(main_py):
+            msg = (
+                f"ComfyUI ist bereits installiert:\n{comfyui_dir}\n\n"
+                "Trotzdem erneut pruefen / Custom Nodes nachinstallieren?"
+            )
+            if not messagebox.askyesno("ComfyUI bereits vorhanden", msg):
+                self._log("[ComfyUI] Installation abgebrochen — bereits vorhanden.", "INFO")
+                return
+
+        confirm = messagebox.askyesno(
+            "ComfyUI installieren",
+            "Folgendes wird installiert:\n\n"
+            "  • ComfyUI Portable (GitHub master)\n"
+            "  • venv + torch (CUDA 12.1)\n"
+            "  • WAN 2.1 1.3B Modell (~2-5 GB)\n"
+            "  • ComfyUI-Manager\n"
+            "  • ComfyUI-AudioTools\n\n"
+            f"Ziel: {comfyui_dir}\n\n"
+            "Installation starten? (dauert einige Minuten)"
+        )
+        if not confirm:
+            self._log("[ComfyUI] Installation abgebrochen.", "INFO")
+            return
+
+        self._log("[ComfyUI] Starte Installation im Hintergrund...", "INFO")
+        self._log(f"[ComfyUI] Ziel: {comfyui_dir}", "INFO")
+
+        def _run_install():
+            ok = ProductionOrchestrator._install_comfyui(
+                storage_root = storage,
+                log_cb       = self._log,
+            )
+            if ok:
+                self.after(0, lambda: messagebox.showinfo(
+                    "ComfyUI installiert ✅",
+                    f"ComfyUI erfolgreich installiert!\n\n"
+                    f"Pfad: {comfyui_dir}\n\n"
+                    f"Start: start_comfyui.bat doppelklicken\n"
+                    f"Dann Worker 'comfyui_local' einer Szene zuweisen."
+                ))
+            else:
+                self.after(0, lambda: messagebox.showerror(
+                    "Installation fehlgeschlagen",
+                    "ComfyUI-Installation nicht vollständig abgeschlossen.\n"
+                    "Siehe Log fuer Details.\n\n"
+                    "Haeufige Ursachen:\n"
+                    "  • Keine Internetverbindung\n"
+                    "  • git nicht installiert (fuer Custom Nodes)\n"
+                    "  • Zu wenig Speicherplatz"
+                ))
+
+        threading.Thread(target=_run_install, daemon=True).start()
 
     def _open_storage(self):
         """Opens the storage root directory in Windows Explorer."""

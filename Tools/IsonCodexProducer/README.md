@@ -3,7 +3,7 @@
 **LYRA as Cinematic Coordinator — AI Film Production Orchestrator**
 
 ```
-DeepSeek (Ison) → LYRA (Coordinator) → Workers (Sora / Runway / Seedance / Digen / ...)
+DeepSeek (Ison) → LYRA (Coordinator) → Workers (Sora / Runway / Seedance / Digen / ComfyUI / ...)
 ```
 
 ---
@@ -17,6 +17,9 @@ own origin — using AI video, audio and editing tools as workers.
 The built-in scene list covers the full story in 55+ scenes. A **Script Supervisor**
 feature can import any novel or screenplay and generate a new scene list via LLM.
 
+A **local ComfyUI worker** (`comfyui_local`) is included for GPU-accelerated video
+generation directly on Lyra — no API key required.
+
 ---
 
 ## Architecture
@@ -26,18 +29,26 @@ IsonCodexProducer.py
 ├── ProductionOrchestrator     Core production logic (no GUI)
 │   ├── generate_scene()       DeepSeek prompt enhancement → Worker API call
 │   ├── _find_video_worker()   Matches scene tool to workers.json entry
+│   │                          (comfyui_local: auto-resolved, no entry needed)
 │   ├── _call_video_worker()   HTTP POST → polling → clip download
+│   │   └── comfyui_local      → _call_comfyui_worker() (local dispatch)
+│   ├── _ensure_comfyui_running()  Ping → auto-start → wait up to 60s
+│   ├── _start_comfyui_process()   Subprocess + live log streaming into GUI
+│   ├── _call_comfyui_worker() ComfyUI workflow → poll /history → download clip
+│   ├── _build_comfyui_workflow()  Builds WAN 2.1 workflow from JSON template or built-in
 │   └── run_production()       Full pipeline with stop/resume
 │
 ├── SceneEditDialog            Per-scene editor (double-click)
 │   ├── Attributes tab         id, chapter, title, duration, chars, tool
+│   │                          (comfyui_local selectable in tool dropdown)
 │   ├── Prompt tabs            Enhanced (DeepSeek) | Base
 │   └── Clips tab              mp4 list, right-click Play/Open/Delete
 │
 └── ProducerApp                tkinter GUI
     ├── Config panel           Storage, Script Supervisor, Dry Run
     ├── Scene list             All scenes + TOTAL row
-    └── Production log         Live output
+    ├── Production log         Live output (incl. ComfyUI process logs)
+    └── Buttons                START · Open Storage · 🖥️ Install ComfyUI · STOP
 ```
 
 ---
@@ -51,6 +62,72 @@ python IsonCodexProducer.py --scene S01     # single scene
 ```
 
 **Requirements:** Python 3.10+, tkinter
+
+---
+
+## ComfyUI Local Worker
+
+A built-in worker type (`comfyui_local`) enables local video generation using
+**WAN 2.1 1.3B** via a locally running ComfyUI instance. No API key required.
+
+### One-Click Installation
+
+Click **🖥️ Install ComfyUI** in the main button bar. The installer:
+
+1. Downloads ComfyUI from GitHub (master ZIP)
+2. Extracts to `<project>/ComfyUI-Portable/`
+3. Creates a Python venv and installs **torch (CUDA 12.1)**
+4. Installs `requirements.txt`
+5. Downloads **WAN 2.1 1.3B** model from Comfy-Org repackaged repo
+   (`wan2.1_t2v_1.3B_bf16.safetensors`, ~2–3 GB; falls back to fp16 if bf16 fails)
+6. Clones **ComfyUI-Manager** and **ComfyUI-AudioTools** as custom nodes
+7. Writes `start_comfyui.bat`
+8. **Starts ComfyUI immediately** — live process logs stream into the production log
+
+If ComfyUI is already installed, the installer skips existing components and asks
+before re-running.
+
+### Automatic Start on Production
+
+When a scene has `tool: comfyui_local` assigned and production runs:
+
+1. **Ping** `http://127.0.0.1:8188/system_stats` — already running → continue
+2. **Not running** → `_start_comfyui_process()` launches `python main.py --listen`
+   in the ComfyUI-Portable directory (no console window, `CREATE_NO_WINDOW`)
+3. **Wait** up to 60 seconds, pinging every 3 seconds
+4. **Ready** → workflow is built and submitted
+
+ComfyUI stdout/stderr is streamed line-by-line into the production log,
+with automatic level detection (`error` → ERROR, `warn` → WARNING, `loaded/ready` → SUCCESS).
+
+### Workflow
+
+The worker builds a WAN 2.1 Text-to-Video workflow automatically:
+
+1. Loads `<storage>/config/comfyui_workflow_template.json` if it exists
+2. Falls back to an embedded WAN 2.1 minimal workflow (848×480, 16fps,
+   KSampler with Euler/Karras, 25 steps)
+3. Injects the enhanced scene prompt into all `CLIPTextEncode` nodes
+   (replaces `__PROMPT__` placeholder, or first positive node)
+4. POSTs to `http://127.0.0.1:8188/prompt`
+5. Polls `GET /history/<prompt_id>` every 8 seconds (max 20 minutes)
+6. Downloads finished clip from `GET /view?filename=...&type=output`
+
+**Custom workflow template:** place `comfyui_workflow_template.json` in
+`<storage>/config/` or next to the storage root to override the built-in workflow.
+Use `__PROMPT__` as the placeholder for the scene prompt in your CLIPTextEncode node.
+
+### Assigning ComfyUI to a Scene
+
+In the Scene Edit dialog (double-click any scene), select `comfyui_local` from
+the **Tool** dropdown. No workers.json entry is needed — the worker is resolved
+automatically from the built-in WORKERS list.
+
+### Hardware Requirements
+
+- **GPU:** NVIDIA, 6 GB+ VRAM recommended (WAN 2.1 1.3B requires ~8 GB VRAM)
+- **Platform:** Windows 10/11
+- **Storage:** ~5–8 GB for ComfyUI + model
 
 ---
 
@@ -92,6 +169,7 @@ START PRODUCTION (Dry Run OFF)
       ├── Step 1: DeepSeek enhances base prompt
       ├── Step 2: Write prompt.txt (Base + Enhanced + Visual DNA)
       └── Step 3: Call video Worker API
+              ├── comfyui_local  → _ensure_comfyui_running() → ComfyUI workflow
               ├── Sync response  {"status":"success","url":"..."}  → download clip
               ├── Async response {"status":"pending","job_id":"abc"} → poll /status/{id}
               └── Error / timeout → SKIP scene, log reason, continue
@@ -154,14 +232,15 @@ Workers are loaded from `~/.openclaw/workers.json` (same file as OpenClaw).
 
 ### Video Workers (clip generation)
 
-| Type | Tool | Endpoint |
+| Type | Tool | Notes |
 |---|---|---|
 | `sora` | Sora 2 (Bing) | Wide shots, landscapes, large spaces |
 | `runway` | Runway | Fractals, data streams, dream sequences |
 | `seedance` | Seedance 2.0 | Atmospheric transitions, nature, mood |
 | `digen` | Digen (CapCut) | Dialogues, multi-character conversations |
+| `comfyui_local` | ComfyUI (WAN 2.1) | Local GPU — no API key, auto-start |
 
-**Worker API contract:**
+**Worker API contract (external workers):**
 
 ```json
 POST <url>/generate
@@ -181,6 +260,10 @@ Response options:
 ```
 
 Polling: every 10 seconds, max 10 minutes, then timeout → SKIP.
+
+**comfyui_local** does not use the HTTP worker contract above — it communicates
+directly with the ComfyUI API (`POST /prompt`, `GET /history/{id}`, `GET /view`).
+It requires no entry in `workers.json` and no API key.
 
 ### LLM Workers (prompt enhancement + Script Supervisor)
 
@@ -225,6 +308,7 @@ Embedded in every enhanced prompt to ensure consistent visual style across all s
 <StorageRoot>/                          default: <project>/LyraFilmProduktion/
 ├── config/
 │   ├── lyra_production_config.json     Production metadata
+│   ├── comfyui_workflow_template.json  Optional — overrides built-in WAN 2.1 workflow
 │   ├── szenen_importiert.json          Active imported scene list (if any)
 │   └── szenen_default.json             Built-in Ison-Codex scenes (backup)
 ├── style/
@@ -248,6 +332,18 @@ Embedded in every enhanced prompt to ensure consistent visual style across all s
     └── TOTAL/
         ├── latest_total.txt            Always the most recent master prompt
         └── YYYY-MM-DD_HH-MM_total.txt  Timestamped versions
+
+<project>/
+└── ComfyUI-Portable/                   Installed by 🖥️ Install ComfyUI button
+    ├── main.py
+    ├── start_comfyui.bat               Manual start script
+    ├── venv/                           Python venv with torch (CUDA 12.1)
+    ├── models/
+    │   └── checkpoints/
+    │       └── wan2.1_t2v_1.3B_bf16.safetensors
+    └── custom_nodes/
+        ├── ComfyUI-Manager/
+        └── ComfyUI-AudioTools/
 ```
 
 ---
@@ -278,12 +374,14 @@ The default is resolved as:
 
 | File | Purpose |
 |---|---|
-| `IsonCodexProducer.py` | Main application (2800+ lines) |
+| `IsonCodexProducer.py` | Main application (3600+ lines) |
 | `~/.openclaw/workers.json` | Worker definitions shared with OpenClaw |
 | `~/.openclaw/ison_producer.json` | Saved storage path |
 | `<storage>/config/szenen_importiert.json` | Active imported scene list |
 | `<storage>/config/szenen_default.json` | Built-in Ison-Codex backup |
+| `<storage>/config/comfyui_workflow_template.json` | Custom ComfyUI workflow (optional) |
 | `<storage>/szenen/<id>/prompt.txt` | Per-scene prompts (Base + Enhanced) |
+| `<project>/ComfyUI-Portable/start_comfyui.bat` | Manual ComfyUI start script |
 
 ---
 
