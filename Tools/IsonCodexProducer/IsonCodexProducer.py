@@ -29,6 +29,7 @@ Python: 3.10+
 import os
 import sys
 import json
+import urllib.parse
 import time
 import datetime
 import threading
@@ -653,6 +654,97 @@ CHARACTERS = {
 # ─────────────────────────────────────────────────────────────────────────────
 # PRODUCTION LOGIC (headless, no tkinter dependency)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _kill_comfyui_port(port: int = 8188, log_cb=None) -> None:
+    """Beendet alle Prozesse auf dem ComfyUI-Port (Modul-Ebene, kein self).
+
+    Kann von statischen Methoden (_install_comfyui) UND Instanzmethoden
+    (_kill_comfyui_on_port) aufgerufen werden.
+
+    Strategie:
+      1. wmic — findet python.exe mit 'main.py' + 'ComfyUI' im CommandLine
+      2. netstat -ano — alle PIDs auf dem Port (alle TCP-States)
+      3. taskkill /F fuer jeden gefundenen PID
+      4. Socket-Test bis Port wirklich frei (max 5s)
+    """
+    log = log_cb or (lambda m, l="INFO": None)
+    if sys.platform != "win32":
+        return
+
+    pids: set[int] = set()
+
+    # wmic: python.exe mit ComfyUI main.py im CommandLine
+    try:
+        r = subprocess.run(
+            ["wmic", "process", "where",
+             "name='python.exe' or name='pythonw.exe'",
+             "get", "ProcessId,CommandLine", "/format:csv"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=10, creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        for line in r.stdout.decode(errors="replace").splitlines():
+            lo = line.lower()
+            if "main.py" in lo and ("comfyui" in lo or str(port) in lo):
+                parts = line.strip().split(",")
+                try:
+                    pid = int(parts[-1].strip())
+                    if pid > 4:
+                        pids.add(pid)
+                except (ValueError, IndexError):
+                    pass
+    except Exception:
+        pass
+
+    # netstat: alle PIDs auf Port (LISTEN, ESTABLISHED, TIME_WAIT, ...)
+    try:
+        r = subprocess.run(
+            ["netstat", "-ano"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=10, creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        for line in r.stdout.decode(errors="replace").splitlines():
+            if f":{port}" in line:
+                parts = line.strip().split()
+                if parts:
+                    try:
+                        pid = int(parts[-1])
+                        if pid > 4:
+                            pids.add(pid)
+                    except ValueError:
+                        pass
+    except Exception:
+        pass
+
+    # Alle gefundenen PIDs beenden
+    for pid in pids:
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=5, creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            log(f"[ComfyUI] PID {pid} auf Port {port} beendet ✓", "INFO")
+        except Exception:
+            pass
+
+    if not pids:
+        return
+
+    # Warten bis Port wirklich frei ist (max 5s)
+    import socket as _sock
+    for _ in range(10):
+        time.sleep(0.5)
+        try:
+            s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+            s.settimeout(0.3)
+            result = s.connect_ex(("127.0.0.1", port))
+            s.close()
+            if result != 0:
+                break
+        except Exception:
+            break
+    log(f"[ComfyUI] Port {port} freigegeben ✓", "INFO")
+
 
 class ProductionOrchestrator:
     """LYRA as Cinematic Coordinator -- empfaengt, speichert, verteilt, trackt.
@@ -1350,47 +1442,109 @@ class ProductionOrchestrator:
 
         if workflow is None:
             # Eingebettetes Minimal-Template fuer WAN 2.1 1.3B (Text2Video)
+            # Verwendet ComfyUI-native WAN-Nodes (kein CheckpointLoaderSimple!)
+            # Modell liegt in models/diffusion_models/, T5 in models/text_encoders/
             self.log("[ComfyUI] Kein Template gefunden — nutze eingebettetes WAN-2.1-Minimal-Workflow.", "INFO")
             fps        = 16
-            num_frames = max(16, min(120, duration_sec * fps))
+            num_frames = max(16, min(81, duration_sec * fps))  # WAN max 81 frames @ 480p
+
+            # Bestimme Dateiname: bf16 bevorzugt, fp16 als Fallback
+            project_root   = os.path.dirname(os.path.normpath(self.storage_root))
+            comfyui_dir    = os.path.join(project_root, "ComfyUI-Portable")
+            diff_models    = os.path.join(comfyui_dir, "models", "diffusion_models")
+            model_bf16     = "wan2.1_t2v_1.3B_bf16.safetensors"
+            model_fp16     = "wan2.1_t2v_1.3B_fp16.safetensors"
+            if os.path.isfile(os.path.join(diff_models, model_bf16)):
+                diffusion_model = model_bf16
+            else:
+                diffusion_model = model_fp16  # Fallback
+
+            # T5 Text Encoder — ersten verfuegbaren in models/text_encoders/ suchen
+            t5_dir_wf  = os.path.join(comfyui_dir, "models", "text_encoders")
+            t5_encoder = "umt5_xxl_fp8_e4m3fn_scaled.safetensors"  # bevorzugt
+            if not os.path.isfile(os.path.join(t5_dir_wf, t5_encoder)):
+                # Alternativen suchen (fp16, bf16, andere Namen)
+                t5_alternatives = [
+                    "umt5_xxl_fp16.safetensors",
+                    "umt5-xxl-enc-bf16.safetensors",
+                    "umt5_xxl_bf16.safetensors",
+                ]
+                for alt in t5_alternatives:
+                    if os.path.isfile(os.path.join(t5_dir_wf, alt)):
+                        t5_encoder = alt
+                        break
+                else:
+                    # Erste .safetensors Datei im Ordner nehmen
+                    try:
+                        found = [f for f in os.listdir(t5_dir_wf) if f.endswith(".safetensors")]
+                        if found:
+                            t5_encoder = found[0]
+                    except Exception:
+                        pass
+
+            # WAN VAE — ersten verfuegbaren in models/vae/ suchen
+            vae_dir_wf = os.path.join(comfyui_dir, "models", "vae")
+            wan_vae    = "wan_2.1_vae.safetensors"
+            if not os.path.isfile(os.path.join(vae_dir_wf, wan_vae)):
+                try:
+                    found_vae = [f for f in os.listdir(vae_dir_wf)
+                                 if f.endswith(".safetensors") and "wan" in f.lower()]
+                    if found_vae:
+                        wan_vae = found_vae[0]
+                    else:
+                        all_vae = [f for f in os.listdir(vae_dir_wf) if f.endswith(".safetensors")]
+                        if all_vae:
+                            wan_vae = all_vae[0]
+                except Exception:
+                    pass
+
+            self.log(f"[ComfyUI] Workflow: diffusion={diffusion_model}", "INFO")
+            self.log(f"[ComfyUI] Workflow: t5={t5_encoder}", "INFO")
+            self.log(f"[ComfyUI] Workflow: vae={wan_vae}", "INFO")
+
             workflow = {
+                # Node 1: Lade WAN Diffusion Model
                 "1": {
-                    "class_type": "CheckpointLoaderSimple",
+                    "class_type": "UNETLoader",
                     "inputs": {
-                        "ckpt_name": "wan2.1_t2v_1.3B_bf16.safetensors"
+                        "unet_name": diffusion_model,
+                        "weight_dtype": "default"
                     }
                 },
+                # Node 2: Lade T5 Text Encoder
                 "2": {
-                    "class_type": "CLIPTextEncode",
+                    "class_type": "CLIPLoader",
                     "inputs": {
-                        "clip":         ["1", 1],
-                        "text":         "__PROMPT__"
+                        "clip_name": t5_encoder,
+                        "type": "wan"
                     }
                 },
+                # Node 3: Lade WAN VAE
                 "3": {
+                    "class_type": "VAELoader",
+                    "inputs": {
+                        "vae_name": wan_vae
+                    }
+                },
+                # Node 4: Positiver Prompt (wird durch Szenen-Prompt ersetzt)
+                "4": {
                     "class_type": "CLIPTextEncode",
                     "inputs": {
-                        "clip":         ["1", 1],
-                        "text":         "blurry, low quality, watermark, text overlay, distorted"
+                        "clip": ["2", 0],
+                        "text": "__PROMPT__"
                     }
                 },
-                "4": {
-                    "class_type": "KSampler",
-                    "inputs": {
-                        "model":            ["1", 0],
-                        "positive":         ["2", 0],
-                        "negative":         ["3", 0],
-                        "latent_image":     ["5", 0],
-                        "seed":             42,
-                        "steps":            25,
-                        "cfg":              7.0,
-                        "sampler_name":     "euler",
-                        "scheduler":        "karras",
-                        "denoise":          1.0
-                    }
-                },
+                # Node 5: Negativer Prompt
                 "5": {
-                    "class_type": "EmptyLatentVideo",
+                    "class_type": "CLIPTextEncode",
+                    "inputs": {
+                        "clip": ["2", 0],
+                        "text": "blurry, low quality, watermark, text, distorted, ugly, worst quality"
+                    }
+                },
+                # Node 6: Leeres Latent Video
+                "6": {
+                    "class_type": "EmptyHunyuanLatentVideo",
                     "inputs": {
                         "width":      848,
                         "height":     480,
@@ -1398,22 +1552,42 @@ class ProductionOrchestrator:
                         "batch_size": 1
                     }
                 },
-                "6": {
-                    "class_type": "VAEDecode",
+                # Node 7: KSampler (WAN nutzt FlowMatch / euler)
+                "7": {
+                    "class_type": "KSampler",
                     "inputs": {
-                        "samples": ["4", 0],
-                        "vae":     ["1", 2]
+                        "model":         ["1", 0],
+                        "positive":      ["4", 0],
+                        "negative":      ["5", 0],
+                        "latent_image":  ["6", 0],
+                        "seed":          42,
+                        "steps":         20,
+                        "cfg":           6.0,
+                        "sampler_name":  "euler",
+                        "scheduler":     "simple",
+                        "denoise":       1.0
                     }
                 },
-                "7": {
-                    "class_type": "VHS_VideoCombine",
+                # Node 8: VAE Decode
+                "8": {
+                    "class_type": "VAEDecode",
                     "inputs": {
-                        "images":          ["6", 0],
-                        "frame_rate":      fps,
-                        "loop_count":      0,
+                        "samples": ["7", 0],
+                        "vae":     ["3", 0]
+                    }
+                },
+                # Node 9: Video speichern — nutze nativen SaveAnimatedWEBP
+                # (immer verfuegbar, kein Custom Node noetig).
+                # VHS_VideoCombine wuerde ComfyUI-VideoHelperSuite benoetigen.
+                "9": {
+                    "class_type": "SaveAnimatedWEBP",
+                    "inputs": {
+                        "images":          ["8", 0],
                         "filename_prefix": "ison_clip",
-                        "format":          "video/h264-mp4",
-                        "save_output":     True
+                        "fps":             fps,
+                        "lossless":        False,
+                        "quality":         85,
+                        "method":          "default"
                     }
                 }
             }
@@ -1436,26 +1610,47 @@ class ProductionOrchestrator:
                     prompt_injected = True
                     break
 
-        # Output-Pfad in VHS_VideoCombine setzen (falls vorhanden)
+        # Output-Pfad in Video/Image-Save-Nodes setzen (falls vorhanden)
         clip_prefix = os.path.join(out_dir, "clip_001").replace("\\", "/")
         for node_id, node in workflow.items():
-            if node.get("class_type") in ("VHS_VideoCombine", "SaveVideo", "VideoSave"):
+            if node.get("class_type") in (
+                "VHS_VideoCombine", "SaveVideo", "VideoSave",
+                "SaveAnimatedWEBP", "SaveAnimatedPNG", "SaveImage",
+            ):
                 node["inputs"]["filename_prefix"] = clip_prefix
 
         return workflow
 
+    def _kill_comfyui_on_port(self, port: int = 8188):
+        """Beendet alle ComfyUI-Prozesse auf dem Port. Delegiert an _kill_comfyui_port()."""
+        # Eigenen gespeicherten Prozess zuerst beenden
+        if self._comfyui_process is not None:
+            try:
+                if self._comfyui_process.poll() is None:
+                    self._comfyui_process.terminate()
+                    try:
+                        self._comfyui_process.wait(timeout=5)
+                    except Exception:
+                        self._comfyui_process.kill()
+                    self.log(f"[ComfyUI] Alter Prozess (PID {self._comfyui_process.pid}) beendet.", "INFO")
+            except Exception:
+                pass
+            self._comfyui_process = None
+        # Modul-Funktion fuer Rest (wmic + netstat + taskkill)
+        _kill_comfyui_port(port, log_cb=self.log)
+
     def _start_comfyui_process(self) -> bool:
         """Startet ComfyUI als Hintergrundprozess und streamt dessen Logs ins GUI.
 
-        Sucht start_comfyui.bat (oder python main.py) im ComfyUI-Portable-Ordner.
-        Startet den Prozess ohne eigenes Consolefenster (Windows: CREATE_NO_WINDOW).
-        Liest stdout + stderr in einem Daemon-Thread und leitet alles an self.log().
+        Sucht das richtige Python (venv > System-Python mit torch > sys.executable).
+        Fuehrt vor dem Start einen Diagnose-Check durch und zeigt Fehler sofort an.
+        Startet ohne eigenes Consolefenster (Windows: CREATE_NO_WINDOW).
 
         Returns:
-            True  wenn Prozess erfolgreich gestartet wurde.
-            False wenn ComfyUI-Ordner nicht gefunden oder Startfehler.
+            True  wenn Prozess gestartet.
+            False wenn ComfyUI-Ordner fehlt oder Startfehler.
         """
-        # ComfyUI-Verzeichnis ableiten (ein Level ueber storage_root)
+        # ── ComfyUI-Verzeichnis ermitteln ─────────────────────────────────────
         project_root = os.path.dirname(os.path.normpath(self.storage_root))
         comfyui_dir  = os.path.join(project_root, "ComfyUI-Portable")
         main_py      = os.path.join(comfyui_dir, "main.py")
@@ -1469,63 +1664,169 @@ class ProductionOrchestrator:
             )
             return False
 
-        # Python-Interpreter aus dem venv
-        python_exe = os.path.join(comfyui_dir, "venv", "Scripts", "python.exe")
-        if not os.path.isfile(python_exe):
-            # Fallback: System-Python
-            python_exe = sys.executable
+        # ── Richtiges Python bestimmen ────────────────────────────────────────
+        # Prioritaet: venv > System-Python das torch kennt > sys.executable
+        python_exe = None
 
-        cmd = [python_exe, "main.py", "--listen"]
-        self.log(f"[ComfyUI] Starte ComfyUI: {' '.join(cmd)}", "INFO")
-        self.log(f"[ComfyUI] Arbeitsverzeichnis: {comfyui_dir}", "INFO")
+        # 1. venv-Python (bevorzugt — isolierte Installation)
+        venv_py = os.path.join(comfyui_dir, "venv", "Scripts", "python.exe")
+        if os.path.isfile(venv_py):
+            python_exe = venv_py
+            self.log(f"[ComfyUI] Nutze venv-Python: {venv_py}", "INFO")
+
+        # 2. System-Python das torch importieren kann
+        if not python_exe:
+            for cand in [
+                sys.executable,
+                os.path.join(os.path.dirname(sys.executable), "python.exe"),
+            ]:
+                if not cand or not os.path.isfile(cand):
+                    continue
+                try:
+                    result = subprocess.run(
+                        [cand, "-c", "import torch; print('ok')"],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        timeout=10, cwd=comfyui_dir,
+                    )
+                    if result.returncode == 0:
+                        python_exe = cand
+                        self.log(f"[ComfyUI] Nutze System-Python (torch gefunden): {cand}", "INFO")
+                        break
+                except Exception:
+                    continue
+
+        # 3. sys.executable als letzter Ausweg
+        if not python_exe:
+            python_exe = sys.executable
+            self.log(f"[ComfyUI] Nutze sys.executable als Fallback: {python_exe}", "WARNING")
+
+        # ── Diagnose-Check: main.py kurz testen (gibt Importfehler sofort aus) ─
+        self.log("[ComfyUI] Diagnose: prüfe Python-Umgebung...", "INFO")
+        try:
+            diag = subprocess.run(
+                [python_exe, "-c",
+                 "import sys; sys.path.insert(0, '.'); "
+                 "import importlib; "
+                 "[importlib.import_module(m) for m in "
+                 "['torch', 'numpy', 'PIL', 'aiohttp']];"
+                 "print('OK')"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=15, cwd=comfyui_dir,
+            )
+            if diag.returncode == 0:
+                self.log("[ComfyUI] Diagnose: torch/numpy/PIL/aiohttp OK ✓", "SUCCESS")
+            else:
+                err = diag.stderr.decode(errors="replace").strip()
+                out = diag.stdout.decode(errors="replace").strip()
+                self.log(f"[ComfyUI] ⚠️  Diagnose: fehlende Abhaengigkeiten!", "WARNING")
+                if err:
+                    # Ersten relevanten Fehler extrahieren
+                    for line in err.splitlines():
+                        if line.strip():
+                            self.log(f"  {line}", "WARNING")
+                if out:
+                    self.log(f"  stdout: {out}", "INFO")
+                self.log(
+                    "[ComfyUI] Tipp: requirements manuell installieren:\n"
+                    f"  {python_exe} -m pip install -r {os.path.join(comfyui_dir, 'requirements.txt')}",
+                    "WARNING"
+                )
+        except Exception as e:
+            self.log(f"[ComfyUI] Diagnose-Check fehlgeschlagen: {e}", "WARNING")
+
+        # ── Prozess starten ───────────────────────────────────────────────────
+        # Schritt 0: Alten ComfyUI-Prozess auf Port 8188 beenden
+        self._kill_comfyui_on_port(8188)
+
+        # CUDA-Verfuegbarkeit pruefen — falls nicht vorhanden: --cpu Flag setzen
+        cuda_available = False
+        try:
+            cuda_check = subprocess.run(
+                [python_exe, "-c",
+                 "import torch; print(torch.cuda.is_available())"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=10, cwd=comfyui_dir,
+            )
+            cuda_available = cuda_check.stdout.decode(errors="replace").strip() == "True"
+        except Exception:
+            pass
+
+        if cuda_available:
+            self.log("[ComfyUI] CUDA verfuegbar ✓ — starte mit GPU-Unterstuetzung.", "SUCCESS")
+        else:
+            self.log(
+                "[ComfyUI] ⚠️  CUDA nicht verfuegbar — starte im CPU-Modus (langsam!).",
+                "WARNING"
+            )
+
+        # Eindeutige DB-Datei pro Instanz (verhindert SQLite-Lock bei Mehrfachstart)
+        db_path = os.path.join(comfyui_dir, "user", "comfyui_lyra.db")
+        cmd = [python_exe, "main.py", "--listen", "--port", "8188",
+               "--database-url", f"sqlite:///{db_path}"]
+        if not cuda_available:
+            cmd.append("--cpu")
+
+        self.log(f"[ComfyUI] Starte: {' '.join(cmd)}", "INFO")
 
         try:
-            # Windows: kein eigenes Consolefenster
             creation_flags = 0
             if sys.platform == "win32":
                 creation_flags = subprocess.CREATE_NO_WINDOW
 
             proc = subprocess.Popen(
                 cmd,
-                cwd            = comfyui_dir,
-                stdout         = subprocess.PIPE,
-                stderr         = subprocess.STDOUT,   # stderr in stdout mergen
-                bufsize        = 1,
-                creationflags  = creation_flags,
-                encoding       = "utf-8",
-                errors         = "replace",
+                cwd           = comfyui_dir,
+                stdout        = subprocess.PIPE,
+                stderr        = subprocess.STDOUT,  # stderr in stdout mergen
+                bufsize       = 1,
+                creationflags = creation_flags,
+                encoding      = "utf-8",
+                errors        = "replace",
             )
         except Exception as e:
-            self.log(f"[ComfyUI] Start fehlgeschlagen: {e}", "ERROR")
+            self.log(f"[ComfyUI] Popen fehlgeschlagen: {e}", "ERROR")
             return False
 
-        # Prozess-Referenz speichern (verhindert Zombie + erlaubt spaeteres Stop)
         self._comfyui_process = proc
-        self.log(f"[ComfyUI] Prozess gestartet (PID {proc.pid})", "SUCCESS")
+        self.log(f"[ComfyUI] Prozess gestartet (PID {proc.pid}) ✓", "SUCCESS")
 
-        # Log-Stream-Thread — leitet stdout zeilenweise ins GUI
+        # ── Log-Stream-Thread ─────────────────────────────────────────────────
         def _stream_logs():
             try:
                 for line in proc.stdout:
                     line = line.rstrip()
                     if not line:
                         continue
-                    # Warnungen und Fehler aus ComfyUI-Output hervorheben
-                    if any(w in line.lower() for w in ("error", "exception", "traceback")):
+                    lo = line.lower()
+                    if any(w in lo for w in ("error", "exception", "traceback",
+                                             "modulenotfounderror", "importerror")):
                         level = "ERROR"
-                    elif any(w in line.lower() for w in ("warn", "missing")):
+                    elif any(w in lo for w in ("warn", "missing", "failed")):
                         level = "WARNING"
-                    elif any(w in line.lower() for w in ("loaded", "ready", "started", "listening")):
+                    elif any(w in lo for w in ("loaded", "ready", "started",
+                                               "listening", "to see the gui",
+                                               "running on")):
                         level = "SUCCESS"
                     else:
                         level = "INFO"
                     self.log(f"  [ComfyUI] {line}", level)
-            except Exception:
-                pass  # Prozess beendet
-            self.log("[ComfyUI] Prozess beendet.", "WARNING")
+            except Exception as ex:
+                self.log(f"[ComfyUI] Log-Stream-Fehler: {ex}", "WARNING")
 
-        t = threading.Thread(target=_stream_logs, daemon=True)
-        t.start()
+            # Prozess ist beendet — Exitcode ausgeben
+            rc = proc.poll()
+            if rc is not None and rc != 0:
+                self.log(
+                    f"[ComfyUI] ⚠️  Prozess beendet mit Exit-Code {rc}.\n"
+                    "  → Tipp: ComfyUI manuell starten um vollstaendigen Fehler zu sehen:\n"
+                    f"  → cd {comfyui_dir}\n"
+                    f"  → {python_exe} main.py --listen",
+                    "WARNING"
+                )
+            else:
+                self.log("[ComfyUI] Prozess beendet.", "INFO")
+
+        threading.Thread(target=_stream_logs, daemon=True).start()
         return True
 
     def _ensure_comfyui_running(self, tag: str = "[ComfyUI]") -> bool:
@@ -1634,6 +1935,26 @@ class ProductionOrchestrator:
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
                 resp_data = json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            # Response-Body enthaelt ComfyUI-Fehlermeldung (z.B. node validation)
+            try:
+                body = e.read().decode("utf-8", errors="replace")
+                self.log(f"{TAG} POST /prompt HTTP {e.code}: {e.reason}", "WARNING")
+                # JSON-Fehler parsen und strukturiert ausgeben
+                try:
+                    err_json = json.loads(body)
+                    if "error" in err_json:
+                        self.log(f"{TAG}   Fehler: {err_json['error']}", "ERROR")
+                    if "node_errors" in err_json:
+                        for nid, nerr in err_json["node_errors"].items():
+                            self.log(f"{TAG}   Node {nid}: {nerr}", "ERROR")
+                    if not err_json.get("error") and not err_json.get("node_errors"):
+                        self.log(f"{TAG}   Body: {body[:500]}", "WARNING")
+                except Exception:
+                    self.log(f"{TAG}   Body: {body[:500]}", "WARNING")
+            except Exception:
+                self.log(f"{TAG} POST /prompt fehlgeschlagen: HTTP {e.code}.", "WARNING")
+            return None
         except Exception as e:
             self.log(f"{TAG} POST /prompt fehlgeschlagen: {e}.", "WARNING")
             return None
@@ -1677,19 +1998,20 @@ class ProductionOrchestrator:
                 return None
 
             # Erfolgreich: Output-Datei suchen
+            # Unterstuetzt: VHS_VideoCombine (gifs/videos), SaveAnimatedWEBP (images),
+            # SaveImage (images), und generische filename-Felder.
             clip_filename = None
+            clip_subfolder = ""
             for node_id, node_out in outputs.items():
-                # VHS_VideoCombine liefert {"gifs": [{"filename": "...", ...}]}
-                for gifs in node_out.get("gifs", []):
-                    clip_filename = gifs.get("filename")
+                for key in ("gifs", "videos", "images"):
+                    for entry in node_out.get(key, []):
+                        fn = entry.get("filename", "")
+                        if fn:
+                            clip_filename  = fn
+                            clip_subfolder = entry.get("subfolder", "")
+                            break
                     if clip_filename:
                         break
-                if not clip_filename:
-                    # Fallback: "videos" key
-                    for vid in node_out.get("videos", []):
-                        clip_filename = vid.get("filename")
-                        if clip_filename:
-                            break
                 if clip_filename:
                     break
 
@@ -1697,13 +2019,27 @@ class ProductionOrchestrator:
                 self.log(f"{TAG} Noch keine Output-Datei nach {waited}s...", "INFO")
                 continue
 
-            # ── 5. Clip herunterladen ─────────────────────────────────────────
+            # ── 5. Datei herunterladen ────────────────────────────────────────
             self.log(f"{TAG} ✅ Render fertig — lade '{clip_filename}' herunter...", "SUCCESS")
-            clip_url  = f"{COMFYUI_URL}/view?filename={clip_filename}&type=output"
-            clip_path = os.path.join(out_dir, "clip_001.mp4")
+            params    = f"filename={urllib.parse.quote(clip_filename)}&type=output"
+            if clip_subfolder:
+                params += f"&subfolder={urllib.parse.quote(clip_subfolder)}"
+            clip_url  = f"{COMFYUI_URL}/view?{params}"
+
+            # Dateiendung aus Output-Dateiname uebernehmen (webp, mp4, etc.)
+            ext       = os.path.splitext(clip_filename)[1] or ".webp"
+            clip_path = os.path.join(out_dir, f"clip_001{ext}")
             try:
                 urllib.request.urlretrieve(clip_url, clip_path)
-                self.log(f"{TAG} ✅ Clip gespeichert: {clip_path}", "SUCCESS")
+                self.log(f"{TAG} ✅ Gespeichert: {clip_path}", "SUCCESS")
+                # Bei WEBP: Info fuer den Nutzer
+                if ext.lower() == ".webp":
+                    self.log(
+                        f"{TAG} ℹ️  Format: WEBP-Animation (nativer ComfyUI-Output).\n"
+                        "  Fuer MP4: ComfyUI-VideoHelperSuite installieren und\n"
+                        "  comfyui_workflow_template.json mit VHS_VideoCombine-Node ablegen.",
+                        "INFO"
+                    )
                 return clip_path
             except Exception as e:
                 self.log(f"{TAG} Download fehlgeschlagen: {e}.", "WARNING")
@@ -1746,127 +2082,567 @@ class ProductionOrchestrator:
 
         # ── 1. Bereits vorhanden? ─────────────────────────────────────────────
         main_py = os.path.join(comfyui_dir, "main.py")
-        if os.path.isfile(main_py):
-            log("[ComfyUI-Install] ComfyUI bereits installiert — ueberspringe.", "INFO")
-            log(f"  → Pfad: {comfyui_dir}", "INFO")
-            return True
+        skip_download = os.path.isfile(main_py)
 
-        # ── 2. ComfyUI Portable ZIP laden ────────────────────────────────────
-        COMFYUI_ZIP_URL = (
-            "https://github.com/comfyanonymous/ComfyUI/releases/latest/download/"
-            "ComfyUI_windows_portable_nvidia.7z"
-        )
-        # Fallback auf GitHub-Archiv (zip, kein 7z-Tool noetig)
-        COMFYUI_ZIP_FALLBACK = (
-            "https://github.com/comfyanonymous/ComfyUI/archive/refs/heads/master.zip"
-        )
+        if skip_download:
+            log("[ComfyUI-Install] ComfyUI bereits vorhanden — ueberspringe Download+Entpacken.", "INFO")
+            log(f"  → Setze fort mit: venv, Dependencies, Modell, Custom Nodes.", "INFO")
+        else:
+            # ── 2. ComfyUI Portable ZIP laden ────────────────────────────────────
+            COMFYUI_ZIP_URL = (
+                "https://github.com/comfyanonymous/ComfyUI/releases/latest/download/"
+                "ComfyUI_windows_portable_nvidia.7z"
+            )
+            COMFYUI_ZIP_FALLBACK = (
+                "https://github.com/comfyanonymous/ComfyUI/archive/refs/heads/master.zip"
+            )
 
-        log("[ComfyUI-Install] Schritt 1/6: Lade ComfyUI von GitHub...", "INFO")
-        log(f"  URL: {COMFYUI_ZIP_FALLBACK}", "INFO")
+            log("[ComfyUI-Install] Schritt 1/6: Lade ComfyUI von GitHub...", "INFO")
 
-        try:
-            urllib.request.urlretrieve(COMFYUI_ZIP_FALLBACK, zip_tmp)
-            log(f"[ComfyUI-Install] ZIP heruntergeladen: {zip_tmp}", "INFO")
-        except Exception as e:
-            log(f"[ComfyUI-Install] Download fehlgeschlagen: {e}", "ERROR")
-            return False
+            # Cache pruefen: setupfiles/comfyui_master.zip
+            zip_cached = os.path.join(project_root, "setupfiles", "comfyui_master.zip")
+            if os.path.isfile(zip_cached) and os.path.getsize(zip_cached) > 1_000_000:
+                log(f"[ComfyUI-Install] ComfyUI ZIP im Cache — ueberspringe Download.", "SUCCESS")
+                log(f"  Cache: {zip_cached}", "INFO")
+                zip_tmp = zip_cached  # direkt aus Cache entpacken
+            else:
+                log(f"  URL: {COMFYUI_ZIP_FALLBACK}", "INFO")
+                try:
+                    urllib.request.urlretrieve(COMFYUI_ZIP_FALLBACK, zip_tmp)
+                    log(f"[ComfyUI-Install] ZIP heruntergeladen: {zip_tmp}", "INFO")
+                except Exception as e:
+                    log(f"[ComfyUI-Install] Download fehlgeschlagen: {e}", "ERROR")
+                    return False
 
-        # ── 3. Entpacken ─────────────────────────────────────────────────────
-        log("[ComfyUI-Install] Schritt 2/6: Entpacke ZIP...", "INFO")
-        try:
-            with zipfile.ZipFile(zip_tmp, "r") as zf:
-                zf.extractall(project_root)
-            # GitHub-Archive haben einen Unterordner 'ComfyUI-master'
-            extracted = os.path.join(project_root, "ComfyUI-master")
-            if os.path.isdir(extracted) and not os.path.isdir(comfyui_dir):
-                shutil.move(extracted, comfyui_dir)
-            os.remove(zip_tmp)
-            log(f"[ComfyUI-Install] Entpackt nach: {comfyui_dir}", "SUCCESS")
-        except Exception as e:
-            log(f"[ComfyUI-Install] Entpacken fehlgeschlagen: {e}", "ERROR")
-            return False
+            # ── 3. Entpacken ─────────────────────────────────────────────────────
+            log("[ComfyUI-Install] Schritt 2/6: Entpacke ZIP...", "INFO")
+            try:
+                with zipfile.ZipFile(zip_tmp, "r") as zf:
+                    zf.extractall(project_root)
+                # ZIP im Cache behalten — nicht loeschen
+                zip_cache = os.path.join(project_root, "setupfiles", "comfyui_master.zip")
+                try:
+                    os.makedirs(os.path.dirname(zip_cache), exist_ok=True)
+                    if os.path.abspath(zip_tmp) != os.path.abspath(zip_cache):
+                        import shutil as _sh2
+                        _sh2.copy2(zip_tmp, zip_cache)
+                    os.remove(zip_tmp)
+                    log(f"[ComfyUI-Install] ZIP gecacht: {zip_cache}", "INFO")
+                except Exception:
+                    try:
+                        os.remove(zip_tmp)
+                    except Exception:
+                        pass
+
+                # GitHub-Archive entpacken als 'ComfyUI-master/' im project_root.
+                # Falls ComfyUI-Portable bereits existiert (z.B. von vorherigem
+                # Versuch), werden fehlende Dateien hineinkopiert statt neu benannt.
+                extracted = os.path.join(project_root, "ComfyUI-master")
+                if os.path.isdir(extracted):
+                    if not os.path.isdir(comfyui_dir):
+                        shutil.move(extracted, comfyui_dir)
+                        log(f"[ComfyUI-Install] Umbenannt: ComfyUI-master → ComfyUI-Portable", "INFO")
+                    else:
+                        # Zielordner existiert: Dateien einzeln kopieren (merge)
+                        log("[ComfyUI-Install] Zielordner existiert — merge ComfyUI-master...", "INFO")
+                        for item in os.listdir(extracted):
+                            src_item = os.path.join(extracted, item)
+                            dst_item = os.path.join(comfyui_dir, item)
+                            if os.path.isdir(src_item):
+                                if not os.path.exists(dst_item):
+                                    shutil.copytree(src_item, dst_item)
+                            else:
+                                shutil.copy2(src_item, dst_item)
+                        shutil.rmtree(extracted, ignore_errors=True)
+                        log("[ComfyUI-Install] Merge abgeschlossen ✓", "INFO")
+
+                # Sanity-check: main.py muss jetzt vorhanden sein
+                main_check = os.path.join(comfyui_dir, "main.py")
+                if not os.path.isfile(main_check):
+                    # Suche main.py in Unterordnern (Fallback fuer unerwartete Struktur)
+                    for root_d, dirs, files in os.walk(comfyui_dir):
+                        if "main.py" in files and "nodes.py" in files:
+                            log(f"[ComfyUI-Install] main.py gefunden in: {root_d} — verschiebe...", "INFO")
+                            for f in os.listdir(root_d):
+                                shutil.move(os.path.join(root_d, f),
+                                            os.path.join(comfyui_dir, f))
+                            break
+
+                log(f"[ComfyUI-Install] Entpackt nach: {comfyui_dir}", "SUCCESS")
+                log(f"[ComfyUI-Install] main.py vorhanden: {os.path.isfile(main_check)}", "INFO")
+            except Exception as e:
+                log(f"[ComfyUI-Install] Entpacken fehlgeschlagen: {e}", "ERROR")
+                return False
+        # Ende skip_download else-Block
 
         # ── 4. Venv + Torch installieren ─────────────────────────────────────
         log("[ComfyUI-Install] Schritt 3/6: Erstelle venv und installiere torch...", "INFO")
         venv_dir = os.path.join(comfyui_dir, "venv")
+
+        # sys.executable koennte 32-Bit Python sein (kein venv/torch moeglich).
+        # Suche explizit nach einem 64-Bit Python 3.10+ auf diesem System.
+        def _find_64bit_python() -> str:
+            """Findet ein geeignetes 64-Bit python.exe fuer venv + torch.
+
+            Anforderungen:
+            - Muss python.exe sein (NICHT pythonw.exe — kein venv-Support)
+            - Muss 64-Bit sein (struct.calcsize('P') == 8)
+            - Muss venv unterstuetzen (ensurepip vorhanden)
+            - Muss Python 3.10+ sein
+            """
+            import struct, shutil as _sh
+
+            def _is_valid(exe: str) -> bool:
+                """Prueft ob exe ein nutzbares 64-Bit python.exe ist."""
+                if not exe or not os.path.isfile(exe):
+                    return False
+                # Niemals pythonw.exe verwenden
+                if os.path.basename(exe).lower() == "pythonw.exe":
+                    return False
+                try:
+                    out = subprocess.check_output(
+                        [exe, "-c",
+                         "import struct, sys, ensurepip; "
+                         "print(struct.calcsize('P'), sys.version_info.major, "
+                         "sys.version_info.minor)"],
+                        timeout=8, stderr=subprocess.DEVNULL
+                    ).decode().strip().split()
+                    ptr_size   = int(out[0])
+                    major, minor = int(out[1]), int(out[2])
+                    return ptr_size == 8 and (major, minor) >= (3, 10)
+                except Exception:
+                    return False
+
+            # 1. Laufendes Python (wenn es python.exe und 64-Bit ist)
+            cur = sys.executable
+            if os.path.basename(cur).lower() == "python.exe" and _is_valid(cur):
+                return cur
+
+            # 2. python.exe im selben Verzeichnis wie laufendes Python
+            cur_dir  = os.path.dirname(cur)
+            sibling  = os.path.join(cur_dir, "python.exe")
+            if _is_valid(sibling):
+                return sibling
+
+            # 3. Windows py-Launcher (py.exe) — findet neuestes 64-Bit Python
+            py_launcher = _sh.which("py")
+            if py_launcher:
+                try:
+                    out = subprocess.check_output(
+                        [py_launcher, "-3", "-c",
+                         "import sys; print(sys.executable)"],
+                        timeout=8, stderr=subprocess.DEVNULL
+                    ).decode().strip()
+                    candidate = os.path.join(os.path.dirname(out), "python.exe")
+                    if _is_valid(candidate):
+                        return candidate
+                except Exception:
+                    pass
+
+            # 4. PATH-Suche (python3 / python — aber nur python.exe)
+            for name in ("python3.exe", "python.exe"):
+                found = _sh.which(name)
+                if found and _is_valid(found):
+                    return found
+
+            # 5. Typische Windows-Installationspfade scannen
+            search_bases = [
+                r"C:\Python",
+                r"C:\Program Files\Python",
+                r"C:\Program Files (x86)\Python",
+                os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Python"),
+            ]
+            for base in search_bases:
+                if not os.path.isdir(base):
+                    continue
+                for entry in sorted(os.listdir(base), reverse=True):  # neueste zuerst
+                    if "32" in entry or entry.lower() == "pythonw.exe":
+                        continue
+                    p = os.path.join(base, entry, "python.exe")
+                    if _is_valid(p):
+                        return p
+
+            # 6. Registry-Eintrag auslesen (Windows)
+            try:
+                import winreg
+                for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                    for subkey in (
+                        r"SOFTWARE\Python\PythonCore",
+                        r"SOFTWARE\WOW6432Node\Python\PythonCore",
+                    ):
+                        try:
+                            key = winreg.OpenKey(hive, subkey)
+                            i   = 0
+                            while True:
+                                try:
+                                    ver = winreg.EnumKey(key, i)
+                                    i  += 1
+                                    ipath = winreg.OpenKey(key, ver + r"\InstallPath")
+                                    install_dir = winreg.QueryValueEx(ipath, "")[0]
+                                    p = os.path.join(install_dir, "python.exe")
+                                    if _is_valid(p):
+                                        return p
+                                except OSError:
+                                    break
+                        except OSError:
+                            continue
+            except ImportError:
+                pass  # kein winreg (Linux/Mac)
+
+            log("[ComfyUI-Install] ⚠️  Kein geeignetes Python gefunden — Fallback auf sys.executable.", "WARNING")
+            return sys.executable
+
+        venv_python = _find_64bit_python()
+        log(f"[ComfyUI-Install] Python fuer venv: {venv_python}", "INFO")
+
+        # ── Altes venv-Verzeichnis bereinigen (verhindert Permission-denied) ──
+        if os.path.isdir(venv_dir):
+            log("[ComfyUI-Install] Altes venv-Verzeichnis gefunden — loesche es...", "INFO")
+            try:
+                import shutil as _shutil
+                _shutil.rmtree(venv_dir, ignore_errors=True)
+                # Sicherheitscheck: falls Prozess die Dateien noch haelt
+                if os.path.isdir(venv_dir):
+                    log("[ComfyUI-Install] venv-Ordner konnte nicht vollstaendig geloescht werden.", "WARNING")
+                else:
+                    log("[ComfyUI-Install] Altes venv geloescht ✓", "INFO")
+            except Exception as e:
+                log(f"[ComfyUI-Install] venv-Loeschung fehlgeschlagen: {e}", "WARNING")
+
+        # ── Venv erstellen — 4 Strategien ────────────────────────────────────
+        # Hinweis: capture_output=True erst ab Python 3.7 — nutze PIPE fuer
+        # maximale Kompatibilitaet (auch auf aelteren Python-Installationen).
+        PIPE = subprocess.PIPE
+        venv_ok = False
+
+        # Strategie 1: Standard venv
         try:
-            subprocess.check_call(
-                [sys.executable, "-m", "venv", venv_dir],
-                timeout=120
+            result = subprocess.run(
+                [venv_python, "-m", "venv", venv_dir],
+                timeout=120,
+                stdout=PIPE, stderr=PIPE,
             )
+            if result.returncode == 0:
+                venv_ok = True
+                log("[ComfyUI-Install] venv erstellt ✓ (Standard)", "SUCCESS")
+            else:
+                log(f"[ComfyUI-Install] venv Standard fehlgeschlagen (exit {result.returncode}):", "WARNING")
+                if result.stdout and result.stdout.strip():
+                    log(f"  stdout: {result.stdout.decode(errors='replace').strip()}", "WARNING")
+                if result.stderr and result.stderr.strip():
+                    log(f"  stderr: {result.stderr.decode(errors='replace').strip()}", "WARNING")
         except Exception as e:
-            log(f"[ComfyUI-Install] Venv-Erstellung fehlgeschlagen: {e}", "ERROR")
-            return False
+            log(f"[ComfyUI-Install] venv Standard Exception: {e}", "WARNING")
 
-        pip_exe = (
-            os.path.join(venv_dir, "Scripts", "pip.exe")  # Windows
-            if sys.platform == "win32" else
-            os.path.join(venv_dir, "bin", "pip")
-        )
-        python_exe = (
-            os.path.join(venv_dir, "Scripts", "python.exe")
-            if sys.platform == "win32" else
-            os.path.join(venv_dir, "bin", "python")
-        )
+        # Strategie 2: venv --without-pip (falls ensurepip fehlt)
+        if not venv_ok:
+            log("[ComfyUI-Install] Versuche venv --without-pip...", "INFO")
+            try:
+                result = subprocess.run(
+                    [venv_python, "-m", "venv", "--without-pip", venv_dir],
+                    timeout=120,
+                    stdout=PIPE, stderr=PIPE,
+                )
+                if result.returncode == 0:
+                    venv_ok = True
+                    log("[ComfyUI-Install] venv --without-pip erstellt ✓", "SUCCESS")
+                    # pip nachinstallieren via get-pip.py
+                    log("[ComfyUI-Install] Installiere pip via get-pip.py...", "INFO")
+                    try:
+                        import urllib.request as _ur
+                        get_pip = os.path.join(comfyui_dir, "_get_pip.py")
+                        _ur.urlretrieve("https://bootstrap.pypa.io/get-pip.py", get_pip)
+                        venv_py = os.path.join(venv_dir, "Scripts", "python.exe")
+                        subprocess.check_call([venv_py, get_pip], timeout=120)
+                        os.remove(get_pip)
+                        log("[ComfyUI-Install] pip installiert ✓", "SUCCESS")
+                    except Exception as ep:
+                        log(f"[ComfyUI-Install] pip-Nachinstall fehlgeschlagen: {ep}", "WARNING")
+                else:
+                    err = result.stderr.decode(errors='replace').strip() if result.stderr else ""
+                    if err:
+                        log(f"  stderr: {err}", "WARNING")
+            except Exception as e:
+                log(f"[ComfyUI-Install] venv --without-pip Exception: {e}", "WARNING")
 
-        torch_cmd = [
-            pip_exe, "install",
-            "torch", "torchvision", "torchaudio",
-            "--index-url", "https://download.pytorch.org/whl/cu121",
-        ]
-        log("[ComfyUI-Install] Installiere torch (CUDA 12.1) — kann einige Minuten dauern...", "INFO")
+        # Strategie 3: virtualenv installieren und nutzen
+        if not venv_ok:
+            log("[ComfyUI-Install] Versuche virtualenv...", "INFO")
+            try:
+                subprocess.check_call(
+                    [venv_python, "-m", "pip", "install", "--quiet", "virtualenv"],
+                    timeout=120,
+                    stdout=PIPE, stderr=PIPE,
+                )
+                result = subprocess.run(
+                    [venv_python, "-m", "virtualenv", venv_dir],
+                    timeout=120,
+                    stdout=PIPE, stderr=PIPE,
+                )
+                if result.returncode == 0:
+                    venv_ok = True
+                    log("[ComfyUI-Install] virtualenv erstellt ✓", "SUCCESS")
+                else:
+                    err = result.stderr.decode(errors='replace').strip() if result.stderr else ""
+                    if err:
+                        log(f"  stderr: {err}", "WARNING")
+            except Exception as e:
+                log(f"[ComfyUI-Install] virtualenv Exception: {e}", "WARNING")
+
+        # Strategie 4: Kein venv — direkt System-Python nutzen (nicht isoliert)
+        if not venv_ok:
+            log("[ComfyUI-Install] ⚠️  Kein venv moeglich — nutze System-Python direkt.", "WARNING")
+            log("  → Pakete werden global installiert (nicht isoliert).", "WARNING")
+
+        # pip_exe und python_exe: aus venv wenn vorhanden, sonst System-Python
+        if venv_ok:
+            pip_exe    = os.path.join(venv_dir, "Scripts", "pip.exe") if sys.platform == "win32" \
+                         else os.path.join(venv_dir, "bin", "pip")
+            python_exe = os.path.join(venv_dir, "Scripts", "python.exe") if sys.platform == "win32" \
+                         else os.path.join(venv_dir, "bin", "python")
+        else:
+            python_exe = venv_python
+            pip_exe    = None  # wird ueber "python -m pip" aufgerufen
+
+        def _pip(args: list, **kwargs) -> bool:
+            """Fuehrt pip-Kommando aus — via pip_exe oder 'python -m pip'."""
+            cmd = [pip_exe] + args if pip_exe and os.path.isfile(pip_exe) \
+                  else [python_exe, "-m", "pip"] + args
+            try:
+                subprocess.check_call(cmd, **kwargs)
+                return True
+            except Exception as ex:
+                log(f"[ComfyUI-Install] pip-Fehler: {ex}", "WARNING")
+                return False
+
+        # ── torch + requirements installieren ────────────────────────────────
+        # Schritt 1: CUDA-Version via nvidia-smi ermitteln (wie in HardwareProfile)
+        # Schritt 2: Bestehende pytorch_env/venv wiederverwenden falls vorhanden
+        # Schritt 3: torch WHL im Cache-Ordner ablegen — kein Re-Download
+
+        # Cache-Ordner: <project_root>/setupfiles (persistent zwischen Laeufen)
+        setup_cache = os.path.join(project_root, "setupfiles")
+        os.makedirs(setup_cache, exist_ok=True)
+        log(f"[ComfyUI-Install] Setup-Cache: {setup_cache}", "INFO")
+
+        def _detect_cuda_version() -> str:
+            """Liest CUDA-Version via nvidia-smi. Gibt z.B. '12.8' zurueck oder '' wenn nicht verfuegbar."""
+            nsmi_paths = [
+                r"C:\Windows\System32\nvidia-smi.exe",
+                r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
+                "nvidia-smi",
+            ]
+            for nsmi in nsmi_paths:
+                try:
+                    r = subprocess.run(
+                        [nsmi, "--query-gpu=driver_version", "--format=csv,noheader"],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        timeout=8, creationflags=subprocess.CREATE_NO_WINDOW
+                    )
+                    if r.returncode == 0:
+                        r2 = subprocess.run(
+                            [nsmi],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            timeout=8, creationflags=subprocess.CREATE_NO_WINDOW
+                        )
+                        out = r2.stdout.decode(errors="replace")
+                        for line in out.splitlines():
+                            if "CUDA Version:" in line:
+                                parts = line.split("CUDA Version:")
+                                if len(parts) > 1:
+                                    return parts[1].strip().split()[0]
+                except Exception:
+                    continue
+            return ""
+
+        cuda_ver = _detect_cuda_version()
+        if cuda_ver:
+            major, minor = cuda_ver.split(".")[:2]
+            cu_tag = f"cu{major}{minor.zfill(1)}"
+            known_tags = {"cu118", "cu121", "cu124", "cu126", "cu128"}
+            if cu_tag not in known_tags:
+                cuda_float = float(f"{major}.{minor}")
+                if cuda_float >= 12.8:
+                    cu_tag = "cu128"
+                elif cuda_float >= 12.6:
+                    cu_tag = "cu126"
+                elif cuda_float >= 12.4:
+                    cu_tag = "cu124"
+                elif cuda_float >= 12.1:
+                    cu_tag = "cu121"
+                else:
+                    cu_tag = "cu118"
+            torch_index = f"https://download.pytorch.org/whl/{cu_tag}"
+            log(f"[ComfyUI-Install] CUDA {cuda_ver} erkannt → torch {cu_tag}", "SUCCESS")
+        else:
+            torch_index = "https://download.pytorch.org/whl/cpu"
+            cu_tag = "cpu"
+            log("[ComfyUI-Install] Kein NVIDIA-Treiber erkannt → torch CPU-Version.", "WARNING")
+
+        # Bestehende pytorch_env/venv auf dem System suchen (vom PyTorchInstaller)
+        pytorch_env_venv = os.path.join(
+            os.path.expanduser("~"), "pytorch_env", "venv", "Scripts", "python.exe"
+        )
+        if os.path.isfile(pytorch_env_venv) and venv_ok is False:
+            try:
+                r = subprocess.run(
+                    [pytorch_env_venv, "-c",
+                     "import torch; print(torch.cuda.is_available(), torch.__version__)"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+                )
+                out = r.stdout.decode(errors="replace").strip()
+                if out.startswith("True"):
+                    log(f"[ComfyUI-Install] Bestehende pytorch_env gefunden: {out}", "SUCCESS")
+                    log(f"  → Nutze {pytorch_env_venv} statt Neuinstallation.", "INFO")
+                    python_exe = pytorch_env_venv
+                    pip_exe    = pytorch_env_venv.replace("python.exe", "pip.exe")
+                    venv_ok    = True
+            except Exception as pe:
+                log(f"[ComfyUI-Install] pytorch_env-Pruefung fehlgeschlagen: {pe}", "WARNING")
+
+        # torch: erst pruefen ob bereits CUDA-faehig installiert
+        torch_already_ok = False
         try:
-            subprocess.check_call(torch_cmd, timeout=600)
-            log("[ComfyUI-Install] torch installiert ✓", "SUCCESS")
-        except Exception as e:
-            log(f"[ComfyUI-Install] torch-Installation fehlgeschlagen: {e}", "ERROR")
-            return False
+            r = subprocess.run(
+                [python_exe, "-c",
+                 "import torch; print(torch.cuda.is_available(), torch.__version__)"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+            )
+            out = r.stdout.decode(errors="replace").strip()
+            if out.startswith("True") and f"+{cu_tag}" in out:
+                log(f"[ComfyUI-Install] torch bereits korrekt installiert: {out} ✓", "SUCCESS")
+                torch_already_ok = True
+        except Exception:
+            pass
 
-        # requirements.txt
+        if not torch_already_ok:
+            # WHL-Dateien im Cache-Ordner ablegen (pip --find-links + --cache-dir)
+            torch_cache = os.path.join(setup_cache, f"torch_{cu_tag}")
+            os.makedirs(torch_cache, exist_ok=True)
+
+            # Pruefen ob WHL bereits gecacht (mind. 3 Dateien: torch, torchvision, torchaudio)
+            cached_whls = [f for f in os.listdir(torch_cache) if f.endswith(".whl")]
+            if len(cached_whls) >= 3:
+                log(f"[ComfyUI-Install] torch WHL-Cache gefunden ({len(cached_whls)} Dateien) — "
+                    f"nutze lokalen Cache.", "SUCCESS")
+                log(f"  Cache: {torch_cache}", "INFO")
+                # Aus Cache installieren (kein Internet noetig)
+                torch_ok = _pip([
+                    "install", "torch", "torchvision", "torchaudio",
+                    "--find-links", torch_cache,
+                    "--no-index",            # nur aus Cache, kein PyPI
+                ], timeout=300)
+                if not torch_ok:
+                    # Falls Cache-Install fehlschlaegt: frisch herunterladen
+                    log("[ComfyUI-Install] Cache-Install fehlgeschlagen — lade neu herunter.", "WARNING")
+                    cached_whls = []
+
+            if len(cached_whls) < 3:
+                log(f"[ComfyUI-Install] Lade torch ({cu_tag}) herunter → Cache: {torch_cache}", "INFO")
+                # download-only: WHL-Dateien in Cache speichern ohne zu installieren
+                _pip([
+                    "download", "torch", "torchvision", "torchaudio",
+                    "--index-url", torch_index,
+                    "--dest", torch_cache,
+                    "--no-cache-dir",
+                ], timeout=900)
+                # Aus frisch heruntergeladenem Cache installieren
+                torch_ok = _pip([
+                    "install", "torch", "torchvision", "torchaudio",
+                    "--find-links", torch_cache,
+                    "--no-index",
+                ], timeout=300)
+
+            if torch_ok:
+                try:
+                    check = subprocess.run(
+                        [python_exe, "-c",
+                         "import torch; "
+                         "print('CUDA:', torch.cuda.is_available(), '|', "
+                         "torch.version.cuda if torch.cuda.is_available() else 'n/a')"],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+                    )
+                    out = check.stdout.decode(errors="replace").strip()
+                    if "CUDA: True" in out:
+                        log(f"[ComfyUI-Install] torch ✓ — {out}", "SUCCESS")
+                    else:
+                        log(f"[ComfyUI-Install] torch installiert aber CUDA nicht aktiv: {out}", "WARNING")
+                        log("  → Pruefe ob NVIDIA-Treiber aktuell sind.", "WARNING")
+                except Exception as ve:
+                    log(f"[ComfyUI-Install] torch CUDA-Verifikation fehlgeschlagen: {ve}", "WARNING")
+            else:
+                log("[ComfyUI-Install] torch-Installation fehlgeschlagen.", "WARNING")
+
         req_file = os.path.join(comfyui_dir, "requirements.txt")
         if os.path.isfile(req_file):
             log("[ComfyUI-Install] Installiere requirements.txt...", "INFO")
-            try:
-                subprocess.check_call(
-                    [pip_exe, "install", "-r", req_file],
-                    timeout=300
-                )
+            req_ok = _pip(["install", "-r", req_file], timeout=300)
+            if req_ok:
                 log("[ComfyUI-Install] requirements.txt installiert ✓", "SUCCESS")
-            except Exception as e:
-                log(f"[ComfyUI-Install] requirements.txt fehlgeschlagen (nicht kritisch): {e}", "WARNING")
+            else:
+                log("[ComfyUI-Install] requirements.txt fehlgeschlagen (nicht kritisch).", "WARNING")
 
-        # ── 5. WAN 2.1 1.3B Modell laden ─────────────────────────────────────
+
         log("[ComfyUI-Install] Schritt 4/6: Lade WAN 2.1 1.3B Modell...", "INFO")
-        models_dir = os.path.join(comfyui_dir, "models", "checkpoints")
+        # WAN 2.1 gehoert in diffusion_models/ (NICHT checkpoints/) — ComfyUI native
+        models_dir = os.path.join(comfyui_dir, "models", "diffusion_models")
         os.makedirs(models_dir, exist_ok=True)
         model_name = "wan2.1_t2v_1.3B_bf16.safetensors"
         model_path = os.path.join(models_dir, model_name)
 
-        # Comfy-Org repackaged version — korrekter Dateiname fuer ComfyUI CheckpointLoader
+        # Cache-Pfad im setupfiles-Ordner
+        model_cache = os.path.join(setup_cache, model_name)
+        MIN_MODEL_SIZE = 500_000_000  # 500 MB — echtes Modell ist ~2.5 GB
+
         WAN_MODEL_URL = (
             "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/"
             "split_files/diffusion_models/wan2.1_t2v_1.3B_bf16.safetensors"
         )
-        # Fallback: fp16-Variante (kleinere Datei, gleiche Quelle)
         WAN_MODEL_URL_FP16 = (
             "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/"
             "split_files/diffusion_models/wan2.1_t2v_1.3B_fp16.safetensors"
         )
 
-        if os.path.isfile(model_path):
-            log(f"[ComfyUI-Install] Modell bereits vorhanden: {model_path}", "INFO")
+        if os.path.isfile(model_path) and os.path.getsize(model_path) > MIN_MODEL_SIZE:
+            log(f"[ComfyUI-Install] Modell bereits im Zielordner ✓", "INFO")
+            log(f"  {model_path}", "INFO")
+        elif os.path.isfile(model_cache) and os.path.getsize(model_cache) > MIN_MODEL_SIZE:
+            # Im Cache vorhanden — einfach in Zielordner kopieren/verlinken
+            log(f"[ComfyUI-Install] Modell im Cache gefunden — kopiere...", "SUCCESS")
+            log(f"  Cache: {model_cache}", "INFO")
+            try:
+                import shutil as _shm
+                _shm.copy2(model_cache, model_path)
+                log(f"[ComfyUI-Install] Modell kopiert ✓ → {model_path}", "SUCCESS")
+            except Exception as e:
+                log(f"[ComfyUI-Install] Kopieren fehlgeschlagen: {e} — versuche Symlink.", "WARNING")
+                try:
+                    os.symlink(model_cache, model_path)
+                    log(f"[ComfyUI-Install] Symlink erstellt ✓", "SUCCESS")
+                except Exception as e2:
+                    log(f"[ComfyUI-Install] Symlink fehlgeschlagen: {e2}", "WARNING")
         else:
             log(f"  URL: {WAN_MODEL_URL}", "INFO")
-            log("  (ca. 2-3 GB — Geduld...)", "INFO")
+            log("  (ca. 2-3 GB — Geduld... wird in setupfiles/ gecacht)", "INFO")
             downloaded = False
-            for attempt_url, attempt_label in [
-                (WAN_MODEL_URL,      "bf16"),
-                (WAN_MODEL_URL_FP16, "fp16"),
+            for attempt_url, attempt_label, fname in [
+                (WAN_MODEL_URL,      "bf16", model_name),
+                (WAN_MODEL_URL_FP16, "fp16", "wan2.1_t2v_1.3B_fp16.safetensors"),
             ]:
                 try:
                     log(f"  Versuche {attempt_label}: {attempt_url}", "INFO")
-                    urllib.request.urlretrieve(attempt_url, model_path)
-                    log(f"[ComfyUI-Install] Modell geladen ✓ ({attempt_label}) → {model_path}", "SUCCESS")
+                    # Direkt in Cache herunterladen
+                    cache_target = os.path.join(setup_cache, fname)
+                    urllib.request.urlretrieve(attempt_url, cache_target)
+                    # Auch in models/diffusion_models/ kopieren
+                    dest = os.path.join(models_dir, fname)
+                    import shutil as _shm2
+                    _shm2.copy2(cache_target, dest)
+                    log(f"[ComfyUI-Install] Modell geladen ✓ ({attempt_label})", "SUCCESS")
+                    log(f"  Cache: {cache_target}", "INFO")
+                    log(f"  Ziel:  {dest}", "INFO")
+                    # model_path auf den tatsaechlichen Dateinamen setzen
+                    model_path = dest
                     downloaded = True
                     break
                 except Exception as e:
@@ -1874,11 +2650,73 @@ class ProductionOrchestrator:
             if not downloaded:
                 log(
                     "[ComfyUI-Install] ⚠️  Modell-Download fehlgeschlagen.\n"
-                    "  Manuell laden und speichern nach:\n"
-                    f"  {model_path}\n"
+                    "  Manuell laden und in setupfiles/ oder models/diffusion_models/ legen:\n"
+                    f"  {setup_cache}\n"
                     "  Quelle: https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged",
                     "WARNING"
                 )
+
+        # ── 5b. WAN VAE + T5 Text Encoder herunterladen ─────────────────────
+        # Beide werden von ComfyUI zwingend benoetigt — ohne sie schlaegt jeder
+        # Workflow fehl. Werden gecacht in setupfiles/ und nach models/vae/ bzw.
+        # models/text_encoders/ kopiert.
+        log("[ComfyUI-Install] Lade WAN VAE + T5 Text Encoder...", "INFO")
+
+        def _ensure_model(filename: str, dest_dir: str, url: str,
+                          min_size: int = 10_000_000, label: str = "") -> bool:
+            """Laedt eine Modell-Datei herunter wenn nicht im Ziel oder Cache vorhanden.
+            Gibt True zurueck wenn Datei am Ende verfuegbar ist."""
+            dest_path  = os.path.join(dest_dir, filename)
+            cache_path = os.path.join(setup_cache, filename)
+            os.makedirs(dest_dir, exist_ok=True)
+
+            if os.path.isfile(dest_path) and os.path.getsize(dest_path) > min_size:
+                log(f"  {label or filename}: bereits vorhanden ✓", "INFO")
+                return True
+            if os.path.isfile(cache_path) and os.path.getsize(cache_path) > min_size:
+                log(f"  {label or filename}: aus Cache kopieren...", "INFO")
+                try:
+                    import shutil as _shx
+                    _shx.copy2(cache_path, dest_path)
+                    log(f"  {label or filename}: kopiert ✓", "SUCCESS")
+                    return True
+                except Exception as e:
+                    log(f"  {label or filename}: Kopieren fehlgeschlagen: {e}", "WARNING")
+            # Herunterladen → zuerst in Cache, dann in Ziel kopieren
+            log(f"  {label or filename}: lade herunter...", "INFO")
+            log(f"    URL: {url}", "INFO")
+            try:
+                urllib.request.urlretrieve(url, cache_path)
+                import shutil as _shx2
+                _shx2.copy2(cache_path, dest_path)
+                log(f"  {label or filename}: heruntergeladen ✓", "SUCCESS")
+                return True
+            except Exception as e:
+                log(f"  {label or filename}: Download fehlgeschlagen: {e}", "WARNING")
+                log(f"    Manuell laden: {url}", "WARNING")
+                log(f"    Speichern nach: {dest_path}", "WARNING")
+                return False
+
+        vae_dir = os.path.join(comfyui_dir, "models", "vae")
+        t5_dir  = os.path.join(comfyui_dir, "models", "text_encoders")
+
+        _ensure_model(
+            filename = "wan_2.1_vae.safetensors",
+            dest_dir = vae_dir,
+            url      = ("https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged"
+                        "/resolve/main/split_files/vae/wan_2.1_vae.safetensors"),
+            min_size = 50_000_000,   # ~335 MB
+            label    = "WAN VAE",
+        )
+        _ensure_model(
+            filename = "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+            dest_dir = t5_dir,
+            url      = ("https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged"
+                        "/resolve/main/split_files/text_encoders"
+                        "/umt5_xxl_fp8_e4m3fn_scaled.safetensors"),
+            min_size = 100_000_000,  # ~4.9 GB
+            label    = "T5 Text Encoder (fp8, ~4.9 GB — Geduld...)",
+        )
 
         # ── 6. Custom Nodes klonen ────────────────────────────────────────────
         custom_nodes_dir = os.path.join(comfyui_dir, "custom_nodes")
@@ -1887,8 +2725,12 @@ class ProductionOrchestrator:
         custom_nodes = [
             ("ComfyUI-Manager",
              "https://github.com/ltdrdata/ComfyUI-Manager.git"),
+            ("ComfyUI-VideoHelperSuite",
+             "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git"),
             ("ComfyUI-AudioTools",
              "https://github.com/eigenpunk/ComfyUI-audio.git"),
+            ("ComfyUI-Florence2",
+             "https://github.com/kijai/ComfyUI-Florence2.git"),
         ]
 
         log("[ComfyUI-Install] Schritt 5/6: Klone Custom Nodes...", "INFO")
@@ -1909,6 +2751,50 @@ class ProductionOrchestrator:
                 break
             except Exception as e:
                 log(f"  {node_name} fehlgeschlagen (nicht kritisch): {e}", "WARNING")
+
+        # ── Custom Node Dependencies installieren ─────────────────────────────
+        log("[ComfyUI-Install] Installiere Custom Node Dependencies...", "INFO")
+
+        # VideoHelperSuite: braucht opencv-python, imageio-ffmpeg
+        vhs_req = os.path.join(custom_nodes_dir, "ComfyUI-VideoHelperSuite", "requirements.txt")
+        if os.path.isfile(vhs_req):
+            log("  VideoHelperSuite: installiere requirements.txt...", "INFO")
+            _pip(["install", "-r", vhs_req, "--no-cache-dir"], timeout=180)
+        else:
+            # Direkt installieren falls requirements.txt fehlt
+            log("  VideoHelperSuite: installiere cv2, imageio-ffmpeg...", "INFO")
+            _pip(["install", "opencv-python", "imageio-ffmpeg",
+                  "numpy", "Pillow", "--no-cache-dir"], timeout=180)
+
+        # AudioTools: librosa direkt installieren (requirements.txt oft inkompatibel)
+        librosa_ok = False
+        try:
+            r = subprocess.run(
+                [python_exe, "-c", "import librosa; print('ok')"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+            )
+            librosa_ok = r.returncode == 0
+        except Exception:
+            pass
+
+        if not librosa_ok:
+            log("  AudioTools: installiere librosa (direkt, ohne requirements.txt)...", "INFO")
+            # Nur die tatsaechlich fehlenden Kern-Abhaengigkeiten
+            _pip(["install", "librosa", "soundfile", "resampy",
+                  "--no-cache-dir"], timeout=300)
+        else:
+            log("  AudioTools: librosa bereits installiert ✓", "INFO")
+
+        # Florence2: timm + einops (leichtgewichtig, selten Konflikte)
+        florence2_req = os.path.join(custom_nodes_dir, "ComfyUI-Florence2", "requirements.txt")
+        if os.path.isfile(florence2_req):
+            log("  Florence2: installiere requirements.txt...", "INFO")
+            _pip(["install", "-r", florence2_req, "--no-cache-dir"], timeout=180)
+        elif os.path.isdir(os.path.join(custom_nodes_dir, "ComfyUI-Florence2")):
+            log("  Florence2: installiere timm, einops...", "INFO")
+            _pip(["install", "timm", "einops", "--no-cache-dir"], timeout=120)
+
+        log("[ComfyUI-Install] Custom Node Dependencies installiert ✓", "SUCCESS")
 
         # ── Startskript erstellen ─────────────────────────────────────────────
         log("[ComfyUI-Install] Schritt 6/6: Erstelle Startskript...", "INFO")
@@ -1934,13 +2820,37 @@ class ProductionOrchestrator:
 
         # ── Schritt 7: ComfyUI direkt starten ────────────────────────────────
         log("[ComfyUI-Install] Schritt 7/7 (Bonus): Starte ComfyUI...", "INFO")
+
+        # Port 8188 bereinigen — laufende Instanz vom letzten Installer-Lauf beenden
+        _kill_comfyui_port(8188, log_cb=log)
+
+        # CUDA pruefen — falls kein CUDA: --cpu Flag
+        _cuda_ok = False
+        try:
+            _r = subprocess.run(
+                [python_exe, "-c", "import torch; print(torch.cuda.is_available())"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, cwd=comfyui_dir,
+            )
+            _cuda_ok = _r.stdout.decode(errors="replace").strip() == "True"
+        except Exception:
+            pass
+
+        _start_cmd = [python_exe, "main.py", "--listen",
+                      "--database-url",
+                      f"sqlite:///{os.path.join(comfyui_dir, 'user', 'comfyui_lyra.db')}"]
+        if not _cuda_ok:
+            _start_cmd.append("--cpu")
+            log("[ComfyUI] Kein CUDA — starte im CPU-Modus (--cpu).", "WARNING")
+        else:
+            log("[ComfyUI] CUDA aktiv ✓", "SUCCESS")
+
         try:
             creation_flags = 0
             if sys.platform == "win32":
                 creation_flags = subprocess.CREATE_NO_WINDOW
 
             proc = subprocess.Popen(
-                [python_exe, "main.py", "--listen"],
+                _start_cmd,
                 cwd           = comfyui_dir,
                 stdout        = subprocess.PIPE,
                 stderr        = subprocess.STDOUT,
