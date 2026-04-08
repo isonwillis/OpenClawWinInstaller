@@ -501,6 +501,7 @@ TOOL ASSIGNMENT:
 - runway: abstract visualizations, fractals, data streams, dream sequences
 - digen: dialogues, press conferences, multi-character conversations
 - seedance: atmospheric transitions, nature, mood
+- comfyui_local: local GPU rendering — use when no external API available
 
 OUTPUT FORMAT (JSON array, one object per scene):
 [
@@ -1407,7 +1408,7 @@ class ProductionOrchestrator:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _build_comfyui_workflow(self, prompt: str, duration_sec: int,
-                                out_dir: str) -> dict:
+                                out_dir: str, sid: str = "scene") -> dict:
         """Laed ein JSON-Workflow-Template und setzt Prompt + Output-Pfad ein.
 
         Sucht das Template in folgender Reihenfolge:
@@ -1445,8 +1446,16 @@ class ProductionOrchestrator:
             # Verwendet ComfyUI-native WAN-Nodes (kein CheckpointLoaderSimple!)
             # Modell liegt in models/diffusion_models/, T5 in models/text_encoders/
             self.log("[ComfyUI] Kein Template gefunden — nutze eingebettetes WAN-2.1-Minimal-Workflow.", "INFO")
-            fps        = 16
-            num_frames = max(16, min(81, duration_sec * fps))  # WAN max 81 frames @ 480p
+            fps = 16
+            # WAN 2.1 1.3B: max 81 Frames @ 480p empfohlen (Speicher-Limit RTX 3050 6GB)
+            # Formel: Frames muss (4k+1) sein fuer WAN — naechste gueltige Zahl nehmen
+            raw_frames = duration_sec * fps
+            # WAN erwartet Frames in Form 4k+1: 17, 21, 25, ..., 81
+            wan_frames = max(17, min(81, int(raw_frames)))
+            # Auf naechste (4k+1)-Zahl runden
+            wan_frames = ((wan_frames - 1) // 4) * 4 + 1
+            num_frames = wan_frames
+            self.log(f"[ComfyUI] Frames: {num_frames} @ {fps}fps = {num_frames/fps:.1f}s", "INFO")
 
             # Bestimme Dateiname: bf16 bevorzugt, fp16 als Fallback
             project_root   = os.path.dirname(os.path.normpath(self.storage_root))
@@ -1576,18 +1585,19 @@ class ProductionOrchestrator:
                         "vae":     ["3", 0]
                     }
                 },
-                # Node 9: Video speichern — nutze nativen SaveAnimatedWEBP
-                # (immer verfuegbar, kein Custom Node noetig).
-                # VHS_VideoCombine wuerde ComfyUI-VideoHelperSuite benoetigen.
+                # Node 9: Video als MP4 speichern via VHS_VideoCombine
+                # (ComfyUI-VideoHelperSuite — bereits installiert)
                 "9": {
-                    "class_type": "SaveAnimatedWEBP",
+                    "class_type": "VHS_VideoCombine",
                     "inputs": {
                         "images":          ["8", 0],
+                        "frame_rate":      fps,
+                        "loop_count":      0,
                         "filename_prefix": "ison_clip",
-                        "fps":             fps,
-                        "lossless":        False,
-                        "quality":         85,
-                        "method":          "default"
+                        "format":          "video/h264-mp4",
+                        "save_output":     True,
+                        "pingpong":        False,
+                        "save_metadata":   False
                     }
                 }
             }
@@ -1610,14 +1620,16 @@ class ProductionOrchestrator:
                     prompt_injected = True
                     break
 
-        # Output-Pfad in Video/Image-Save-Nodes setzen (falls vorhanden)
-        clip_prefix = os.path.join(out_dir, "clip_001").replace("\\", "/")
+        # Output-Pfad-Setzer:
+        # ComfyUI erlaubt KEINEN Pfad ausserhalb seines output/-Ordners.
+        # Loesung: kurzen Prefix nutzen (bleibt in output/), Datei nach Render verschieben.
+        scene_prefix = f"lyra_{sid}"   # eindeutig pro Szene, bleibt in output/
         for node_id, node in workflow.items():
             if node.get("class_type") in (
                 "VHS_VideoCombine", "SaveVideo", "VideoSave",
                 "SaveAnimatedWEBP", "SaveAnimatedPNG", "SaveImage",
             ):
-                node["inputs"]["filename_prefix"] = clip_prefix
+                node["inputs"]["filename_prefix"] = scene_prefix
 
         return workflow
 
@@ -1762,7 +1774,8 @@ class ProductionOrchestrator:
         # Eindeutige DB-Datei pro Instanz (verhindert SQLite-Lock bei Mehrfachstart)
         db_path = os.path.join(comfyui_dir, "user", "comfyui_lyra.db")
         cmd = [python_exe, "main.py", "--listen", "--port", "8188",
-               "--database-url", f"sqlite:///{db_path}"]
+               "--database-url", f"sqlite:///{db_path}",
+               ]  # PYTHONIOENCODING env loest tqdm stderr OSError
         if not cuda_available:
             cmd.append("--cpu")
 
@@ -1773,6 +1786,14 @@ class ProductionOrchestrator:
             if sys.platform == "win32":
                 creation_flags = subprocess.CREATE_NO_WINDOW
 
+            # PYTHONIOENCODING=utf-8 gibt original_stderr ein gueltiges Encoding.
+            # Ohne dies schlaegt tqdm/ComfyUI-Manager mit OSError [Errno 22] fehl
+            # wenn es versucht den Fortschrittsbalken auf den Pipe-stderr zu schreiben.
+            comfyui_env = os.environ.copy()
+            comfyui_env["PYTHONIOENCODING"]          = "utf-8"
+            comfyui_env["PYTHONLEGACYWINDOWSSTDIO"]  = "0"
+            comfyui_env["PYTHONUNBUFFERED"]          = "1"
+
             proc = subprocess.Popen(
                 cmd,
                 cwd           = comfyui_dir,
@@ -1782,6 +1803,7 @@ class ProductionOrchestrator:
                 creationflags = creation_flags,
                 encoding      = "utf-8",
                 errors        = "replace",
+                env           = comfyui_env,
             )
         except Exception as e:
             self.log(f"[ComfyUI] Popen fehlgeschlagen: {e}", "ERROR")
@@ -1798,8 +1820,24 @@ class ProductionOrchestrator:
                     if not line:
                         continue
                     lo = line.lower()
-                    if any(w in lo for w in ("error", "exception", "traceback",
-                                             "modulenotfounderror", "importerror")):
+
+                    # Bekannte harmlose Meldungen herausfiltern (kein Render-Problem)
+                    _noise_patterns = (
+                        "an error occurred while fetching",   # ComfyUI-Manager API-Fetch
+                        "expecting value: line 1 column 1",   # leere HTTP-Antwort
+                        "cannot connect to comfyregistry",    # Registry offline
+                        "due to a network error, switching to local mode",
+                        "cannot schedule new futures after shutdown",
+                        "a new release of pip is available",
+                        "to update, run: python",
+                        "ignoring invalid distribution",
+                        "logging failed: [winerror 32]",      # log-Datei gesperrt
+                        "default cache updated:",              # ComfyUI-Manager Cache-Updates
+                    )
+                    if any(p in lo for p in _noise_patterns):
+                        level = "INFO"  # als INFO statt WARNING/ERROR
+                    elif any(w in lo for w in ("error", "exception", "traceback",
+                                               "modulenotfounderror", "importerror")):
                         level = "ERROR"
                     elif any(w in lo for w in ("warn", "missing", "failed")):
                         level = "WARNING"
@@ -1889,6 +1927,248 @@ class ProductionOrchestrator:
         )
         return False
 
+    def _run_cinematic_audio_pipeline(
+        self,
+        sid: str,
+        video_path: str,
+        prompt: str,
+        duration_sec: int,
+        out_dir: str,
+        comfyui_url: str,
+        tag: str,
+    ) -> str | None:
+        """Fuegt Narration + Cinematic Musik zum Video hinzu.
+
+        Pipeline (sequenziell, VRAM-schonend):
+          A) TTS-Narration via ComfyUI F5-TTS/ChatterBox (TTS-Audio-Suite)
+          B) Cinematic Musik via ComfyUI ACE-Step 1.5
+          C) FFmpeg: Video + Narration + Musik → finales MP4
+
+        VRAM-Management: Jeder ComfyUI-Job laeuft separat, Modelle werden
+        nach jedem Job entladen. So bleiben 6GB VRAM ausreichend.
+
+        Args:
+            sid:          Szenen-ID.
+            video_path:   Pfad zum gerenderten Video (MP4/WEBP).
+            prompt:       Szenen-Prompt (fuer Musik-Beschreibung).
+            duration_sec: Videodauer in Sekunden.
+            out_dir:      Ausgabeverzeichnis.
+            comfyui_url:  ComfyUI-API-URL.
+            tag:          Log-Prefix.
+
+        Returns:
+            Pfad zum finalen MP4 mit Audio, oder None bei Fehler.
+        """
+        import urllib.request, urllib.error, json as _json
+
+        self.log(f"{tag} 🎬 Starte Cinematic Audio Pipeline...", "INFO")
+
+        project_root = os.path.dirname(os.path.normpath(self.storage_root))
+        comfyui_dir  = os.path.join(project_root, "ComfyUI-Portable")
+        comfyui_out  = os.path.join(comfyui_dir, "output")
+
+        # ── Hilfsfunktion: ComfyUI-Job abschicken und warten ─────────────────
+        def _submit_and_wait(workflow: dict, label: str,
+                             max_wait: int = 300) -> dict | None:
+            """Sendet Workflow, wartet auf Completion, gibt outputs zurueck."""
+            payload = _json.dumps({"prompt": workflow}).encode("utf-8")
+            req = urllib.request.Request(
+                f"{comfyui_url}/prompt",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    resp = _json.loads(r.read().decode("utf-8"))
+            except Exception as e:
+                self.log(f"{tag}   [{label}] POST fehlgeschlagen: {e}", "WARNING")
+                return None
+            pid = resp.get("prompt_id")
+            if not pid:
+                return None
+            self.log(f"{tag}   [{label}] Job {pid[:8]}... gestartet", "INFO")
+            waited = 0
+            while waited < max_wait:
+                time.sleep(5)
+                waited += 5
+                try:
+                    with urllib.request.urlopen(
+                        f"{comfyui_url}/history/{pid}", timeout=15
+                    ) as r:
+                        hist = _json.loads(r.read().decode("utf-8"))
+                    if pid in hist:
+                        st = hist[pid].get("status", {})
+                        if st.get("status_str") in ("error", "failed"):
+                            msgs = st.get("messages", [])
+                            self.log(f"{tag}   [{label}] Job fehlgeschlagen: {msgs}", "WARNING")
+                            return None
+                        outputs = hist[pid].get("outputs", {})
+                        if outputs:
+                            self.log(f"{tag}   [{label}] ✓ fertig nach {waited}s", "SUCCESS")
+                            return outputs
+                except Exception:
+                    pass
+            self.log(f"{tag}   [{label}] Timeout nach {max_wait}s", "WARNING")
+            return None
+
+        def _find_audio_file(outputs: dict, label: str) -> str | None:
+            """Sucht Audio-Datei in ComfyUI-Outputs."""
+            for node_out in outputs.values():
+                for entry in node_out.get("audio", []):
+                    fn = entry.get("filename", "")
+                    if fn:
+                        sf = entry.get("subfolder", "")
+                        p  = os.path.join(comfyui_out, sf, fn) if sf else \
+                             os.path.join(comfyui_out, fn)
+                        if os.path.isfile(p):
+                            return p
+            return None
+
+        # ── Schritt A: TTS-Narration ──────────────────────────────────────────
+        self.log(f"{tag} A) TTS-Narration...", "INFO")
+        narration_path = None
+
+        # Kurzen Narrations-Text aus Prompt extrahieren (erste 200 Zeichen)
+        narration_text = prompt[:300].strip()
+        if len(prompt) > 300:
+            narration_text += "..."
+
+        tts_prefix = f"tts_{sid}"
+        tts_workflow = {
+            "1": {
+                "class_type": "TTSNode",    # TTS-Audio-Suite unified node
+                "inputs": {
+                    "engine_type":      "ChatterBox",
+                    "text_input":       narration_text,
+                    "filename_prefix":  tts_prefix,
+                    "seed":             42,
+                    "temperature":      0.7,
+                }
+            }
+        }
+
+        tts_outputs = _submit_and_wait(tts_workflow, "TTS", max_wait=120)
+        if tts_outputs:
+            narration_path = _find_audio_file(tts_outputs, "TTS")
+            if narration_path:
+                import shutil as _sha
+                local_narr = os.path.join(out_dir, "narration.wav")
+                _sha.copy2(narration_path, local_narr)
+                narration_path = local_narr
+                self.log(f"{tag}   Narration: {local_narr}", "SUCCESS")
+        else:
+            self.log(f"{tag}   TTS uebersprungen (Node nicht verfuegbar).", "INFO")
+
+        # ── Schritt B: Cinematic Musik (ACE-Step) ─────────────────────────────
+        self.log(f"{tag} B) Cinematic Musik (ACE-Step)...", "INFO")
+        music_path = None
+
+        # Musik-Prompt aus Visual DNA ableiten
+        music_prompt = (
+            "cinematic noir orchestral score, dark ambient, "
+            "volumetric low strings, haunting piano, tension building, "
+            "no vocals, film score, Hans Zimmer style, "
+            "blue amber color palette in sound"
+        )
+        music_prefix = f"music_{sid}"
+        music_workflow = {
+            "1": {
+                "class_type": "ACEStepSampler",
+                "inputs": {
+                    "tags":            music_prompt,
+                    "lyrics":          "",          # instrumental
+                    "seconds":         min(duration_sec + 2, 30),  # etwas laenger als Video
+                    "filename_prefix": music_prefix,
+                    "seed":            int(sid.replace("S", "").replace("K", "").replace("P", "").replace("E", "").replace(".", "") or "1"),
+                    "steps":           20,
+                    "cfg":             7.0,
+                }
+            }
+        }
+
+        music_outputs = _submit_and_wait(music_workflow, "ACE-Step Musik", max_wait=180)
+        if music_outputs:
+            music_path = _find_audio_file(music_outputs, "Musik")
+            if music_path:
+                import shutil as _shm
+                local_music = os.path.join(out_dir, "music.wav")
+                _shm.copy2(music_path, local_music)
+                music_path = local_music
+                self.log(f"{tag}   Musik: {local_music}", "SUCCESS")
+        else:
+            self.log(f"{tag}   Musik uebersprungen (ACE-Step nicht verfuegbar).", "INFO")
+
+        # ── Schritt C: FFmpeg-Merge ───────────────────────────────────────────
+        if not narration_path and not music_path:
+            self.log(f"{tag} Kein Audio generiert — Video ohne Ton.", "INFO")
+            return None
+
+        self.log(f"{tag} C) FFmpeg-Merge: Video + Audio...", "INFO")
+        final_path = os.path.join(out_dir, "clip_001_final.mp4")
+
+        # FFmpeg-Kommando aufbauen
+        cmd = ["ffmpeg", "-y", "-i", video_path]
+
+        if narration_path and music_path:
+            # Narration (laut) + Musik (leise im Hintergrund) mischen
+            cmd += [
+                "-i", narration_path,
+                "-i", music_path,
+                "-filter_complex",
+                f"[1:a]volume=1.0[narr];"           # Narration voll
+                f"[2:a]volume=0.25[mus];"            # Musik 25% Lautstaerke
+                f"[narr][mus]amix=inputs=2:duration=shortest[aout]",
+                "-map", "0:v",
+                "-map", "[aout]",
+            ]
+        elif narration_path:
+            cmd += ["-i", narration_path, "-map", "0:v", "-map", "1:a"]
+        elif music_path:
+            cmd += ["-i", music_path, "-map", "0:v", "-map", "1:a"]
+
+        cmd += [
+            "-c:v", "copy",           # Video nicht neu encoden
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-shortest",              # Laenge = kuerzeste Spur
+            final_path,
+        ]
+
+        try:
+            import shutil as _shf
+            ffmpeg = _shf.which("ffmpeg")
+            if not ffmpeg:
+                # FFmpeg in ComfyUI-Portable suchen (von VHS installiert)
+                ffmpeg_local = os.path.join(comfyui_dir, "venv", "Scripts", "ffmpeg.exe")
+                if os.path.isfile(ffmpeg_local):
+                    cmd[0] = ffmpeg_local
+
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=120,
+            )
+            if result.returncode == 0 and os.path.isfile(final_path):
+                self.log(f"{tag} ✅ Finales MP4 mit Audio: {final_path}", "SUCCESS")
+                return final_path
+            else:
+                err = result.stderr.decode(errors="replace")[-300:]
+                self.log(f"{tag} FFmpeg fehlgeschlagen: {err}", "WARNING")
+                return None
+        except FileNotFoundError:
+            self.log(
+                f"{tag} FFmpeg nicht gefunden.\n"
+                "  → Installiere FFmpeg: https://ffmpeg.org/download.html\n"
+                "  → Oder: pip install imageio-ffmpeg (dann ffmpeg in PATH)",
+                "WARNING"
+            )
+            return None
+        except Exception as e:
+            self.log(f"{tag} FFmpeg-Fehler: {e}", "WARNING")
+            return None
+
     def _call_comfyui_worker(self, sid: str, prompt: str, duration_sec: int,
                              out_dir: str) -> str | None:
         """Rendert eine Szene ueber eine lokal laufende ComfyUI-Instanz.
@@ -1922,9 +2202,40 @@ class ProductionOrchestrator:
         self.log(f"{TAG} ComfyUI bereit. Baue Workflow...", "INFO")
 
         # ── 2. Workflow bauen ─────────────────────────────────────────────────
-        workflow = self._build_comfyui_workflow(prompt, duration_sec, out_dir)
+        workflow = self._build_comfyui_workflow(prompt, duration_sec, out_dir, sid)
 
-        # ── 3. Job abschicken ─────────────────────────────────────────────────
+        # ── 3. ComfyUI Queue leeren (vorherige Jobs abbrechen) ───────────────
+        # Verhindert dass haengende Jobs den neuen Request blockieren.
+        try:
+            clear_req = urllib.request.Request(
+                f"{COMFYUI_URL}/queue",
+                data    = json.dumps({"clear": True}).encode("utf-8"),
+                headers = {"Content-Type": "application/json"},
+                method  = "POST",
+            )
+            with urllib.request.urlopen(clear_req, timeout=10) as r:
+                r.read()
+            self.log(f"{TAG} Queue geleert ✓", "INFO")
+        except Exception as qe:
+            self.log(f"{TAG} Queue-Clear fehlgeschlagen (nicht kritisch): {qe}", "WARNING")
+
+        # Interrupt (bricht laufenden Job ab)
+        try:
+            int_req = urllib.request.Request(
+                f"{COMFYUI_URL}/interrupt",
+                data    = b"{}",
+                headers = {"Content-Type": "application/json"},
+                method  = "POST",
+            )
+            with urllib.request.urlopen(int_req, timeout=10) as r:
+                r.read()
+        except Exception:
+            pass  # Kein Job laufend — ignorieren
+
+        # Kurz warten bis ComfyUI bereit fuer neuen Job
+        time.sleep(2)
+
+        # ── 4. Job abschicken ─────────────────────────────────────────────────
         payload = json.dumps({"prompt": workflow}).encode("utf-8")
         req     = urllib.request.Request(
             f"{COMFYUI_URL}/prompt",
@@ -1964,9 +2275,9 @@ class ProductionOrchestrator:
             self.log(f"{TAG} Keine prompt_id in Antwort: {resp_data}", "WARNING")
             return None
 
-        self.log(f"{TAG} Job gestartet — prompt_id={prompt_id}", "INFO")
+        self.log(f"{TAG} Job gestartet — prompt_id={prompt_id}", "SUCCESS")
 
-        # ── 4. Polling bis fertig ─────────────────────────────────────────────
+        # ── 5. Polling bis fertig ─────────────────────────────────────────────
         max_wait = 1200   # 20 Minuten
         interval = 8      # alle 8 Sekunden
         waited   = 0
@@ -2019,27 +2330,56 @@ class ProductionOrchestrator:
                 self.log(f"{TAG} Noch keine Output-Datei nach {waited}s...", "INFO")
                 continue
 
-            # ── 5. Datei herunterladen ────────────────────────────────────────
-            self.log(f"{TAG} ✅ Render fertig — lade '{clip_filename}' herunter...", "SUCCESS")
-            params    = f"filename={urllib.parse.quote(clip_filename)}&type=output"
-            if clip_subfolder:
-                params += f"&subfolder={urllib.parse.quote(clip_subfolder)}"
-            clip_url  = f"{COMFYUI_URL}/view?{params}"
+            # ── 5. Datei aus ComfyUI output/ in Szenen-Ordner verschieben ─────
+            self.log(f"{TAG} ✅ Render fertig nach {waited}s — '{clip_filename}'", "SUCCESS")
 
-            # Dateiendung aus Output-Dateiname uebernehmen (webp, mp4, etc.)
+            # ComfyUI speichert in seinem output/-Ordner.
+            # Wir ermitteln den Pfad direkt (kein HTTP-Download noetig).
+            project_root  = os.path.dirname(os.path.normpath(self.storage_root))
+            comfyui_dir   = os.path.join(project_root, "ComfyUI-Portable")
+            comfyui_out   = os.path.join(comfyui_dir, "output")
+            if clip_subfolder:
+                src_path = os.path.join(comfyui_out, clip_subfolder, clip_filename)
+            else:
+                src_path = os.path.join(comfyui_out, clip_filename)
+
             ext       = os.path.splitext(clip_filename)[1] or ".webp"
             clip_path = os.path.join(out_dir, f"clip_001{ext}")
+            os.makedirs(out_dir, exist_ok=True)
+
+            if os.path.isfile(src_path):
+                try:
+                    import shutil as _shc
+                    _shc.copy2(src_path, clip_path)
+                    self.log(f"{TAG} ✅ Video kopiert: {clip_path}", "SUCCESS")
+                    # ── Cinematic Audio Pipeline ──────────────────────────────
+                    # Schritt A: TTS-Narration generieren
+                    # Schritt B: Cinematic Musik generieren (ACE-Step)
+                    # Schritt C: Video + Narration + Musik → finales MP4 (FFmpeg)
+                    final_path = self._run_cinematic_audio_pipeline(
+                        sid=sid,
+                        video_path=clip_path,
+                        prompt=prompt,
+                        duration_sec=duration_sec,
+                        out_dir=out_dir,
+                        comfyui_url=COMFYUI_URL,
+                        tag=TAG,
+                    )
+                    return final_path if final_path else clip_path
+                except Exception as e:
+                    self.log(f"{TAG} Pipeline fehlgeschlagen: {e} — gebe Video ohne Audio zurueck.", "WARNING")
+                    if os.path.isfile(clip_path):
+                        return clip_path
+
+            # Fallback: HTTP-Download (falls Dateisystem-Zugriff fehlschlaegt)
+            self.log(f"{TAG} Lade via HTTP (Fallback)...", "INFO")
+            params   = f"filename={urllib.parse.quote(clip_filename)}&type=output"
+            if clip_subfolder:
+                params += f"&subfolder={urllib.parse.quote(clip_subfolder)}"
+            clip_url = f"{COMFYUI_URL}/view?{params}"
             try:
                 urllib.request.urlretrieve(clip_url, clip_path)
-                self.log(f"{TAG} ✅ Gespeichert: {clip_path}", "SUCCESS")
-                # Bei WEBP: Info fuer den Nutzer
-                if ext.lower() == ".webp":
-                    self.log(
-                        f"{TAG} ℹ️  Format: WEBP-Animation (nativer ComfyUI-Output).\n"
-                        "  Fuer MP4: ComfyUI-VideoHelperSuite installieren und\n"
-                        "  comfyui_workflow_template.json mit VHS_VideoCombine-Node ablegen.",
-                        "INFO"
-                    )
+                self.log(f"{TAG} ✅ Gespeichert (HTTP): {clip_path}", "SUCCESS")
                 return clip_path
             except Exception as e:
                 self.log(f"{TAG} Download fehlgeschlagen: {e}.", "WARNING")
@@ -2731,6 +3071,13 @@ class ProductionOrchestrator:
              "https://github.com/eigenpunk/ComfyUI-audio.git"),
             ("ComfyUI-Florence2",
              "https://github.com/kijai/ComfyUI-Florence2.git"),
+            # ── Cinematic Audio Pipeline ──────────────────────────────────────
+            # TTS: F5-TTS, ChatterBox, Higgs Audio 2 — Narration + Dialogue
+            ("TTS-Audio-Suite",
+             "https://github.com/diodiogod/TTS-Audio-Suite.git"),
+            # Musik: ACE-Step 1.5 — Cinematic orchestral soundtrack (Suno-Alternative)
+            ("ComfyUI_ACE-Step",
+             "https://github.com/billwuhao/ComfyUI_ACE-Step.git"),
         ]
 
         log("[ComfyUI-Install] Schritt 5/6: Klone Custom Nodes...", "INFO")
@@ -2794,6 +3141,24 @@ class ProductionOrchestrator:
             log("  Florence2: installiere timm, einops...", "INFO")
             _pip(["install", "timm", "einops", "--no-cache-dir"], timeout=120)
 
+        # TTS-Audio-Suite: F5-TTS, ChatterBox etc. — Narration + Dialoge
+        tts_req = os.path.join(custom_nodes_dir, "TTS-Audio-Suite", "requirements.txt")
+        if os.path.isfile(tts_req):
+            log("  TTS-Audio-Suite: installiere requirements.txt...", "INFO")
+            _pip(["install", "-r", tts_req, "--no-cache-dir"], timeout=300)
+        elif os.path.isdir(os.path.join(custom_nodes_dir, "TTS-Audio-Suite")):
+            log("  TTS-Audio-Suite: installiere Kern-Dependencies...", "INFO")
+            _pip(["install", "f5-tts", "transformers", "pydub", "--no-cache-dir"], timeout=300)
+
+        # ACE-Step: Musik-Generierung (cinematic, ambient, orchestral)
+        ace_req = os.path.join(custom_nodes_dir, "ComfyUI_ACE-Step", "requirements.txt")
+        if os.path.isfile(ace_req):
+            log("  ACE-Step: installiere requirements.txt...", "INFO")
+            _pip(["install", "-r", ace_req, "--no-cache-dir"], timeout=300)
+        elif os.path.isdir(os.path.join(custom_nodes_dir, "ComfyUI_ACE-Step")):
+            log("  ACE-Step: installiere Kern-Dependencies...", "INFO")
+            _pip(["install", "ace-step", "einops", "omegaconf", "--no-cache-dir"], timeout=300)
+
         log("[ComfyUI-Install] Custom Node Dependencies installiert ✓", "SUCCESS")
 
         # ── Startskript erstellen ─────────────────────────────────────────────
@@ -2837,7 +3202,8 @@ class ProductionOrchestrator:
 
         _start_cmd = [python_exe, "main.py", "--listen",
                       "--database-url",
-                      f"sqlite:///{os.path.join(comfyui_dir, 'user', 'comfyui_lyra.db')}"]
+                      f"sqlite:///{os.path.join(comfyui_dir, 'user', 'comfyui_lyra.db')}",
+                      ]  # PYTHONIOENCODING env loest tqdm stderr OSError
         if not _cuda_ok:
             _start_cmd.append("--cpu")
             log("[ComfyUI] Kein CUDA — starte im CPU-Modus (--cpu).", "WARNING")
@@ -2849,6 +3215,11 @@ class ProductionOrchestrator:
             if sys.platform == "win32":
                 creation_flags = subprocess.CREATE_NO_WINDOW
 
+            _comfy_env = os.environ.copy()
+            _comfy_env["PYTHONIOENCODING"]         = "utf-8"
+            _comfy_env["PYTHONLEGACYWINDOWSSTDIO"] = "0"
+            _comfy_env["PYTHONUNBUFFERED"]         = "1"
+
             proc = subprocess.Popen(
                 _start_cmd,
                 cwd           = comfyui_dir,
@@ -2858,21 +3229,37 @@ class ProductionOrchestrator:
                 creationflags = creation_flags,
                 encoding      = "utf-8",
                 errors        = "replace",
+                env           = _comfy_env,
             )
             log(f"[ComfyUI] Prozess gestartet (PID {proc.pid})", "SUCCESS")
             log(f"[ComfyUI] Erreichbar unter: http://127.0.0.1:8188", "INFO")
             log("[ComfyUI] Logs folgen — warte auf 'To see the GUI go to:'", "INFO")
 
             # Log-Stream-Thread (daemon — endet mit Hauptprozess)
+            _noise = (
+                "an error occurred while fetching",
+                "expecting value: line 1 column 1",
+                "cannot connect to comfyregistry",
+                "due to a network error, switching to local mode",
+                "cannot schedule new futures after shutdown",
+                "a new release of pip is available",
+                "to update, run: python",
+                "ignoring invalid distribution",
+                "logging failed: [winerror 32]",
+                "default cache updated:",
+            )
             def _stream():
                 try:
                     for line in proc.stdout:
                         line = line.rstrip()
                         if not line:
                             continue
-                        if any(w in line.lower() for w in ("error", "exception", "traceback")):
+                        lo = line.lower()
+                        if any(p in lo for p in _noise):
+                            lvl = "INFO"
+                        elif any(w in lo for w in ("error", "exception", "traceback")):
                             lvl = "ERROR"
-                        elif any(w in line.lower() for w in ("warn", "missing")):
+                        elif any(w in lo for w in ("warn", "missing")):
                             lvl = "WARNING"
                         elif any(w in line.lower() for w in ("loaded", "ready", "started",
                                                               "listening", "to see the gui")):
@@ -4501,14 +4888,28 @@ class ProducerApp(tk.Tk):
     # ── Thread-safe log ────────────────────────────────────────────────────────
 
     def _log(self, msg: str, level: str = "INFO"):
-        """Thread-safe log append with color tagging."""
+        """Thread-safe log append with color tagging.
+
+        Robust gegen destroyed tkinter window (z.B. IDLE-Restart waehrend
+        ein Render-Thread noch laeuft). Faengt RuntimeError und TclError ab.
+        """
         def _do():
-            self._log_area.config(state="normal")
+            try:
+                self._log_area.config(state="normal")
+                ts = datetime.datetime.now().strftime("%H:%M:%S")
+                self._log_area.insert("end", f"[{ts}] {msg}\n", level)
+                self._log_area.see("end")
+                self._log_area.config(state="disabled")
+            except Exception:
+                pass  # Widget zerstoert — ignorieren
+        try:
+            self.after(0, _do)
+        except RuntimeError:
+            # Main thread not in main loop — Fenster zerstoert oder IDLE-Restart
+            # Fallback: direkt auf stdout ausgeben
+            import sys
             ts = datetime.datetime.now().strftime("%H:%M:%S")
-            self._log_area.insert("end", f"[{ts}] {msg}\n", level)
-            self._log_area.see("end")
-            self._log_area.config(state="disabled")
-        self.after(0, _do)
+            print(f"[{ts}] [{level}] {msg}", file=sys.stderr)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
