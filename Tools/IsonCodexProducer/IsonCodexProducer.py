@@ -1,24 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-IsonCodexProducer.py  --  v1.1.0
+IsonCodexProducer.py  --  v1.0.4
 Ison-Codex Film Production Orchestrator
 ------------------------------------------------------------
 LYRA as Cinematic Coordinator:
   - DeepSeek (= Ison) liefert kreative Prompts + Qualitaetskontrolle
   - LYRA empfaengt, speichert, verteilt an Workers, trackt Status
   - Workers: Sora, Runway, Seedance, Digen, MyEdit, Suno, CapCut
-  - Workers (neu v1.1.0): ComfyUI Local (WAN 2.1 1.3B, kein API-Key)
+  - Workers: ComfyUI Local (WAN 2.1 1.3B, kein API-Key)
 
 Architektur:
   DeepSeek (Ison) -> LYRA (Proxy/Speicher) -> Workers (Ausfuehrung)
 
-v1.1.0 Erweiterungen (bestehende Funktionen unveraendert):
-  - WORKERS: comfyui_local Eintrag
-  - ProductionOrchestrator._build_comfyui_workflow()
-  - ProductionOrchestrator._call_comfyui_worker()
-  - ProductionOrchestrator._install_comfyui()  [static]
-  - ProducerApp._on_install_comfyui()
-  - GUI-Button '🖥️ Install ComfyUI'
+v1.0.4 Änderungen:
+  - BugFix: Scene-Save persistiert jetzt korrekt via _save_active_scenes()
+  - BugFix: pip-Aufrufe während ComfyUI-Install ohne CMD-Fenster-Popups
+  - ComfyUI Installer-Status-GUI (analog pytorch_setup_gui)
 
 Run:   python IsonCodexProducer.py
        python IsonCodexProducer.py --dry-run
@@ -1090,6 +1087,237 @@ class ProductionOrchestrator:
             self.log(f"[DeepSeek] Prompt enhancement failed: {e} — using base prompt", "WARNING")
             return scene["prompt"]
 
+    # ── Whitelist-Validierung für Scene-Package ────────────────────────────────
+
+    # Gültige ChatterBox Sprach-Codes (TTS-Audio-Suite v4.x)
+    _VALID_TTS_LANGUAGES = {
+        "English", "German", "French", "Spanish", "Italian",
+        "Portuguese", "Dutch", "Polish", "Russian", "Chinese",
+        "Japanese", "Korean", "Arabic", "Turkish", "Hindi",
+        "Czech", "Romanian", "Hungarian", "Swedish", "Norwegian",
+        "Finnish", "Danish", "Ukrainian", "Croatian", "Slovak",
+    }
+    # Gültige ChatterBox Emotion-Tags
+    _VALID_TTS_EMOTIONS = {
+        "neutral", "calm", "dramatic", "intense", "sad",
+        "mysterious", "hopeful", "tense", "warm", "cold",
+        "urgent", "reflective", "ominous", "solemn",
+    }
+    # Gültige ACE-Step Genre/Stimmungs-Tags (verifiziert gegen ACE-Step Doku)
+    _VALID_MUSIC_TAGS = {
+        "cinematic", "orchestral", "instrumental", "ambient", "dark",
+        "noir", "epic", "tension", "dramatic", "atmospheric",
+        "electronic", "piano", "strings", "brass", "percussion",
+        "minimal", "sparse", "haunting", "melancholic", "hopeful",
+        "action", "suspense", "emotional", "soft", "intense",
+        "drone", "pad", "hybrid", "score", "soundtrack",
+    }
+    # Erlaubte ACE-Step Sprach-Marker
+    _VALID_MUSIC_LANG_MARKERS = {"[en]", "[inst]", "[de]", "[fr]", "[es]", "[zh]", "[ja]"}
+
+    def _validate_scene_package(self, pkg: dict, scene: dict) -> dict:
+        """Validiert alle LLM-generierten Parameter gegen Whitelists.
+
+        Ungültige Werte werden auf geprüfte Defaults zurückgesetzt und geloggt.
+        Gibt immer ein vollständiges, sicheres Package zurück.
+        """
+        sid = scene.get("id", "?")
+        warnings = []
+
+        # ── narration_text ────────────────────────────────────────────────────
+        narration = pkg.get("narration_text", "")
+        if not isinstance(narration, str) or len(narration.strip()) < 10:
+            narration = f"{scene.get('title', sid)}: {scene.get('prompt', '')[:120]}"
+            warnings.append("narration_text leer/ungültig → Fallback auf Titel+Prompt")
+        else:
+            # Markup bereinigen: Markdown, Hex-Codes, Regie-Klammern entfernen
+            import re as _re
+            narration = _re.sub(r"\*{1,2}[^*]+\*{1,2}", "", narration)   # **bold**, *italic*
+            narration = _re.sub(r"#[0-9A-Fa-f]{3,6}\b", "", narration)   # Hex-Farben
+            narration = _re.sub(r"\([^)]{0,60}\)", "", narration)         # (Kamera-Anweisungen)
+            narration = _re.sub(r"\[[^\]]{0,40}\]", "", narration)        # [Regie-Notizen]
+            narration = _re.sub(r"\s{2,}", " ", narration).strip()
+            if len(narration) < 10:
+                narration = scene.get("title", sid)
+                warnings.append("narration_text nach Bereinigung zu kurz → Fallback")
+
+        # Max 500 Zeichen für TTS
+        if len(narration) > 500:
+            narration = narration[:497] + "..."
+
+        # ── tts_language ──────────────────────────────────────────────────────
+        tts_lang = pkg.get("tts_language", "English")
+        if tts_lang not in self._VALID_TTS_LANGUAGES:
+            warnings.append(f"tts_language '{tts_lang}' ungültig → English")
+            tts_lang = "English"
+
+        # ── tts_emotion ───────────────────────────────────────────────────────
+        tts_emotion = pkg.get("tts_emotion", "neutral")
+        if tts_emotion not in self._VALID_TTS_EMOTIONS:
+            warnings.append(f"tts_emotion '{tts_emotion}' ungültig → neutral")
+            tts_emotion = "neutral"
+
+        # ── tts_exaggeration ─────────────────────────────────────────────────
+        try:
+            tts_exag = float(pkg.get("tts_exaggeration", 0.5))
+            tts_exag = max(0.0, min(1.0, tts_exag))
+        except (TypeError, ValueError):
+            tts_exag = 0.5
+            warnings.append("tts_exaggeration ungültig → 0.5")
+
+        # ── music_tags ────────────────────────────────────────────────────────
+        raw_tags = pkg.get("music_tags", [])
+        if isinstance(raw_tags, str):
+            raw_tags = [t.strip() for t in raw_tags.replace(",", " ").split()]
+        valid_tags = [t.lower() for t in raw_tags if t.lower() in self._VALID_MUSIC_TAGS]
+        if not valid_tags:
+            valid_tags = ["cinematic", "orchestral", "instrumental", "dark", "atmospheric"]
+            warnings.append(f"music_tags '{raw_tags}' alle ungültig → cinematic defaults")
+        elif len(valid_tags) < len(raw_tags):
+            dropped = [t for t in raw_tags if t.lower() not in self._VALID_MUSIC_TAGS]
+            warnings.append(f"music_tags: ungültige Tags entfernt: {dropped}")
+
+        # ── music_lang_marker ─────────────────────────────────────────────────
+        music_lang = pkg.get("music_lang_marker", "[inst]")
+        if music_lang not in self._VALID_MUSIC_LANG_MARKERS:
+            warnings.append(f"music_lang_marker '{music_lang}' ungültig → [inst]")
+            music_lang = "[inst]"
+
+        # ── music_duration_sec ────────────────────────────────────────────────
+        try:
+            music_dur = int(pkg.get("music_duration_sec", scene.get("duration_sec", 15)))
+            music_dur = max(5, min(60, music_dur))   # ACE-Step: 5–60s sinnvoll
+        except (TypeError, ValueError):
+            music_dur = min(scene.get("duration_sec", 15) + 2, 30)
+            warnings.append("music_duration_sec ungültig → Szenen-Dauer+2")
+
+        # ── music_num_steps ───────────────────────────────────────────────────
+        try:
+            music_steps = int(pkg.get("music_num_steps", 30))
+            music_steps = max(20, min(60, music_steps))
+        except (TypeError, ValueError):
+            music_steps = 30
+            warnings.append("music_num_steps ungültig → 30")
+
+        # ── Warnungen loggen ──────────────────────────────────────────────────
+        for w in warnings:
+            self.log(f"[ScenePackage/{sid}] ⚠️  {w}", "WARNING")
+        if not warnings:
+            self.log(f"[ScenePackage/{sid}] Alle Parameter validiert ✓", "SUCCESS")
+
+        return {
+            "narration_text":    narration,
+            "tts_language":      tts_lang,
+            "tts_emotion":       tts_emotion,
+            "tts_exaggeration":  tts_exag,
+            "music_tags":        valid_tags,
+            "music_lang_marker": music_lang,
+            "music_duration_sec": music_dur,
+            "music_num_steps":   music_steps,
+        }
+
+    def request_scene_package(self, scene: dict, enhanced_prompt: str) -> dict:
+        """Asks the LLM to generate a complete scene package with all subsystem parameters.
+
+        Returns a validated dict with:
+          narration_text, tts_language, tts_emotion, tts_exaggeration,
+          music_tags, music_lang_marker, music_duration_sec, music_num_steps
+
+        Falls back to safe defaults if LLM fails or returns invalid data.
+        """
+        sid = scene.get("id", "?")
+
+        # ── Safe Default (wird immer als Fallback verwendet) ──────────────────
+        def _safe_default() -> dict:
+            return self._validate_scene_package({}, scene)
+
+        if self.dry_run or not self.deepseek_api_key:
+            self.log(f"[ScenePackage/{sid}] dry_run/no-key — nutze Defaults", "INFO")
+            return _safe_default()
+
+        self.log(f"[ScenePackage/{sid}] Generiere Scene-Package via LLM...", "INFO")
+
+        char_descs = "; ".join(
+            CHARACTERS[c]["desc"] for c in scene.get("chars", [])
+            if c in CHARACTERS
+        )
+
+        # Gültige Werte als Kontext für das LLM damit es keine unbekannten Werte erfindet
+        valid_tags_str   = ", ".join(sorted(self._VALID_MUSIC_TAGS))
+        valid_lang_str   = ", ".join(sorted(self._VALID_TTS_LANGUAGES))
+        valid_emot_str   = ", ".join(sorted(self._VALID_TTS_EMOTIONS))
+        valid_mmark_str  = ", ".join(sorted(self._VALID_MUSIC_LANG_MARKERS))
+
+        system_prompt = (
+            "You are the creative director of the film 'Der Ison-Codex'. "
+            "You generate scene packages for an AI film production pipeline. "
+            "IMPORTANT: Only use values from the provided lists. "
+            "Return ONLY valid JSON, no markdown, no explanation."
+        )
+
+        user_prompt = (
+            f"Scene ID: {sid} | Title: {scene.get('title', '')}\n"
+            f"Chapter: {scene.get('chapter', '')}\n"
+            f"Characters: {char_descs or 'none'}\n"
+            f"Duration: {scene.get('duration_sec', 15)} seconds\n"
+            f"Visual prompt: {enhanced_prompt[:300]}\n\n"
+            f"Generate a JSON scene package with these exact keys:\n"
+            f"- narration_text: (string, max 400 chars) A short, atmospheric narration "
+            f"  for the VIEWER — what happens in the story, the mood, what it means. "
+            f"  NO camera directions, NO hex colors, NO stage directions, NO asterisks. "
+            f"  Write as a film narrator speaking to the audience.\n"
+            f"- tts_language: one of: {valid_lang_str}\n"
+            f"- tts_emotion: one of: {valid_emot_str}\n"
+            f"- tts_exaggeration: float 0.0–1.0 (0.3=calm, 0.6=dramatic)\n"
+            f"- music_tags: list of 3–6 tags from: {valid_tags_str}\n"
+            f"- music_lang_marker: one of: {valid_mmark_str} (use [inst] for instrumental)\n"
+            f"- music_duration_sec: integer, scene duration + 2 (max 60)\n"
+            f"- music_num_steps: integer 20–40 (30 recommended)\n\n"
+            f"Return ONLY the JSON object, nothing else."
+        )
+
+        try:
+            import urllib.request, urllib.error
+            payload = json.dumps({
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_prompt},
+                ],
+                "temperature": 0.4,   # niedrig für konsistente strukturierte Outputs
+                "max_tokens":  600,
+            }).encode("utf-8")
+
+            req = urllib.request.Request(
+                f"{DEFAULT_DEEPSEEK_URL}/chat/completions",
+                data=payload,
+                headers={
+                    "Content-Type":  "application/json",
+                    "Authorization": f"Bearer {self.deepseek_api_key}",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                data = json.load(resp)
+                raw = data["choices"][0]["message"]["content"].strip()
+
+            # JSON aus Antwort extrahieren (falls doch Markdown-Fences dabei)
+            import re as _re
+            json_match = _re.search(r"\{.*\}", raw, _re.DOTALL)
+            if not json_match:
+                self.log(f"[ScenePackage/{sid}] Kein JSON in LLM-Antwort — Defaults", "WARNING")
+                return _safe_default()
+
+            pkg_raw = json.loads(json_match.group(0))
+            self.log(f"[ScenePackage/{sid}] LLM-Package empfangen — validiere...", "INFO")
+            return self._validate_scene_package(pkg_raw, scene)
+
+        except json.JSONDecodeError as e:
+            self.log(f"[ScenePackage/{sid}] JSON-Parse-Fehler: {e} — Defaults", "WARNING")
+            return _safe_default()
+        except Exception as e:
+            self.log(f"[ScenePackage/{sid}] LLM-Fehler: {e} — Defaults", "WARNING")
+            return _safe_default()
+
     def submit_for_quality_check(self, scene_id: str, output_path: str) -> dict:
         """Sends completed scene path to DeepSeek for approval.
 
@@ -1162,10 +1390,42 @@ class ProductionOrchestrator:
                 try:
                     with open(prompt_path, "r", encoding="utf-8") as f:
                         content = f.read()
+                    # Enhanced Prompt extrahieren — endet vor ## Narration, ## Scene Package oder ## Visual DNA
                     enhanced = content.split("## Enhanced Prompt (DeepSeek)")[-1]
-                    enhanced = enhanced.split("## Visual DNA")[0].strip()
+                    for _stop in ("## Narration", "## Scene Package", "## Visual DNA"):
+                        if _stop in enhanced:
+                            enhanced = enhanced.split(_stop)[0]
+                    enhanced = enhanced.strip()
                 except Exception:
                     enhanced = scene["prompt"]
+
+                # ── Scene-Package: aus prompt.txt lesen oder neu generieren ──
+                scene_pkg = None
+                try:
+                    if "## Scene Package" in content:
+                        pkg_raw = content.split("## Scene Package")[-1].strip()
+                        import re as _re2
+                        m = _re2.search(r"\{.*\}", pkg_raw, _re2.DOTALL)
+                        if m:
+                            scene_pkg = self._validate_scene_package(
+                                json.loads(m.group(0)), scene
+                            )
+                            self.log(f"[Scene {sid}] Scene-Package aus prompt.txt geladen ✓", "INFO")
+                except Exception:
+                    scene_pkg = None
+
+                if scene_pkg is None:
+                    # Ältere prompt.txt ohne Scene-Package — jetzt nachholen und eintragen
+                    self.log(f"[Scene {sid}] Kein Scene-Package in prompt.txt — generiere...", "INFO")
+                    scene_pkg = self.request_scene_package(scene, enhanced)
+                    try:
+                        with open(prompt_path, "a", encoding="utf-8") as f:
+                            f.write(f"\n## Narration\n{scene_pkg['narration_text']}\n\n")
+                            f.write(f"## Scene Package\n{json.dumps(scene_pkg, indent=2, ensure_ascii=False)}\n")
+                        self.log(f"[Scene {sid}] Scene-Package nachgetragen ✓", "INFO")
+                    except Exception as _ce:
+                        self.log(f"[Scene {sid}] Scene-Package eintragen fehlgeschlagen: {_ce}", "WARNING")
+
                 prompt_dir = os.path.join(self.storage_root, "szenen", sid, scene["tool"])
                 os.makedirs(prompt_dir, exist_ok=True)
                 worker = self._find_video_worker(scene["tool"])
@@ -1174,7 +1434,8 @@ class ProductionOrchestrator:
                     scene_status = "skipped_no_worker"
                 else:
                     clip_path = self._call_video_worker(
-                        sid, enhanced, scene["duration_sec"], scene["tool"], worker, prompt_dir)
+                        sid, enhanced, scene["duration_sec"], scene["tool"], worker, prompt_dir,
+                        scene=scene, scene_pkg=scene_pkg)
                     scene_status = "complete" if clip_path else "skipped_api_error"
                 with self._lock:
                     status["scenes"][sid] = {
@@ -1196,10 +1457,11 @@ class ProductionOrchestrator:
         self.log(f"[Scene {sid}] DeepSeek available: {bool(self.deepseek_api_key)} | "
                   f"dry_run: {self.dry_run}", "INFO")
 
-        # Step 1: enhance prompt via DeepSeek
-        enhanced = self.request_enhanced_prompt(scene)
+        # Step 1: enhance prompt + scene package via DeepSeek (ein Schritt)
+        enhanced  = self.request_enhanced_prompt(scene)
+        scene_pkg = self.request_scene_package(scene, enhanced)
 
-        # Step 2: write prompt.txt
+        # Step 2: write prompt.txt — alles auf einmal
         prompt_dir  = os.path.join(self.storage_root, "szenen", sid, scene["tool"])
         prompt_path = os.path.join(self.storage_root, "szenen", sid, "prompt.txt")
         os.makedirs(prompt_dir, exist_ok=True)
@@ -1210,6 +1472,8 @@ class ProductionOrchestrator:
             f.write(f"# Characters: {', '.join(scene['chars']) or 'none'}\n\n")
             f.write(f"## Base Prompt\n{scene['prompt']}\n\n")
             f.write(f"## Enhanced Prompt (DeepSeek)\n{enhanced}\n\n")
+            f.write(f"## Narration\n{scene_pkg['narration_text']}\n\n")
+            f.write(f"## Scene Package\n{json.dumps(scene_pkg, indent=2, ensure_ascii=False)}\n\n")
             f.write(f"## Visual DNA\n")
             for k, v in VISUAL_DNA.items():
                 f.write(f"  {k}: {v}\n")
@@ -1230,7 +1494,8 @@ class ProductionOrchestrator:
                 scene_status = "skipped_no_worker"
             else:
                 clip_path = self._call_video_worker(
-                    sid, enhanced, scene["duration_sec"], scene["tool"], worker, prompt_dir)
+                    sid, enhanced, scene["duration_sec"], scene["tool"], worker, prompt_dir,
+                    scene=scene, scene_pkg=scene_pkg)
                 if clip_path:
                     scene_status = "complete"
                 else:
@@ -1287,7 +1552,9 @@ class ProductionOrchestrator:
         return None
 
     def _call_video_worker(self, sid: str, prompt: str, duration: int,
-                           tool: str, worker: dict, out_dir: str) -> str | None:
+                           tool: str, worker: dict, out_dir: str,
+                           scene: dict | None = None,
+                           scene_pkg: dict | None = None) -> str | None:
         """Sends a video generation request to the worker API.
 
         Handles three response patterns:
@@ -1301,7 +1568,8 @@ class ProductionOrchestrator:
         """
         # ── ComfyUI local dispatch (kein API-Key, eigener Workflow-Pfad) ─────
         if worker.get("type", "").lower() == "comfyui_local":
-            return self._call_comfyui_worker(sid, prompt, duration, out_dir)
+            return self._call_comfyui_worker(sid, prompt, duration, out_dir,
+                                             scene=scene, scene_pkg=scene_pkg)
 
         import urllib.request, urllib.error, time
 
@@ -1404,7 +1672,7 @@ class ProductionOrchestrator:
             return None
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # COMFYUI LOCAL WORKER  (neu in v1.1.0 -- bestehende Worker unberuehrt)
+    # COMFYUI LOCAL WORKER  (neu in v1.0.4 -- bestehende Worker unberuehrt)
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _build_comfyui_workflow(self, prompt: str, duration_sec: int,
@@ -1689,16 +1957,25 @@ class ProductionOrchestrator:
             return False
 
         # ── Richtiges Python bestimmen ────────────────────────────────────────
-        # Prioritaet: venv > System-Python das torch kennt > sys.executable
+        # Prioritaet: ComfyUI-eigenes venv (Scripts/python.exe oder bin/python)
+        # NIEMALS pytorch_env verwenden — das hat einen anderen tqdm-Wrapper
+        # der auf Windows-Pipes mit OSError [Errno 22] versagt.
         python_exe = None
 
-        # 1. venv-Python (bevorzugt — isolierte Installation)
-        venv_py = os.path.join(comfyui_dir, "venv", "Scripts", "python.exe")
-        if os.path.isfile(venv_py):
-            python_exe = venv_py
-            self.log(f"[ComfyUI] Nutze venv-Python: {venv_py}", "INFO")
+        # 1. venv-Python (bevorzugt — isolierte ComfyUI-Installation, Windows)
+        venv_py_win = os.path.join(comfyui_dir, "venv", "Scripts", "python.exe")
+        venv_py_nix = os.path.join(comfyui_dir, "venv", "bin", "python")
+        for venv_candidate in (venv_py_win, venv_py_nix):
+            if os.path.isfile(venv_candidate):
+                python_exe = venv_candidate
+                self.log(f"[ComfyUI] Nutze venv-Python: {venv_candidate}", "INFO")
+                break
 
-        # 2. System-Python das torch importieren kann
+        # 2. System-Python das torch importieren kann — pytorch_env EXPLIZIT ausschliessen
+        #    (pytorch_env hat einen inkompatiblen tqdm stderr-Wrapper → Errno 22 auf Pipes)
+        _pytorch_env_marker = os.path.normcase(
+            os.path.join(os.path.expanduser("~"), "pytorch_env")
+        )
         if not python_exe:
             for cand in [
                 sys.executable,
@@ -1706,11 +1983,16 @@ class ProductionOrchestrator:
             ]:
                 if not cand or not os.path.isfile(cand):
                     continue
+                # Nie pytorch_env verwenden
+                if os.path.normcase(cand).startswith(_pytorch_env_marker):
+                    self.log(f"[ComfyUI] pytorch_env ignoriert (inkompatibel): {cand}", "WARNING")
+                    continue
                 try:
                     result = subprocess.run(
                         [cand, "-c", "import torch; print('ok')"],
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                         timeout=10, cwd=comfyui_dir,
+                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                     )
                     if result.returncode == 0:
                         python_exe = cand
@@ -1719,10 +2001,22 @@ class ProductionOrchestrator:
                 except Exception:
                     continue
 
-        # 3. sys.executable als letzter Ausweg
+        # 3. sys.executable als letzter Ausweg — nur wenn KEIN pytorch_env
         if not python_exe:
-            python_exe = sys.executable
-            self.log(f"[ComfyUI] Nutze sys.executable als Fallback: {python_exe}", "WARNING")
+            cand = sys.executable
+            if os.path.normcase(cand).startswith(_pytorch_env_marker):
+                self.log("[ComfyUI] sys.executable ist pytorch_env — suche Alternativen.", "WARNING")
+                # python.exe im PATH suchen (ohne pytorch_env)
+                import shutil as _shutil
+                for name in ("python3.exe", "python.exe", "python3", "python"):
+                    found = _shutil.which(name)
+                    if found and not os.path.normcase(found).startswith(_pytorch_env_marker):
+                        python_exe = found
+                        self.log(f"[ComfyUI] PATH-Python als Fallback: {found}", "WARNING")
+                        break
+            if not python_exe:
+                python_exe = cand
+                self.log(f"[ComfyUI] Nutze sys.executable als Fallback: {python_exe}", "WARNING")
 
         # ── Diagnose-Check: main.py kurz testen (gibt Importfehler sofort aus) ─
         self.log("[ComfyUI] Diagnose: prüfe Python-Umgebung...", "INFO")
@@ -1802,6 +2096,8 @@ class ProductionOrchestrator:
             # Ohne dies schlaegt tqdm/ComfyUI-Manager mit OSError [Errno 22] fehl.
             # ComfyUI-Manager patcht stderr (prestartup_script.py:336) — tqdm
             # versucht dann flush() auf dem gepatchten Stream → OSError auf Windows-Pipes.
+            # TQDM_DISABLE=1  verhindert dass tqdm ueberhaupt in stderr schreibt —
+            # das ist der eigentliche Ausloester des Errno 22 auf Windows-Pipes.
             comfyui_env = os.environ.copy()
             comfyui_env["PYTHONIOENCODING"]          = "utf-8"
             comfyui_env["PYTHONLEGACYWINDOWSSTDIO"]  = "0"
@@ -1809,6 +2105,9 @@ class ProductionOrchestrator:
             comfyui_env["NO_COLOR"]                  = "1"   # tqdm: kein ANSI → kein flush-Problem
             comfyui_env["TERM"]                      = "dumb" # tqdm: kein interaktives Terminal
             comfyui_env["FORCE_COLOR"]               = "0"
+            comfyui_env["TQDM_DISABLE"]              = "1"   # tqdm komplett stumm → kein stderr-Write → kein Errno 22
+            comfyui_env["TQDM_MININTERVAL"]          = "999" # Fallback falls TQDM_DISABLE ignoriert wird
+            comfyui_env["COMFYUI_NO_PROGRESS"]       = "1"   # zukuenftige ComfyUI-Versionen
 
             proc = subprocess.Popen(
                 cmd,
@@ -1960,28 +2259,18 @@ class ProductionOrchestrator:
         out_dir: str,
         comfyui_url: str,
         tag: str,
+        scene_package: dict | None = None,
     ) -> str | None:
         """Fuegt Narration + Cinematic Musik zum Video hinzu.
 
         Pipeline (sequenziell, VRAM-schonend):
-          A) TTS-Narration via ComfyUI F5-TTS/ChatterBox (TTS-Audio-Suite)
-          B) Cinematic Musik via ComfyUI ACE-Step 1.5
+          A) TTS-Narration via ComfyUI ChatterBox (TTS-Audio-Suite)
+          B) Cinematic Musik via ComfyUI ACE-Step
           C) FFmpeg: Video + Narration + Musik → finales MP4
 
-        VRAM-Management: Jeder ComfyUI-Job laeuft separat, Modelle werden
-        nach jedem Job entladen. So bleiben 6GB VRAM ausreichend.
-
         Args:
-            sid:          Szenen-ID.
-            video_path:   Pfad zum gerenderten Video (MP4/WEBP).
-            prompt:       Szenen-Prompt (fuer Musik-Beschreibung).
-            duration_sec: Videodauer in Sekunden.
-            out_dir:      Ausgabeverzeichnis.
-            comfyui_url:  ComfyUI-API-URL.
-            tag:          Log-Prefix.
-
-        Returns:
-            Pfad zum finalen MP4 mit Audio, oder None bei Fehler.
+            scene_package: Validiertes Package aus request_scene_package().
+                           Falls None: Fallback auf prompt-basierte Defaults.
         """
         import urllib.request, urllib.error, json as _json
 
@@ -1990,6 +2279,19 @@ class ProductionOrchestrator:
         project_root = os.path.dirname(os.path.normpath(self.storage_root))
         comfyui_dir  = os.path.join(project_root, "ComfyUI-Portable")
         comfyui_out  = os.path.join(comfyui_dir, "output")
+
+        # ── Scene-Package: Defaults wenn nicht vorhanden ──────────────────────
+        if not scene_package:
+            scene_package = {
+                "narration_text":    prompt[:300].strip(),
+                "tts_language":      "English",
+                "tts_emotion":       "neutral",
+                "tts_exaggeration":  0.5,
+                "music_tags":        ["cinematic", "orchestral", "instrumental", "dark", "atmospheric"],
+                "music_lang_marker": "[inst]",
+                "music_duration_sec": min(duration_sec + 2, 30),
+                "music_num_steps":   30,
+            }
 
         # ── Hilfsfunktion: ComfyUI-Job abschicken und warten ─────────────────
         def _submit_and_wait(workflow: dict, label: str,
@@ -2053,25 +2355,46 @@ class ProductionOrchestrator:
         self.log(f"{tag} A) TTS-Narration (ChatterBox)...", "INFO")
         narration_path = None
 
-        narration_text = prompt[:300].strip()
-        if len(prompt) > 300:
-            narration_text += "..."
+        narration_text   = scene_package["narration_text"]
+        tts_language     = scene_package["tts_language"]
+        tts_exaggeration = scene_package["tts_exaggeration"]
+        # Emotion → ChatterBox-Parameter mappen
+        _emotion_map = {
+            "calm":        (0.3, 0.5, 0.6),   # (exag, temp, cfg)
+            "neutral":     (0.5, 0.7, 0.5),
+            "dramatic":    (0.7, 0.8, 0.4),
+            "intense":     (0.8, 0.9, 0.35),
+            "mysterious":  (0.5, 0.6, 0.5),
+            "sad":         (0.4, 0.5, 0.55),
+            "ominous":     (0.6, 0.6, 0.45),
+            "solemn":      (0.45, 0.55, 0.55),
+            "urgent":      (0.75, 0.85, 0.4),
+            "tense":       (0.65, 0.75, 0.42),
+            "warm":        (0.4, 0.6, 0.55),
+            "reflective":  (0.35, 0.55, 0.6),
+            "hopeful":     (0.5, 0.65, 0.5),
+            "cold":        (0.4, 0.5, 0.6),
+        }
+        _exag, _temp, _cfg = _emotion_map.get(
+            scene_package.get("tts_emotion", "neutral"),
+            (tts_exaggeration, 0.7, 0.5)
+        )
+        self.log(
+            f"{tag}   TTS: lang={tts_language}, emotion={scene_package.get('tts_emotion','neutral')}, "
+            f"exag={_exag}, temp={_temp}", "INFO"
+        )
+        self.log(f"{tag}   Narration-Text ({len(narration_text)} Zeichen): {narration_text[:80]}...", "INFO")
 
         tts_prefix = f"tts_{sid}"
-        # TTS-Audio-Suite Architektur: Engine-Node → UnifiedTTSTextNode → SaveAudio
-        # UnifiedTTSTextNode akzeptiert TTS_ENGINE-Objekt (nicht String "engine_type").
-        # Korrekte Nodes aus nodes.py:
-        #   "ChatterBoxEngineNode"       → TTS_ENGINE Typ
-        #   "UnifiedTTSTextNode"         → braucht TTS_ENGINE als Input "TTS_engine"
         tts_workflow = {
             "1": {
                 "class_type": "ChatterBoxEngineNode",
                 "inputs": {
-                    "language":                  "English",
+                    "language":                  tts_language,
                     "device":                    "auto",
-                    "exaggeration":              0.5,
-                    "temperature":               0.7,
-                    "cfg_weight":                0.5,
+                    "exaggeration":              _exag,
+                    "temperature":               _temp,
+                    "cfg_weight":                _cfg,
                     "crash_protection_template": "none",
                 }
             },
@@ -2111,17 +2434,23 @@ class ProductionOrchestrator:
         self.log(f"{tag} B) Cinematic Musik (ACE-Step)...", "INFO")
         music_path = None
 
-        music_prompt = (
-            "cinematic noir orchestral score, dark ambient, "
-            "volumetric low strings, haunting piano, tension building, "
-            "no vocals, film score, Hans Zimmer style"
+        # Music-Parameter aus validiertem Scene-Package
+        music_tags     = scene_package["music_tags"]
+        music_lang     = scene_package["music_lang_marker"]
+        music_dur      = scene_package["music_duration_sec"]
+        music_steps    = scene_package["music_num_steps"]
+        # ACE-Step Prompt: Tags + Sprach-Marker + keine Vocals
+        music_prompt = ", ".join(music_tags) + f", no vocals, film score"
+        self.log(
+            f"{tag}   Musik: tags={music_tags}, lang={music_lang}, "
+            f"dur={music_dur}s, steps={music_steps}", "INFO"
         )
+
         music_prefix = f"music_{sid}"
 
         import re as _re
         sid_digits = _re.sub(r"[^0-9]", "", sid) or "1"
         music_seed  = int(sid_digits[:6])
-        music_dur   = min(duration_sec + 2, 30)
 
         # ComfyUI_ACE-Step (billwuhao): Node-Namen aus ace_step_nodes.py
         # ACEModelLoader → ACEStepGen → SaveAudio
@@ -2166,19 +2495,19 @@ class ProductionOrchestrator:
                 "2": {
                     "class_type": "ACEStepGen",
                     "inputs": {
-                        "models":         ["1", 0],
-                        "prompt":         music_prompt,
-                        "lyrics":         "[inst]",
-                        # delicious_song: verwendet Node-eigene Default-Parameter.
-                        # parameters direkt übergeben ist fehleranfällig wegen API-Versionsunterschieden.
-                        # Der Node liest duration etc. aus dem JSON selbst.
-                        "delicious_song": "default_1.json",
-                        # Nur den Prompt und Seed überschreiben via parameters:
-                        "parameters": (
-                            f'{{"seed": {music_seed}, '
-                            '"use_erg_tag": True, "use_erg_lyric": False, '
-                            '"use_erg_diffusion": True}'
-                        ),
+                        "models":                ["1", 0],
+                        "prompt":                music_prompt,
+                        "lyrics":                music_lang,   # [inst] = keine Vocals
+                        "duration":              float(music_dur),
+                        "steps":                 music_steps,
+                        "guidance_scale":        7.0,
+                        "seed":                  music_seed,
+                        "scheduler":             "euler",
+                        "cfg_type":              "apg",
+                        "omega_scale":           10.0,
+                        "use_erg_tag":           True,
+                        "use_erg_lyric":         False,
+                        "use_erg_diffusion":     True,
                     }
                 },
                 "3": {
@@ -2189,7 +2518,9 @@ class ProductionOrchestrator:
                     }
                 }
             }
-            music_outputs = _submit_and_wait(music_workflow, "ACE-Step Musik", max_wait=14400)  # max 4h
+            # max_wait: music_dur * 200s Puffer (30s Musik ~ 2000s Rechenzeit auf RTX 3050)
+            music_max_wait = max(3600, music_dur * 120)
+            music_outputs = _submit_and_wait(music_workflow, "ACE-Step Musik", max_wait=music_max_wait)
         if music_outputs:
             music_path = _find_audio_file(music_outputs, "Musik")
             if music_path:
@@ -2274,7 +2605,8 @@ class ProductionOrchestrator:
             return None
 
     def _call_comfyui_worker(self, sid: str, prompt: str, duration_sec: int,
-                             out_dir: str) -> str | None:
+                             out_dir: str, scene: dict | None = None,
+                             scene_pkg: dict | None = None) -> str | None:
         """Rendert eine Szene ueber eine lokal laufende ComfyUI-Instanz.
 
         Workflow:
@@ -2538,25 +2870,46 @@ class ProductionOrchestrator:
                                     f.write(f"file '{c}'\n")
                             concat_out = os.path.join(out_dir, "_clip_concat.mp4")
                             # FFmpeg suchen
-                        import shutil as _shff
-                        ffmpeg_cc = _shff.which("ffmpeg")
-                        if not ffmpeg_cc:
-                            _ff_local = os.path.join(comfyui_out, "..", "venv", "Scripts", "ffmpeg.exe")
-                            _ff_local = os.path.normpath(_ff_local)
-                            if os.path.isfile(_ff_local):
-                                ffmpeg_cc = _ff_local
+                            import shutil as _shff
+                            ffmpeg_cc = _shff.which("ffmpeg")
+                            if not ffmpeg_cc:
+                                _ff_local = os.path.join(comfyui_out, "..", "venv", "Scripts", "ffmpeg.exe")
+                                _ff_local = os.path.normpath(_ff_local)
+                                if os.path.isfile(_ff_local):
+                                    ffmpeg_cc = _ff_local
                             if ffmpeg_cc:
                                 try:
                                     subprocess.run(
                                         [ffmpeg_cc, "-y", "-f", "concat", "-safe", "0",
                                          "-i", concat_list, "-c", "copy", concat_out],
-                                        check=True, capture_output=True, timeout=120
+                                        check=True,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        timeout=120,
+                                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                                     )
                                     if os.path.isfile(concat_out):
-                                        _shc.copy2(concat_out, clip_path)
+                                        import shutil as _shc2
+                                        _shc2.copy2(concat_out, clip_path)
                                         self.log(f"{TAG} ✅ {len(all_clips)} Clips → {clip_path} ({len(all_clips)*5:.0f}s)", "SUCCESS")
+                                    else:
+                                        self.log(f"{TAG} ⚠️  Concat-Datei nicht erzeugt — nutze clip_001.", "WARNING")
                                 except Exception as fe:
                                     self.log(f"{TAG} FFmpeg concat fehlgeschlagen: {fe}", "WARNING")
+                            else:
+                                self.log(f"{TAG} ⚠️  FFmpeg nicht gefunden — concat übersprungen.", "WARNING")
+
+                    # ── Scene-Package generieren (LLM + Validierung) ──────────
+                    _scene_for_pkg = scene if scene else {
+                        "id": sid, "prompt": prompt, "duration_sec": duration_sec,
+                        "title": sid, "chapter": "", "chars": [],
+                    }
+                    if scene_pkg is None:
+                        scene_pkg = self.request_scene_package(
+                            scene           = _scene_for_pkg,
+                            enhanced_prompt = prompt,
+                        )
+                    else:
+                        self.log(f"{TAG} Scene-Package bereits vorhanden — überspringe LLM-Call.", "INFO")
 
                     # ── Cinematic Audio Pipeline ──────────────────────────────
                     final_path = self._run_cinematic_audio_pipeline(
@@ -2567,6 +2920,7 @@ class ProductionOrchestrator:
                         out_dir=out_dir,
                         comfyui_url=COMFYUI_URL,
                         tag=TAG,
+                        scene_package=scene_pkg,
                     )
                     return final_path if final_path else clip_path
                 except Exception as e:
@@ -2592,7 +2946,7 @@ class ProductionOrchestrator:
         return None
 
     @staticmethod
-    def _install_comfyui(storage_root: str, log_cb=None) -> bool:
+    def _install_comfyui(storage_root: str, log_cb=None, tick_cb=None) -> bool:
         """Installiert ComfyUI Portable + WAN 2.1 1.3B + Custom Nodes einmalig.
 
         Schritte:
@@ -2616,7 +2970,18 @@ class ProductionOrchestrator:
         import zipfile
         import shutil
 
-        log = log_cb or (lambda m, l="INFO": print(f"[{l}] {m}"))
+        log  = log_cb  or (lambda m, l="INFO": print(f"[{l}] {m}"))
+        tick = tick_cb or (lambda key, state, txt="": None)
+
+        # ── Hilfsfunktion: subprocess ohne CMD-Popup-Fenster ──────────────────
+        _NO_WIN = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+        def _run_hidden(cmd, **kw):
+            """subprocess.run() — niemals ein CMD-Fenster öffnen."""
+            kw.setdefault("stdout", subprocess.PIPE)
+            kw.setdefault("stderr", subprocess.PIPE)
+            kw["creationflags"] = kw.get("creationflags", 0) | _NO_WIN
+            return subprocess.run(cmd, **kw)
 
         # Zielordner: ein Level ueber storage_root (Projektroot)
         project_root  = os.path.dirname(os.path.normpath(storage_root))
@@ -2720,6 +3085,7 @@ class ProductionOrchestrator:
 
         # ── 4. Venv + Torch installieren ─────────────────────────────────────
         log("[ComfyUI-Install] Schritt 3/6: Erstelle venv und installiere torch...", "INFO")
+        tick("venv", "run", "venv + torch installieren...")
         venv_dir = os.path.join(comfyui_dir, "venv")
 
         # sys.executable koennte 32-Bit Python sein (kein venv/torch moeglich).
@@ -2748,7 +3114,8 @@ class ProductionOrchestrator:
                          "import struct, sys, ensurepip; "
                          "print(struct.calcsize('P'), sys.version_info.major, "
                          "sys.version_info.minor)"],
-                        timeout=8, stderr=subprocess.DEVNULL
+                        timeout=8, stderr=subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                     ).decode().strip().split()
                     ptr_size   = int(out[0])
                     major, minor = int(out[1]), int(out[2])
@@ -2774,7 +3141,8 @@ class ProductionOrchestrator:
                     out = subprocess.check_output(
                         [py_launcher, "-3", "-c",
                          "import sys; print(sys.executable)"],
-                        timeout=8, stderr=subprocess.DEVNULL
+                        timeout=8, stderr=subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                     ).decode().strip()
                     candidate = os.path.join(os.path.dirname(out), "python.exe")
                     if _is_valid(candidate):
@@ -2855,15 +3223,17 @@ class ProductionOrchestrator:
         # ── Venv erstellen — 4 Strategien ────────────────────────────────────
         # Hinweis: capture_output=True erst ab Python 3.7 — nutze PIPE fuer
         # maximale Kompatibilitaet (auch auf aelteren Python-Installationen).
-        PIPE = subprocess.PIPE
+        PIPE   = subprocess.PIPE
+        NO_WIN = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         venv_ok = False
 
         # Strategie 1: Standard venv
         try:
-            result = subprocess.run(
+            result = _run_hidden(
                 [venv_python, "-m", "venv", venv_dir],
                 timeout=120,
                 stdout=PIPE, stderr=PIPE,
+                creationflags=NO_WIN,
             )
             if result.returncode == 0:
                 venv_ok = True
@@ -2881,10 +3251,11 @@ class ProductionOrchestrator:
         if not venv_ok:
             log("[ComfyUI-Install] Versuche venv --without-pip...", "INFO")
             try:
-                result = subprocess.run(
+                result = _run_hidden(
                     [venv_python, "-m", "venv", "--without-pip", venv_dir],
                     timeout=120,
                     stdout=PIPE, stderr=PIPE,
+                    creationflags=NO_WIN,
                 )
                 if result.returncode == 0:
                     venv_ok = True
@@ -2896,7 +3267,15 @@ class ProductionOrchestrator:
                         get_pip = os.path.join(comfyui_dir, "_get_pip.py")
                         _ur.urlretrieve("https://bootstrap.pypa.io/get-pip.py", get_pip)
                         venv_py = os.path.join(venv_dir, "Scripts", "python.exe")
-                        subprocess.check_call([venv_py, get_pip], timeout=120)
+                        _no_win_si = subprocess.STARTUPINFO()
+                        _no_win_si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                        _no_win_si.wShowWindow = 0
+                        subprocess.check_call(
+                            [venv_py, get_pip], timeout=120,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                            startupinfo=_no_win_si if sys.platform == "win32" else None,
+                        )
                         os.remove(get_pip)
                         log("[ComfyUI-Install] pip installiert ✓", "SUCCESS")
                     except Exception as ep:
@@ -2916,11 +3295,13 @@ class ProductionOrchestrator:
                     [venv_python, "-m", "pip", "install", "--quiet", "virtualenv"],
                     timeout=120,
                     stdout=PIPE, stderr=PIPE,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                 )
-                result = subprocess.run(
+                result = _run_hidden(
                     [venv_python, "-m", "virtualenv", venv_dir],
                     timeout=120,
                     stdout=PIPE, stderr=PIPE,
+                    creationflags=NO_WIN,
                 )
                 if result.returncode == 0:
                     venv_ok = True
@@ -2948,14 +3329,33 @@ class ProductionOrchestrator:
             pip_exe    = None  # wird ueber "python -m pip" aufgerufen
 
         def _pip(args: list, **kwargs) -> bool:
-            """Fuehrt pip-Kommando aus — via pip_exe oder 'python -m pip'."""
+            """Fuehrt pip-Kommando aus — ohne CMD-Popup-Fenster (CREATE_NO_WINDOW)."""
             cmd = [pip_exe] + args if pip_exe and os.path.isfile(pip_exe) \
                   else [python_exe, "-m", "pip"] + args
+            # Immer stdout/stderr abfangen + kein eigenes Fenster oeffnen
+            no_win = {}
+            if sys.platform == "win32":
+                no_win["creationflags"] = subprocess.CREATE_NO_WINDOW
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                si.wShowWindow = 0  # SW_HIDE
+                no_win["startupinfo"] = si
+            kwargs.setdefault("stdout", subprocess.PIPE)
+            kwargs.setdefault("stderr", subprocess.STDOUT)
+            kwargs.update(no_win)
             try:
-                subprocess.check_call(cmd, **kwargs)
+                result = subprocess.run(cmd, **kwargs)
+                if result.returncode != 0:
+                    out = (result.stdout or b"").decode(errors="replace") if isinstance(result.stdout, bytes) \
+                          else (result.stdout or "")
+                    for line in out.splitlines()[-8:]:
+                        if line.strip():
+                            log(f"  pip> {line.strip()}", "WARNING")
+                    log(f"[ComfyUI-Install] pip {args[1] if len(args)>1 else ''} exit={result.returncode}", "WARNING")
+                    return False
                 return True
             except Exception as ex:
-                log(f"[ComfyUI-Install] pip-Fehler: {ex}", "WARNING")
+                log(f"[ComfyUI-Install] pip: {args[1] if len(args)>1 else ''} fehlgeschlagen: {ex}", "WARNING")
                 return False
 
         # ── torch + requirements installieren ────────────────────────────────
@@ -2977,13 +3377,13 @@ class ProductionOrchestrator:
             ]
             for nsmi in nsmi_paths:
                 try:
-                    r = subprocess.run(
+                    r = _run_hidden(
                         [nsmi, "--query-gpu=driver_version", "--format=csv,noheader"],
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                         timeout=8, creationflags=subprocess.CREATE_NO_WINDOW
                     )
                     if r.returncode == 0:
-                        r2 = subprocess.run(
+                        r2 = _run_hidden(
                             [nsmi],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             timeout=8, creationflags=subprocess.CREATE_NO_WINDOW
@@ -3028,7 +3428,7 @@ class ProductionOrchestrator:
         )
         if os.path.isfile(pytorch_env_venv) and venv_ok is False:
             try:
-                r = subprocess.run(
+                r = _run_hidden(
                     [pytorch_env_venv, "-c",
                      "import torch; print(torch.cuda.is_available(), torch.__version__)"],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
@@ -3046,7 +3446,7 @@ class ProductionOrchestrator:
         # torch: erst pruefen ob bereits CUDA-faehig installiert
         torch_already_ok = False
         try:
-            r = subprocess.run(
+            r = _run_hidden(
                 [python_exe, "-c",
                  "import torch; print(torch.cuda.is_available(), torch.__version__)"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
@@ -3054,6 +3454,7 @@ class ProductionOrchestrator:
             out = r.stdout.decode(errors="replace").strip()
             if out.startswith("True") and f"+{cu_tag}" in out:
                 log(f"[ComfyUI-Install] torch bereits korrekt installiert: {out} ✓", "SUCCESS")
+                tick("venv", "ok", f"torch CUDA {out.split()[-1]}")
                 torch_already_ok = True
         except Exception:
             pass
@@ -3098,7 +3499,7 @@ class ProductionOrchestrator:
 
             if torch_ok:
                 try:
-                    check = subprocess.run(
+                    check = _run_hidden(
                         [python_exe, "-c",
                          "import torch; "
                          "print('CUDA:', torch.cuda.is_available(), '|', "
@@ -3119,27 +3520,51 @@ class ProductionOrchestrator:
         req_file = os.path.join(comfyui_dir, "requirements.txt")
         if os.path.isfile(req_file):
             log("[ComfyUI-Install] Installiere requirements.txt...", "INFO")
+            tick("deps", "run", "requirements.txt...")
             req_ok = _pip(["install", "-r", req_file], timeout=300)
             if req_ok:
                 log("[ComfyUI-Install] requirements.txt installiert ✓", "SUCCESS")
+                tick("deps", "ok", "requirements.txt installiert")
             else:
                 log("[ComfyUI-Install] requirements.txt fehlgeschlagen (nicht kritisch).", "WARNING")
+                tick("deps", "fail")
 
-        # ── tqdm auf bekannt-gute Version fixieren ────────────────────────────
-        # tqdm >= 4.67 hat einen Bug auf Windows-Pipes wenn ComfyUI-Manager
-        # stderr patcht → OSError [Errno 22] beim flush() → KSampler bricht ab.
-        # Lösung: tqdm==4.66.4 (letzte stabile Version ohne diesen Bug).
+        # tqdm==4.66.4 in ALLEN verfuegbaren Python-Umgebungen fixieren.
+        # ComfyUI laeuft je nach Situation mit venv ODER pytorch_env —
+        # tqdm muss in beiden vorhanden sein sonst OSError [Errno 22].
         log("[ComfyUI-Install] Fixiere tqdm (Windows-Pipe Bug)...", "INFO")
-        tqdm_ok = _pip(["install", "tqdm==4.66.4", "--force-reinstall", "--no-cache-dir"], timeout=60)
+        tick("tqdm", "run", "tqdm fixieren...")
+        tqdm_cmd = ["install", "tqdm==4.66.4", "--force-reinstall", "--no-cache-dir"]
+        tqdm_ok = _pip(tqdm_cmd, timeout=60)
         if tqdm_ok:
             log("  tqdm==4.66.4 installiert ✓", "SUCCESS")
+            tick("tqdm", "ok", "tqdm fixiert")
         else:
-            log("  tqdm-Fix fehlgeschlagen — KSampler kann weiter abstürzen", "WARNING")
+            log("  tqdm-Fix fehlgeschlagen — KSampler kann weiter abstuerzen", "WARNING")
+        # Zusaetzlich in pytorch_env installieren falls vorhanden und anders als python_exe
+        pytorch_env_pip = os.path.join(
+            os.path.expanduser("~"), "pytorch_env", "venv", "Scripts", "pip.exe"
+        )
+        if os.path.isfile(pytorch_env_pip) and pytorch_env_pip != pip_exe:
+            try:
+                _run_hidden(
+                    [pytorch_env_pip, "install", "tqdm==4.66.4",
+                     "--force-reinstall", "--no-cache-dir"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                )
+                log("  tqdm==4.66.4 in pytorch_env installiert ✓", "SUCCESS")
+            except Exception as te:
+                log(f"  tqdm in pytorch_env fehlgeschlagen: {te}", "WARNING")
+
+        # ── sqlalchemy upgraden — ComfyUI braucht sqlalchemy>=2.0 fuer 'select' ──
+        log("[ComfyUI-Install] Upgrade sqlalchemy (behebt ImportError: cannot import 'select')...", "INFO")
+        _pip(["install", "sqlalchemy>=2.0", "--upgrade", "--no-cache-dir"], timeout=120)
 
         # ── torch CUDA nach requirements.txt sichern ──────────────────────────
         # requirements.txt kann torch überschreiben. Immer danach prüfen und
         # ggf. aus WHL-Cache wiederherstellen.
-        chk_torch_req = subprocess.run(
+        chk_torch_req = _run_hidden(
             [python_exe, "-c",
              "import torch; print(torch.cuda.is_available(), torch.__version__)"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
@@ -3160,6 +3585,7 @@ class ProductionOrchestrator:
 
 
         log("[ComfyUI-Install] Schritt 4/6: Lade WAN 2.1 1.3B Modell...", "INFO")
+        tick("models", "run", "Modelle laden...")
         # WAN 2.1 gehoert in diffusion_models/ (NICHT checkpoints/) — ComfyUI native
         models_dir = os.path.join(comfyui_dir, "models", "diffusion_models")
         os.makedirs(models_dir, exist_ok=True)
@@ -3237,6 +3663,7 @@ class ProductionOrchestrator:
         # Workflow fehl. Werden gecacht in setupfiles/ und nach models/vae/ bzw.
         # models/text_encoders/ kopiert.
         log("[ComfyUI-Install] Lade WAN VAE + T5 Text Encoder...", "INFO")
+        tick("models", "run", "VAE + T5 laden...")
 
         def _ensure_model(filename: str, dest_dir: str, url: str,
                           min_size: int = 10_000_000, label: str = "") -> bool:
@@ -3307,6 +3734,7 @@ class ProductionOrchestrator:
             label    = "SD 1.5 fp16 (~2 GB — Geduld...)",
         )
         log("[ComfyUI-Install] Lade ChatterBox TTS Modell...", "INFO")
+        tick("chatterbox", "run", "ChatterBox TTS Modell laden...")
         chatterbox_dir        = os.path.join(comfyui_dir, "models", "TTS", "chatterbox")
         chatterbox_cache_dir  = os.path.join(setup_cache, "chatterbox")
         os.makedirs(chatterbox_dir, exist_ok=True)
@@ -3331,6 +3759,7 @@ class ProductionOrchestrator:
 
         if _chatterbox_complete(chatterbox_dir):
             log("  ChatterBox: Modell bereits vorhanden ✓", "INFO")
+            tick("chatterbox", "ok", "ChatterBox bereits vorhanden")
             # English/-Unterordner in Cache sichern falls noch nicht vorhanden
             en_src = os.path.join(chatterbox_dir, "English")
             en_dst = os.path.join(chatterbox_cache_dir, "English")
@@ -3360,7 +3789,7 @@ class ProductionOrchestrator:
         else:
             log("  ChatterBox: Lade von HuggingFace (~1 GB) → Cache: setupfiles/chatterbox/", "INFO")
             try:
-                dl_cb = subprocess.run(
+                dl_cb = _run_hidden(
                     [python_exe, "-c",
                      "from huggingface_hub import snapshot_download; "
                      "snapshot_download("
@@ -3389,6 +3818,7 @@ class ProductionOrchestrator:
                         except Exception:
                             pass
                     log("  ChatterBox: Modell installiert ✓", "SUCCESS")
+                    tick("chatterbox", "ok", "ChatterBox installiert")
                     # English/-Unterordner aus Zielordner in Cache sichern
                     # (TTS-Audio-Suite laedt English/ direkt in models/TTS/chatterbox/English/)
                     en_src = os.path.join(chatterbox_dir, "English")
@@ -3427,12 +3857,13 @@ class ProductionOrchestrator:
         ]
 
         log("[ComfyUI-Install] Schritt 5/6: Klone Custom Nodes...", "INFO")
+        tick("nodes", "run", "Custom Nodes klonen...")
         for node_name, node_url in custom_nodes:
             node_dir = os.path.join(custom_nodes_dir, node_name)
             if os.path.isdir(node_dir):
                 # Vorhanden — git pull um auf neueste Version zu aktualisieren
                 try:
-                    r = subprocess.run(
+                    r = _run_hidden(
                         ["git", "pull", "--ff-only"],
                         cwd=node_dir, capture_output=True, timeout=60
                     )
@@ -3451,7 +3882,9 @@ class ProductionOrchestrator:
             try:
                 subprocess.check_call(
                     ["git", "clone", "--depth=1", node_url, node_dir],
-                    timeout=120
+                    timeout=120,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                 )
                 log(f"  {node_name} geklont ✓", "SUCCESS")
             except FileNotFoundError:
@@ -3462,6 +3895,7 @@ class ProductionOrchestrator:
 
         # ── Custom Node Dependencies installieren ─────────────────────────────
         log("[ComfyUI-Install] Installiere Custom Node Dependencies...", "INFO")
+        tick("nodedeps", "run", "Node Dependencies installieren...")
 
         # VideoHelperSuite: braucht opencv-python, imageio-ffmpeg
         vhs_req = os.path.join(custom_nodes_dir, "ComfyUI-VideoHelperSuite", "requirements.txt")
@@ -3477,7 +3911,7 @@ class ProductionOrchestrator:
         # AudioTools: librosa direkt installieren (requirements.txt oft inkompatibel)
         librosa_ok = False
         try:
-            r = subprocess.run(
+            r = _run_hidden(
                 [python_exe, "-c", "import librosa; print('ok')"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
             )
@@ -3537,7 +3971,7 @@ class ProductionOrchestrator:
                 ("audioread",               "Audio",                "audioread"),
             ]
             for pkg, engine, import_name in _tts_deps:
-                check = subprocess.run(
+                check = _run_hidden(
                     [python_exe, "-c", f"import {import_name}"],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
                     creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
@@ -3553,7 +3987,7 @@ class ProductionOrchestrator:
                     ok = _pip(["install", pkg, "--no-cache-dir", "--no-deps"], timeout=120)
                     if ok:
                         # Sicherheitscheck: torch CUDA nach chatterbox-tts Installation
-                        chk_torch = subprocess.run(
+                        chk_torch = _run_hidden(
                             [python_exe, "-c",
                              "import torch; assert torch.cuda.is_available(), 'CUDA verloren';"
                              "print('torch CUDA OK:', torch.__version__)"],
@@ -3589,7 +4023,7 @@ class ProductionOrchestrator:
                     # Bereits-Check
                     _imp = ace_pkg.split(">=")[0].split("<=")[0].split("==")[0].strip()
                     _imp = _imp.replace("-", "_").lower()
-                    chk = subprocess.run(
+                    chk = _run_hidden(
                         [python_exe, "-c", f"import {_imp}"],
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8,
                         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
@@ -3640,7 +4074,7 @@ class ProductionOrchestrator:
         else:
             log("  ACE-Step: Lade von HuggingFace (~5 GB) → Cache: setupfiles/ACE-Step-v1-3.5B/", "INFO")
             try:
-                dl_ace = subprocess.run(
+                dl_ace = _run_hidden(
                     [python_exe, "-c",
                      "from huggingface_hub import snapshot_download; "
                      "snapshot_download("
@@ -3655,6 +4089,7 @@ class ProductionOrchestrator:
                 )
                 if "DONE" in dl_ace.stdout.decode(errors="replace") or _ace_model_complete(ace_model_cache_dir):
                     log("  ACE-Step: Heruntergeladen ✓ — kopiere in Zielordner...", "SUCCESS")
+                    tick("ace", "ok", "ACE-Step installiert")
                     import shutil as _shace2
                     _shace2.copytree(ace_model_cache_dir, ace_model_dir, dirs_exist_ok=True)
                     log("  ACE-Step: Modell installiert ✓", "SUCCESS")
@@ -3669,7 +4104,7 @@ class ProductionOrchestrator:
         # chatterbox-tts zieht torch CPU als Dependency — das zerstoert die CUDA-
         # Installation. Loesung: --no-deps, dann torch CUDA aus Cache wiederherstellen.
         # Prüfe ob ChatterboxTTS vollständig funktioniert (nicht nur ob chatterbox importierbar)
-        chk_cb = subprocess.run(
+        chk_cb = _run_hidden(
             [python_exe, "-c", "from chatterbox.tts import ChatterboxTTS; print('OK')"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
@@ -3679,6 +4114,7 @@ class ProductionOrchestrator:
             log("  chatterbox-tts: ChatterboxTTS verfügbar ✓", "INFO")
         else:
             err_cb = chk_cb.stderr.decode(errors="replace")[-300:]
+            tick("chatterboxpkg", "run", "chatterbox-tts installieren...")
             log(f"  chatterbox-tts: ChatterboxTTS nicht verfügbar — installiere...", "INFO")
             if err_cb:
                 log(f"  Fehler: {err_cb}", "INFO")
@@ -3699,7 +4135,7 @@ class ProductionOrchestrator:
             ]
             for dep in cb_deps:
                 dep_imp = dep.split("==")[0].replace("-", "_").lower()
-                chk_dep = subprocess.run(
+                chk_dep = _run_hidden(
                     [python_exe, "-c", f"import {dep_imp}"],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8,
                     creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
@@ -3707,22 +4143,27 @@ class ProductionOrchestrator:
                 if chk_dep.returncode != 0:
                     ok_dep = _pip(["install", dep, "--no-cache-dir"], timeout=120)
                     if not ok_dep:
-                        # Fallback mit --no-deps
                         ok_dep = _pip(["install", dep, "--no-cache-dir", "--no-deps"], timeout=60)
+                    # antlr4 Versions-Fallback: 4.9.3 schlaegt oft fehl → 4.13.2 versuchen
+                    if not ok_dep and "antlr4" in dep:
+                        ok_dep = _pip(["install", "antlr4-python3-runtime==4.13.2",
+                                       "--no-cache-dir"], timeout=60)
                     log(f"    {dep}: {'✓' if ok_dep else 'fehlgeschlagen'}", "SUCCESS" if ok_dep else "WARNING")
                 else:
                     log(f"    {dep}: bereits installiert ✓", "INFO")
 
             # Verifikation
-            chk_cb2 = subprocess.run(
+            chk_cb2 = _run_hidden(
                 [python_exe, "-c", "from chatterbox.tts import ChatterboxTTS; print('OK')"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
             if b"OK" in chk_cb2.stdout:
                 log("  ChatterboxTTS: bereit ✓", "SUCCESS")
+                tick("chatterboxpkg", "ok", "ChatterboxTTS bereit")
             else:
                 log(f"  ChatterboxTTS: immer noch nicht verfügbar — {chk_cb2.stderr.decode(errors='replace')[-200:]}", "WARNING")
+                tick("chatterboxpkg", "fail")
 
             # torch CUDA sofort wiederherstellen (sicherheitshalber immer)
             log("  Stelle torch CUDA sicher...", "INFO")
@@ -3737,7 +4178,7 @@ class ProductionOrchestrator:
                       "--index-url", torch_index, "--no-cache-dir"], timeout=900)
 
             # Verifikation
-            chk_t = subprocess.run(
+            chk_t = _run_hidden(
                 [python_exe, "-c",
                  "import torch; print(torch.cuda.is_available(), torch.__version__)"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
@@ -3750,9 +4191,12 @@ class ProductionOrchestrator:
                 log(f"  ⚠️  torch CUDA Problem: {out_t}", "WARNING")
 
         log("[ComfyUI-Install] Custom Node Dependencies installiert ✓", "SUCCESS")
+        tick("nodes", "ok")
+        tick("nodedeps", "ok", "Dependencies installiert")
 
         # ── Startskript erstellen ─────────────────────────────────────────────
         log("[ComfyUI-Install] Schritt 6/6: Erstelle Startskript...", "INFO")
+        tick("nodedeps", "ok")
         bat_path = os.path.join(comfyui_dir, "start_comfyui.bat")
         bat_content = (
             "@echo off\n"
@@ -3770,11 +4214,13 @@ class ProductionOrchestrator:
         log("", "INFO")
         log("══════════════════════════════════════════════════════", "SUCCESS")
         log("  ComfyUI-Installation abgeschlossen! ✅", "SUCCESS")
+        tick("start", "ok", "Installation abgeschlossen!")
         log(f"  Pfad: {comfyui_dir}", "SUCCESS")
         log("══════════════════════════════════════════════════════", "SUCCESS")
 
         # ── Schritt 7: ComfyUI direkt starten ────────────────────────────────
         log("[ComfyUI-Install] Schritt 7/7 (Bonus): Starte ComfyUI...", "INFO")
+        tick("start", "run", "Starte ComfyUI...")
 
         # Port 8188 bereinigen — laufende Instanz vom letzten Installer-Lauf beenden
         _kill_comfyui_port(8188, log_cb=log)
@@ -3782,7 +4228,7 @@ class ProductionOrchestrator:
         # CUDA pruefen — falls kein CUDA: --cpu Flag
         _cuda_ok = False
         try:
-            _r = subprocess.run(
+            _r = _run_hidden(
                 [python_exe, "-c", "import torch; print(torch.cuda.is_available())"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, cwd=comfyui_dir,
             )
@@ -4327,6 +4773,10 @@ class SceneEditDialog(tk.Toplevel):
         new_text    = self._prompt_text.get("1.0", "end").strip()
         mode        = self._prompt_mode.get()
 
+        # Bug-Fix: s["prompt"] im Scene-Dict aktualisieren wenn Base Prompt geändert
+        if mode == "base":
+            s["prompt"] = new_text
+
         if os.path.isfile(prompt_path):
             try:
                 with open(prompt_path, "r", encoding="utf-8") as f:
@@ -4360,6 +4810,12 @@ class SceneEditDialog(tk.Toplevel):
                 f.write(f"# Characters: {', '.join(s.get('chars',[]))}\n\n")
                 f.write(f"## Base Prompt\n{s.get('prompt','')}\n\n")
                 f.write(f"## Enhanced Prompt (DeepSeek)\n{new_text}\n")
+
+        # ── Szenenlist persistent speichern (Bug-Fix: Session-übergreifend) ──
+        try:
+            _save_active_scenes(self._storage_root, _get_active_scenes())
+        except Exception as _e:
+            print(f"[SceneEdit] _save_active_scenes fehlgeschlagen: {_e}")
 
         if self._on_save:
             self._on_save()
@@ -4626,6 +5082,100 @@ class ProducerApp(tk.Tk):
         self._log("DeepSeek active — prompts will be enhanced via API.", "INFO")
         self._log("Dry Run disabled. Enable for prompt generation only without API calls.", "INFO")
 
+
+    def _open_installer_popup(self, steps: list) -> dict:
+        """Öffnet ein modales Installer-Fortschrittsfenster nach PyTorch-GUI-Stil.
+        
+        Args:
+            steps: Liste von (key, label) Tuples für die Checkliste.
+        Returns:
+            dict mit tick(key, state) und close() Funktionen.
+        """
+        BG      = "#181825"
+        BG_HDR  = "#1e1e2e"
+        FG      = "#cdd6f4"
+        FG_DIM  = "#6c7086"
+        COL_PENDING = "#585b70"
+        COL_RUN     = "#fab387"
+        COL_OK      = "#a6e3a1"
+        COL_FAIL    = "#f38ba8"
+        PENDING = "  ···"
+        RUNNING = "  ⏳"
+        OK      = "  ✔"
+        FAIL    = "  ✘"
+
+        win = tk.Toplevel(self)
+        win.title("ComfyUI Installation")
+        win.resizable(False, False)
+        win.grab_set()
+        win.configure(bg=BG)
+
+        w, h = 480, 80 + len(steps) * 34 + 80
+        sx = self.winfo_x() + (self.winfo_width()  - w) // 2
+        sy = self.winfo_y() + (self.winfo_height() - h) // 2
+        win.geometry(f"{w}x{h}+{sx}+{sy}")
+
+        # Header
+        hdr = tk.Frame(win, bg=BG_HDR, height=50)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        tk.Label(hdr, text="🖥️  ComfyUI Installation",
+                 font=("Segoe UI", 12, "bold"),
+                 bg=BG_HDR, fg=FG).pack(pady=12)
+
+        # Checkliste
+        list_frame = tk.Frame(win, bg=BG, padx=24, pady=10)
+        list_frame.pack(fill="both", expand=True)
+
+        row_widgets = {}
+        for key, label_text in steps:
+            row = tk.Frame(list_frame, bg=BG)
+            row.pack(fill="x", pady=2)
+            icon_var = tk.StringVar(value=PENDING)
+            icon_lbl = tk.Label(row, textvariable=icon_var,
+                                font=("Segoe UI", 11), bg=BG,
+                                fg=COL_PENDING, width=5, anchor="w")
+            icon_lbl.pack(side="left")
+            tk.Label(row, text=label_text,
+                     font=("Segoe UI", 10), bg=BG, fg=FG, anchor="w").pack(side="left")
+            row_widgets[key] = (icon_var, icon_lbl)
+
+        # Progressbar
+        pb_frame = tk.Frame(win, bg=BG)
+        pb_frame.pack(fill="x", padx=24, pady=(0, 4))
+        pb = ttk.Progressbar(pb_frame, mode="determinate", maximum=len(steps))
+        pb.pack(fill="x")
+
+        # Status-Zeile
+        status_var = tk.StringVar(value="Starte...")
+        tk.Label(win, textvariable=status_var,
+                 font=("Segoe UI", 9), fg=FG_DIM, bg=BG).pack(pady=(0, 10))
+
+        def tick(key, state, status_text=""):
+            def _do():
+                if key in row_widgets:
+                    icon_var, icon_lbl = row_widgets[key]
+                    if state == "run":
+                        icon_var.set(RUNNING); icon_lbl.config(fg=COL_RUN)
+                    elif state == "ok":
+                        icon_var.set(OK);      icon_lbl.config(fg=COL_OK);  pb.step(1)
+                    elif state == "fail":
+                        icon_var.set(FAIL);    icon_lbl.config(fg=COL_FAIL); pb.step(1)
+                if status_text:
+                    status_var.set(status_text)
+            try:
+                self.after(0, _do)
+            except Exception:
+                pass
+
+        def close():
+            try:
+                self.after(0, win.destroy)
+            except Exception:
+                pass
+
+        return {"tick": tick, "close": close, "status": status_var}
+
     def _build_buttons(self):
         """Builds the main action buttons."""
         bf = tk.Frame(self, bg=COLORS["bg"])
@@ -4634,7 +5184,7 @@ class ProducerApp(tk.Tk):
                          self._run_full_production, COLORS["gold"]).pack(side="left", padx=4)
         self._action_btn(bf, "\U0001f4c2  Open Storage",
                          self._open_storage, COLORS["accent"]).pack(side="left", padx=4)
-        # ── ComfyUI-Installations-Button (neu v1.1.0) ─────────────────────────
+        # ── ComfyUI-Installations-Button (neu v1.0.4) ─────────────────────────
         self._action_btn(bf, "\U0001f5a5\ufe0f  Install ComfyUI",
                          self._on_install_comfyui, COLORS["success"]).pack(side="left", padx=4)
         self._flat_btn(bf, "\U0001f50d  ComfyUI Nodes",
@@ -5396,10 +5946,31 @@ class ProducerApp(tk.Tk):
         threading.Thread(target=_run, daemon=True).start()
 
     def _stop_production(self):
-        """Signals the running orchestrator to stop."""
+        """Stoppt die laufende Produktion und startet ComfyUI neu."""
         if self._orchestrator:
             self._orchestrator.stop()
-            self._log("Stopping production...", "WARNING")
+            self._log("■ Produktion gestoppt.", "WARNING")
+
+        def _restart_comfyui():
+            import time
+            # Kurz warten bis laufende Jobs abbrechen
+            time.sleep(2)
+            self._log("[ComfyUI] Starte ComfyUI neu...", "INFO")
+            orch = self._make_orchestrator()
+            # ComfyUI beenden
+            orch._kill_comfyui_on_port(8188)
+            time.sleep(2)
+            # ComfyUI neu starten
+            ok = orch._start_comfyui_process()
+            if ok:
+                self.after(0, lambda: self._log(
+                    "[ComfyUI] ✅ ComfyUI neu gestartet.", "SUCCESS"))
+            else:
+                self.after(0, lambda: self._log(
+                    "[ComfyUI] ⚠️  ComfyUI-Neustart fehlgeschlagen — "
+                    "manuell starten via 'Install ComfyUI'.", "WARNING"))
+
+        threading.Thread(target=_restart_comfyui, daemon=True).start()
 
     def _on_diagnose_comfyui(self):
         """Fragt ComfyUI nach den exakten Node-Inputs und zeigt sie im Log."""
@@ -5443,64 +6014,65 @@ class ProducerApp(tk.Tk):
         threading.Thread(target=_query, daemon=True).start()
 
     def _on_install_comfyui(self):
-        """GUI-Handler fuer den '🖥️ Install ComfyUI'-Button.
-
-        Prueft ob bereits installiert, fragt Benutzer, startet Installation
-        in einem Daemon-Thread damit das GUI responsiv bleibt.
-        """
-        storage = os.path.normpath(self._storage_var.get().strip())
+        """GUI-Handler fuer den '🖥️ Install ComfyUI'-Button."""
+        storage      = os.path.normpath(self._storage_var.get().strip())
         project_root = os.path.dirname(storage)
         comfyui_dir  = os.path.join(project_root, "ComfyUI-Portable")
         main_py      = os.path.join(comfyui_dir, "main.py")
 
         if os.path.isfile(main_py):
-            msg = (
-                f"ComfyUI ist bereits installiert:\n{comfyui_dir}\n\n"
-                "Trotzdem erneut pruefen / Custom Nodes nachinstallieren?"
-            )
-            if not messagebox.askyesno("ComfyUI bereits vorhanden", msg):
-                self._log("[ComfyUI] Installation abgebrochen — bereits vorhanden.", "INFO")
+            if not messagebox.askyesno("ComfyUI bereits vorhanden",
+                    f"ComfyUI ist bereits installiert:\n{comfyui_dir}\n\n"
+                    "Trotzdem erneut pruefen / Custom Nodes nachinstallieren?"):
                 return
 
-        confirm = messagebox.askyesno(
-            "ComfyUI installieren",
-            "Folgendes wird installiert:\n\n"
-            "  • ComfyUI Portable (GitHub master)\n"
-            "  • venv + torch (CUDA 12.1)\n"
-            "  • WAN 2.1 1.3B Modell (~2-5 GB)\n"
-            "  • ComfyUI-Manager\n"
-            "  • ComfyUI-AudioTools\n\n"
-            f"Ziel: {comfyui_dir}\n\n"
-            "Installation starten? (dauert einige Minuten)"
-        )
-        if not confirm:
-            self._log("[ComfyUI] Installation abgebrochen.", "INFO")
+        if not messagebox.askyesno("ComfyUI installieren",
+                "Folgendes wird installiert:\n\n"
+                "  • ComfyUI Portable\n"
+                "  • venv + torch cu128\n"
+                "  • WAN 2.1 1.3B · VAE · T5 · SD 1.5\n"
+                "  • ChatterBox TTS · ACE-Step Musik\n"
+                "  • Custom Nodes (6x)\n\n"
+                f"Ziel: {comfyui_dir}\n\n"
+                "Installation starten?"):
             return
 
-        self._log("[ComfyUI] Starte Installation im Hintergrund...", "INFO")
-        self._log(f"[ComfyUI] Ziel: {comfyui_dir}", "INFO")
+        # Installer-Schritte für das Popup
+        steps = [
+            ("venv",        "venv + torch (CUDA)"),
+            ("deps",        "requirements.txt"),
+            ("tqdm",        "tqdm Fix (Windows-Pipe)"),
+            ("models",      "WAN 2.1 · VAE · T5 · SD 1.5"),
+            ("chatterbox",  "ChatterBox TTS Modell"),
+            ("ace",         "ACE-Step Musik Modell"),
+            ("nodes",       "Custom Nodes (6x)"),
+            ("nodedeps",    "Node Dependencies"),
+            ("chatterboxpkg","chatterbox-tts Paket"),
+            ("start",       "ComfyUI starten"),
+        ]
+
+        popup = self._open_installer_popup(steps)
+        tick  = popup["tick"]
 
         def _run_install():
             ok = ProductionOrchestrator._install_comfyui(
                 storage_root = storage,
                 log_cb       = self._log,
+                tick_cb      = tick,
             )
+            popup["close"]()
             if ok:
                 self.after(0, lambda: messagebox.showinfo(
                     "ComfyUI installiert ✅",
-                    f"ComfyUI erfolgreich installiert!\n\n"
-                    f"Pfad: {comfyui_dir}\n\n"
-                    f"Start: start_comfyui.bat doppelklicken\n"
-                    f"Dann Worker 'comfyui_local' einer Szene zuweisen."
+                    f"ComfyUI erfolgreich installiert!\n\nPfad: {comfyui_dir}"
                 ))
             else:
                 self.after(0, lambda: messagebox.showerror(
                     "Installation fehlgeschlagen",
-                    "ComfyUI-Installation nicht vollständig abgeschlossen.\n"
                     "Siehe Log fuer Details.\n\n"
                     "Haeufige Ursachen:\n"
                     "  • Keine Internetverbindung\n"
-                    "  • git nicht installiert (fuer Custom Nodes)\n"
+                    "  • git nicht installiert\n"
                     "  • Zu wenig Speicherplatz"
                 ))
 
