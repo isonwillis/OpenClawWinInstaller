@@ -43,8 +43,8 @@ from tkinter import ttk, scrolledtext, messagebox, filedialog
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-APP_TITLE   = "Ison-Codex Film Producer  --  v1.1.0"
-APP_VERSION = "1.1.0"
+APP_TITLE   = "Ison-Codex Film Producer  --  v1.0.4"
+APP_VERSION = "1.0.4"
 
 def _resolve_default_storage() -> str:
     """Returns the default storage root: <ProjectDir>/LyraFilmProduction.
@@ -1447,15 +1447,27 @@ class ProductionOrchestrator:
             # Modell liegt in models/diffusion_models/, T5 in models/text_encoders/
             self.log("[ComfyUI] Kein Template gefunden — nutze eingebettetes WAN-2.1-Minimal-Workflow.", "INFO")
             fps = 16
-            # WAN 2.1 1.3B: max 81 Frames @ 480p empfohlen (Speicher-Limit RTX 3050 6GB)
-            # Formel: Frames muss (4k+1) sein fuer WAN — naechste gueltige Zahl nehmen
+            # WAN 2.1 1.3B Hardware-Limit auf RTX 3050 (6GB VRAM):
+            # Max 81 Frames @ 480p = 81/16 = ~5.1 Sekunden pro Render
+            # Fuer laengere Szenen (z.B. 18s) werden mehrere Clips gerendert
+            # und spaeter in CapCut zusammengeschnitten.
+            # WAN 2.1 5B wuerde laengere Sequenzen erlauben, braucht aber >8GB VRAM.
+            MAX_WAN_FRAMES = 81   # Hardware-Grenze RTX 3050 6GB @ 480p
             raw_frames = duration_sec * fps
+            wan_frames = max(17, min(MAX_WAN_FRAMES, int(raw_frames)))
             # WAN erwartet Frames in Form 4k+1: 17, 21, 25, ..., 81
-            wan_frames = max(17, min(81, int(raw_frames)))
-            # Auf naechste (4k+1)-Zahl runden
             wan_frames = ((wan_frames - 1) // 4) * 4 + 1
             num_frames = wan_frames
-            self.log(f"[ComfyUI] Frames: {num_frames} @ {fps}fps = {num_frames/fps:.1f}s", "INFO")
+            actual_secs = num_frames / fps
+            if actual_secs < duration_sec - 1:
+                self.log(
+                    f"[ComfyUI] ⚠️  Szene {duration_sec}s → WAN 1.3B-Limit: {actual_secs:.1f}s "
+                    f"({num_frames} Frames @ {fps}fps). "
+                    f"Fuer volle {duration_sec}s: {int(duration_sec/actual_secs)+1} Clips noetig.",
+                    "WARNING"
+                )
+            else:
+                self.log(f"[ComfyUI] Frames: {num_frames} @ {fps}fps = {actual_secs:.1f}s", "INFO")
 
             # Bestimme Dateiname: bf16 bevorzugt, fp16 als Fallback
             project_root   = os.path.dirname(os.path.normpath(self.storage_root))
@@ -1787,12 +1799,16 @@ class ProductionOrchestrator:
                 creation_flags = subprocess.CREATE_NO_WINDOW
 
             # PYTHONIOENCODING=utf-8 gibt original_stderr ein gueltiges Encoding.
-            # Ohne dies schlaegt tqdm/ComfyUI-Manager mit OSError [Errno 22] fehl
-            # wenn es versucht den Fortschrittsbalken auf den Pipe-stderr zu schreiben.
+            # Ohne dies schlaegt tqdm/ComfyUI-Manager mit OSError [Errno 22] fehl.
+            # ComfyUI-Manager patcht stderr (prestartup_script.py:336) — tqdm
+            # versucht dann flush() auf dem gepatchten Stream → OSError auf Windows-Pipes.
             comfyui_env = os.environ.copy()
             comfyui_env["PYTHONIOENCODING"]          = "utf-8"
             comfyui_env["PYTHONLEGACYWINDOWSSTDIO"]  = "0"
             comfyui_env["PYTHONUNBUFFERED"]          = "1"
+            comfyui_env["NO_COLOR"]                  = "1"   # tqdm: kein ANSI → kein flush-Problem
+            comfyui_env["TERM"]                      = "dumb" # tqdm: kein interaktives Terminal
+            comfyui_env["FORCE_COLOR"]               = "0"
 
             proc = subprocess.Popen(
                 cmd,
@@ -1833,7 +1849,15 @@ class ProductionOrchestrator:
                         "ignoring invalid distribution",
                         "logging failed: [winerror 32]",      # log-Datei gesperrt
                         "default cache updated:",              # ComfyUI-Manager Cache-Updates
+                        "addedtoken(",                        # Tokenizer-Dump (256299 Zeilen)
+                        "extra_id_",                          # T5-Tokenizer special tokens
+                        "rstrip=false, lstrip=false",         # Tokenizer-Metadaten
+                        "single_word=false, normalized=false", # Tokenizer-Metadaten
                     )
+                    # Sehr lange Zeilen (>500 Zeichen) die keinen Fehler enthalten unterdrücken
+                    if len(lo) > 500 and not any(w in lo for w in ("error", "exception", "traceback")):
+                        level = "INFO"
+                        lo = lo[:200] + f"... [+{len(lo)-200} Zeichen gekürzt]"
                     if any(p in lo for p in _noise_patterns):
                         level = "INFO"  # als INFO statt WARNING/ERROR
                     elif any(w in lo for w in ("error", "exception", "traceback",
@@ -2026,29 +2050,50 @@ class ProductionOrchestrator:
             return None
 
         # ── Schritt A: TTS-Narration ──────────────────────────────────────────
-        self.log(f"{tag} A) TTS-Narration...", "INFO")
+        self.log(f"{tag} A) TTS-Narration (ChatterBox)...", "INFO")
         narration_path = None
 
-        # Kurzen Narrations-Text aus Prompt extrahieren (erste 200 Zeichen)
         narration_text = prompt[:300].strip()
         if len(prompt) > 300:
             narration_text += "..."
 
         tts_prefix = f"tts_{sid}"
+        # TTS-Audio-Suite Architektur: Engine-Node → UnifiedTTSTextNode → SaveAudio
+        # UnifiedTTSTextNode akzeptiert TTS_ENGINE-Objekt (nicht String "engine_type").
+        # Korrekte Nodes aus nodes.py:
+        #   "ChatterBoxEngineNode"       → TTS_ENGINE Typ
+        #   "UnifiedTTSTextNode"         → braucht TTS_ENGINE als Input "TTS_engine"
         tts_workflow = {
             "1": {
-                "class_type": "TTSNode",    # TTS-Audio-Suite unified node
+                "class_type": "ChatterBoxEngineNode",
                 "inputs": {
-                    "engine_type":      "ChatterBox",
-                    "text_input":       narration_text,
-                    "filename_prefix":  tts_prefix,
-                    "seed":             42,
-                    "temperature":      0.7,
+                    "language":                  "English",
+                    "device":                    "auto",
+                    "exaggeration":              0.5,
+                    "temperature":               0.7,
+                    "cfg_weight":                0.5,
+                    "crash_protection_template": "none",
+                }
+            },
+            "2": {
+                "class_type": "UnifiedTTSTextNode",
+                "inputs": {
+                    "TTS_engine":    ["1", 0],
+                    "text":          narration_text,
+                    "narrator_voice": "none",
+                    "seed":          42,
+                }
+            },
+            "3": {
+                "class_type": "SaveAudio",
+                "inputs": {
+                    "audio":           ["2", 0],
+                    "filename_prefix": tts_prefix,
                 }
             }
         }
 
-        tts_outputs = _submit_and_wait(tts_workflow, "TTS", max_wait=120)
+        tts_outputs = _submit_and_wait(tts_workflow, "TTS", max_wait=3600)   # max 1h
         if tts_outputs:
             narration_path = _find_audio_file(tts_outputs, "TTS")
             if narration_path:
@@ -2057,37 +2102,94 @@ class ProductionOrchestrator:
                 _sha.copy2(narration_path, local_narr)
                 narration_path = local_narr
                 self.log(f"{tag}   Narration: {local_narr}", "SUCCESS")
+            else:
+                self.log(f"{tag}   TTS Audio-Datei nicht gefunden.", "WARNING")
         else:
-            self.log(f"{tag}   TTS uebersprungen (Node nicht verfuegbar).", "INFO")
+            self.log(f"{tag}   TTS fehlgeschlagen — Video ohne Narration.", "WARNING")
 
         # ── Schritt B: Cinematic Musik (ACE-Step) ─────────────────────────────
         self.log(f"{tag} B) Cinematic Musik (ACE-Step)...", "INFO")
         music_path = None
 
-        # Musik-Prompt aus Visual DNA ableiten
         music_prompt = (
             "cinematic noir orchestral score, dark ambient, "
             "volumetric low strings, haunting piano, tension building, "
-            "no vocals, film score, Hans Zimmer style, "
-            "blue amber color palette in sound"
+            "no vocals, film score, Hans Zimmer style"
         )
         music_prefix = f"music_{sid}"
-        music_workflow = {
-            "1": {
-                "class_type": "ACEStepSampler",
-                "inputs": {
-                    "tags":            music_prompt,
-                    "lyrics":          "",          # instrumental
-                    "seconds":         min(duration_sec + 2, 30),  # etwas laenger als Video
-                    "filename_prefix": music_prefix,
-                    "seed":            int(sid.replace("S", "").replace("K", "").replace("P", "").replace("E", "").replace(".", "") or "1"),
-                    "steps":           20,
-                    "cfg":             7.0,
+
+        import re as _re
+        sid_digits = _re.sub(r"[^0-9]", "", sid) or "1"
+        music_seed  = int(sid_digits[:6])
+        music_dur   = min(duration_sec + 2, 30)
+
+        # ComfyUI_ACE-Step (billwuhao): Node-Namen aus ace_step_nodes.py
+        # ACEModelLoader → ACEStepGen → SaveAudio
+        # ACE-Step: ACEModelLoader braucht 4 separate Checkpoint-Inputs.
+        # Die Modell-Dateien werden beim ersten Render automatisch heruntergeladen.
+        # Ordnerstruktur: models/TTS/ACE-Step-v1-3.5B/{ace_step_transformer, music_dcae_f8c8, ...}
+        project_root_ace = os.path.dirname(os.path.normpath(self.storage_root))
+        comfyui_dir_ace  = os.path.join(project_root_ace, "ComfyUI-Portable")
+        ace_model_base   = os.path.join(comfyui_dir_ace, "models", "TTS", "ACE-Step-v1-3.5B")
+
+        # Pruefen welche Unter-Ordner vorhanden sind
+        def _ace_subfolder(sub: str) -> str:
+            """Gibt Unterordner-Namen zurueck wenn vorhanden, sonst leer."""
+            path = os.path.join(ace_model_base, sub)
+            return sub if os.path.isdir(path) else ""
+
+        ace_dcae     = _ace_subfolder("music_dcae_f8c8")
+        ace_vocoder  = _ace_subfolder("music_vocoder")
+        ace_step     = _ace_subfolder("ace_step_transformer")
+        ace_t5       = _ace_subfolder("umt5-base")
+
+        if not all([ace_dcae, ace_vocoder, ace_step, ace_t5]):
+            self.log(
+                f"{tag}   ACE-Step Modell-Ordner unvollstaendig — "
+                f"Musik wird uebersprungen. Ordner: {ace_model_base}",
+                "WARNING"
+            )
+            music_outputs = None
+        else:
+            music_workflow = {
+                "1": {
+                    "class_type": "ACEModelLoader",
+                    "inputs": {
+                        "dcae_checkpoint":         ace_dcae,
+                        "vocoder_checkpoint":      ace_vocoder,
+                        "ace_step_checkpoint":     ace_step,
+                        "text_encoder_checkpoint": ace_t5,
+                        "cpu_offload":   True,
+                        "torch_compile": False,
+                    }
+                },
+                "2": {
+                    "class_type": "ACEStepGen",
+                    "inputs": {
+                        "models":         ["1", 0],
+                        "prompt":         music_prompt,
+                        "lyrics":         "[inst]",
+                        # delicious_song: verwendet Node-eigene Default-Parameter.
+                        # parameters direkt übergeben ist fehleranfällig wegen API-Versionsunterschieden.
+                        # Der Node liest duration etc. aus dem JSON selbst.
+                        "delicious_song": "default_1.json",
+                        # Nur den Prompt und Seed überschreiben via parameters:
+                        "parameters": (
+                            f'{{"seed": {music_seed}, '
+                            '"use_erg_tag": True, "use_erg_lyric": False, '
+                            '"use_erg_diffusion": True}'
+                        ),
+                    }
+                },
+                "3": {
+                    "class_type": "SaveAudio",
+                    "inputs": {
+                        "audio":           ["2", 0],
+                        "filename_prefix": music_prefix,
+                    }
                 }
             }
-        }
-
-        music_outputs = _submit_and_wait(music_workflow, "ACE-Step Musik", max_wait=180)
+            music_outputs = _submit_and_wait(music_workflow, "ACE-Step Musik", max_wait=14400)  # max 4h
         if music_outputs:
             music_path = _find_audio_file(music_outputs, "Musik")
             if music_path:
@@ -2096,8 +2198,10 @@ class ProductionOrchestrator:
                 _shm.copy2(music_path, local_music)
                 music_path = local_music
                 self.log(f"{tag}   Musik: {local_music}", "SUCCESS")
+            else:
+                self.log(f"{tag}   Musik Audio-Datei nicht gefunden.", "WARNING")
         else:
-            self.log(f"{tag}   Musik uebersprungen (ACE-Step nicht verfuegbar).", "INFO")
+            self.log(f"{tag}   Musik fehlgeschlagen — Video ohne Musik.", "WARNING")
 
         # ── Schritt C: FFmpeg-Merge ───────────────────────────────────────────
         if not narration_path and not music_path:
@@ -2352,10 +2456,102 @@ class ProductionOrchestrator:
                     import shutil as _shc
                     _shc.copy2(src_path, clip_path)
                     self.log(f"{TAG} ✅ Video kopiert: {clip_path}", "SUCCESS")
+
+                    # ── Multi-Clip: weitere Clips rendern falls Szene > 5.1s ────
+                    MAX_CLIP_SEC = 5.1
+                    num_clips_needed = max(1, int(duration_sec / MAX_CLIP_SEC + 0.5))
+
+                    if num_clips_needed > 1 and os.path.isfile(clip_path):
+                        self.log(f"{TAG} 📽️  {num_clips_needed} Clips noetig fuer {duration_sec}s — rendere weiter...", "INFO")
+                        all_clips = [clip_path]
+
+                        def _render_extra_clip(clip_idx: int) -> str | None:
+                            """Rendert einen weiteren Clip und gibt den Pfad zurueck."""
+                            sid_n  = f"{sid}_c{clip_idx}"
+                            wf_n   = self._build_comfyui_workflow(prompt, duration_sec, out_dir, sid_n)
+                            # Seed variieren damit Clips visuell variieren
+                            if "7" in wf_n and "inputs" in wf_n.get("7", {}):
+                                wf_n["7"]["inputs"]["seed"] = 42 + clip_idx * 1337
+
+                            # POST /prompt
+                            try:
+                                req_n = urllib.request.Request(
+                                    f"{COMFYUI_URL}/prompt",
+                                    data    = json.dumps({"prompt": wf_n}).encode("utf-8"),
+                                    headers = {"Content-Type": "application/json"},
+                                    method  = "POST",
+                                )
+                                with urllib.request.urlopen(req_n, timeout=30) as r:
+                                    pid_n = json.loads(r.read()).get("prompt_id")
+                            except Exception as pe:
+                                self.log(f"{TAG} Clip {clip_idx} POST fehlgeschlagen: {pe}", "WARNING")
+                                return None
+
+                            if not pid_n:
+                                return None
+                            self.log(f"{TAG} Clip {clip_idx} Job gestartet — {pid_n[:8]}...", "INFO")
+
+                            # Poll /history
+                            deadline_n = time.time() + 1200
+                            while time.time() < deadline_n:
+                                time.sleep(8)
+                                try:
+                                    with urllib.request.urlopen(f"{COMFYUI_URL}/history/{pid_n}", timeout=15) as r:
+                                        hist_n = json.loads(r.read())
+                                    if pid_n in hist_n:
+                                        msgs_n = hist_n[pid_n].get("status", {}).get("messages", [])
+                                        if any(m[0] == "execution_success" for m in msgs_n):
+                                            # Output finden
+                                            outs_n = hist_n[pid_n].get("outputs", {})
+                                            for nid, nout in outs_n.items():
+                                                for key in ("gifs", "videos", "images"):
+                                                    items = nout.get(key, [])
+                                                    if items:
+                                                        fn = items[0].get("filename", "")
+                                                        sp = os.path.join(comfyui_out, fn)
+                                                        if os.path.isfile(sp):
+                                                            dst_n = os.path.join(out_dir, f"clip_{clip_idx:03d}.mp4")
+                                                            _shc.copy2(sp, dst_n)
+                                                            self.log(f"{TAG} ✅ Clip {clip_idx} fertig", "SUCCESS")
+                                                            return dst_n
+                                        if any(m[0] == "execution_error" for m in msgs_n):
+                                            self.log(f"{TAG} ⚠️  Clip {clip_idx} Fehler.", "WARNING")
+                                            return None
+                                except Exception:
+                                    pass
+                            return None
+
+                        for clip_idx in range(2, num_clips_needed + 1):
+                            result_n = _render_extra_clip(clip_idx)
+                            if result_n:
+                                all_clips.append(result_n)
+                            else:
+                                self.log(f"{TAG} ⚠️  Clip {clip_idx} fehlgeschlagen — stoppe bei {len(all_clips)} Clip(s).", "WARNING")
+                                break
+
+                        # FFmpeg concat wenn mehr als 1 Clip
+                        if len(all_clips) > 1:
+                            self.log(f"{TAG} 🔗 Fuege {len(all_clips)} Clips zusammen ({len(all_clips)*5:.0f}s)...", "INFO")
+                            concat_list = os.path.join(out_dir, "_concat_list.txt")
+                            with open(concat_list, "w", encoding="utf-8") as f:
+                                for c in all_clips:
+                                    f.write(f"file '{c}'\n")
+                            concat_out = os.path.join(out_dir, "_clip_concat.mp4")
+                            ffmpeg_cc  = self._find_ffmpeg()
+                            if ffmpeg_cc:
+                                try:
+                                    subprocess.run(
+                                        [ffmpeg_cc, "-y", "-f", "concat", "-safe", "0",
+                                         "-i", concat_list, "-c", "copy", concat_out],
+                                        check=True, capture_output=True, timeout=120
+                                    )
+                                    if os.path.isfile(concat_out):
+                                        _shc.copy2(concat_out, clip_path)
+                                        self.log(f"{TAG} ✅ {len(all_clips)} Clips → {clip_path} ({len(all_clips)*5:.0f}s)", "SUCCESS")
+                                except Exception as fe:
+                                    self.log(f"{TAG} FFmpeg concat fehlgeschlagen: {fe}", "WARNING")
+
                     # ── Cinematic Audio Pipeline ──────────────────────────────
-                    # Schritt A: TTS-Narration generieren
-                    # Schritt B: Cinematic Musik generieren (ACE-Step)
-                    # Schritt C: Video + Narration + Musik → finales MP4 (FFmpeg)
                     final_path = self._run_cinematic_audio_pipeline(
                         sid=sid,
                         video_path=clip_path,
@@ -2922,6 +3118,39 @@ class ProductionOrchestrator:
             else:
                 log("[ComfyUI-Install] requirements.txt fehlgeschlagen (nicht kritisch).", "WARNING")
 
+        # ── tqdm auf bekannt-gute Version fixieren ────────────────────────────
+        # tqdm >= 4.67 hat einen Bug auf Windows-Pipes wenn ComfyUI-Manager
+        # stderr patcht → OSError [Errno 22] beim flush() → KSampler bricht ab.
+        # Lösung: tqdm==4.66.4 (letzte stabile Version ohne diesen Bug).
+        log("[ComfyUI-Install] Fixiere tqdm (Windows-Pipe Bug)...", "INFO")
+        tqdm_ok = _pip(["install", "tqdm==4.66.4", "--force-reinstall", "--no-cache-dir"], timeout=60)
+        if tqdm_ok:
+            log("  tqdm==4.66.4 installiert ✓", "SUCCESS")
+        else:
+            log("  tqdm-Fix fehlgeschlagen — KSampler kann weiter abstürzen", "WARNING")
+
+        # ── torch CUDA nach requirements.txt sichern ──────────────────────────
+        # requirements.txt kann torch überschreiben. Immer danach prüfen und
+        # ggf. aus WHL-Cache wiederherstellen.
+        chk_torch_req = subprocess.run(
+            [python_exe, "-c",
+             "import torch; print(torch.cuda.is_available(), torch.__version__)"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+        out_tr = chk_torch_req.stdout.decode(errors="replace").strip()
+        if out_tr.startswith("True") and f"+{cu_tag}" in out_tr:
+            log(f"  torch CUDA nach requirements.txt: {out_tr} ✓", "INFO")
+        else:
+            log(f"  torch CUDA verloren nach requirements.txt ({out_tr}) — stelle wieder her...", "WARNING")
+            torch_cache_req = os.path.join(setup_cache, f"torch_{cu_tag}")
+            cached_req = [f for f in os.listdir(torch_cache_req) if f.endswith(".whl")] \
+                         if os.path.isdir(torch_cache_req) else []
+            if len(cached_req) >= 3:
+                _pip(["install", "torch", "torchvision", "torchaudio",
+                      "--find-links", torch_cache_req, "--no-index"], timeout=300)
+            log("  torch CUDA wiederhergestellt ✓", "SUCCESS")
+
 
         log("[ComfyUI-Install] Schritt 4/6: Lade WAN 2.1 1.3B Modell...", "INFO")
         # WAN 2.1 gehoert in diffusion_models/ (NICHT checkpoints/) — ComfyUI native
@@ -3058,6 +3287,116 @@ class ProductionOrchestrator:
             label    = "T5 Text Encoder (fp8, ~4.9 GB — Geduld...)",
         )
 
+        # ── 5b-2. Stable Diffusion 1.5 Checkpoint ─────────────────────────────
+        log("[ComfyUI-Install] Lade SD 1.5 Checkpoint...", "INFO")
+        ckpt_dir  = os.path.join(comfyui_dir, "models", "checkpoints")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        _ensure_model(
+            filename = "v1-5-pruned-emaonly-fp16.safetensors",
+            dest_dir = ckpt_dir,
+            url      = ("https://huggingface.co/runwayml/stable-diffusion-v1-5"
+                        "/resolve/main/v1-5-pruned-emaonly.safetensors"),
+            min_size = 1_000_000_000,
+            label    = "SD 1.5 fp16 (~2 GB — Geduld...)",
+        )
+        log("[ComfyUI-Install] Lade ChatterBox TTS Modell...", "INFO")
+        chatterbox_dir        = os.path.join(comfyui_dir, "models", "TTS", "chatterbox")
+        chatterbox_cache_dir  = os.path.join(setup_cache, "chatterbox")
+        os.makedirs(chatterbox_dir, exist_ok=True)
+        os.makedirs(chatterbox_cache_dir, exist_ok=True)
+
+        # TTS-Audio-Suite laedt ChatterBox-Modelle in chatterbox/English/ Unterordner
+        # Wir cachen und pruefen beide Ebenen (Root + English/)
+        _CB_REQUIRED_ROOT = ["s3gen.pt", "t3_cfg.pt", "tokenizer.model"]
+        _CB_REQUIRED_EN   = ["s3gen.pt", "t3_cfg.pt", "tokenizer.json",
+                             "ve.pt", "conds.pt"]
+
+        def _chatterbox_complete(d: str) -> bool:
+            # Root-Ebene (alte HF-Struktur)
+            if all(os.path.isfile(os.path.join(d, f)) for f in _CB_REQUIRED_ROOT):
+                return True
+            # English/-Unterordner (TTS-Audio-Suite Struktur)
+            en = os.path.join(d, "English")
+            if os.path.isdir(en):
+                if all(os.path.isfile(os.path.join(en, f)) for f in _CB_REQUIRED_EN):
+                    return True
+            return False
+
+        if _chatterbox_complete(chatterbox_dir):
+            log("  ChatterBox: Modell bereits vorhanden ✓", "INFO")
+            # English/-Unterordner in Cache sichern falls noch nicht vorhanden
+            en_src = os.path.join(chatterbox_dir, "English")
+            en_dst = os.path.join(chatterbox_cache_dir, "English")
+            if os.path.isdir(en_src) and not _chatterbox_complete(chatterbox_cache_dir):
+                try:
+                    import shutil as _shcb0
+                    _shcb0.copytree(en_src, en_dst, dirs_exist_ok=True)
+                    log("  ChatterBox English/-Ordner → Cache gesichert ✓", "INFO")
+                except Exception:
+                    pass
+        elif _chatterbox_complete(chatterbox_cache_dir):
+            log("  ChatterBox: Kopiere aus Cache...", "SUCCESS")
+            import shutil as _shcb
+            for f in os.listdir(chatterbox_cache_dir):
+                if f.startswith("."):
+                    continue  # .cache und andere versteckte Ordner ueberspringen
+                src = os.path.join(chatterbox_cache_dir, f)
+                dst = os.path.join(chatterbox_dir, f)
+                try:
+                    if os.path.isdir(src):
+                        _shcb.copytree(src, dst, dirs_exist_ok=True)
+                    else:
+                        _shcb.copy2(src, dst)
+                except Exception:
+                    pass
+            log("  ChatterBox: Modell kopiert ✓", "SUCCESS")
+        else:
+            log("  ChatterBox: Lade von HuggingFace (~1 GB) → Cache: setupfiles/chatterbox/", "INFO")
+            try:
+                dl_cb = subprocess.run(
+                    [python_exe, "-c",
+                     "from huggingface_hub import snapshot_download; "
+                     "snapshot_download("
+                     "  repo_id='ResembleAI/chatterbox',"
+                     f"  local_dir=r'{chatterbox_cache_dir}',"
+                     "  repo_type='model',"
+                     "  ignore_patterns=['*.md','*.gitattributes']"
+                     "); print('DONE')"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    timeout=1800,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                )
+                if "DONE" in dl_cb.stdout.decode(errors="replace") or _chatterbox_complete(chatterbox_cache_dir):
+                    log("  ChatterBox: Heruntergeladen ✓ — kopiere in Zielordner...", "SUCCESS")
+                    import shutil as _shcb2
+                    for f in os.listdir(chatterbox_cache_dir):
+                        if f.startswith("."):
+                            continue  # .cache ueberspringen
+                        src = os.path.join(chatterbox_cache_dir, f)
+                        dst = os.path.join(chatterbox_dir, f)
+                        try:
+                            if os.path.isdir(src):
+                                _shcb2.copytree(src, dst, dirs_exist_ok=True)
+                            else:
+                                _shcb2.copy2(src, dst)
+                        except Exception:
+                            pass
+                    log("  ChatterBox: Modell installiert ✓", "SUCCESS")
+                    # English/-Unterordner aus Zielordner in Cache sichern
+                    # (TTS-Audio-Suite laedt English/ direkt in models/TTS/chatterbox/English/)
+                    en_src = os.path.join(chatterbox_dir, "English")
+                    en_dst = os.path.join(chatterbox_cache_dir, "English")
+                    if os.path.isdir(en_src):
+                        try:
+                            import shutil as _shcb3
+                            _shcb3.copytree(en_src, en_dst, dirs_exist_ok=True)
+                            log("  ChatterBox English/-Ordner gecacht ✓", "INFO")
+                        except Exception:
+                            pass
+                    log(f"  ChatterBox: Download fehlgeschlagen — {dl_cb.stderr.decode(errors='replace')[-200:]}", "WARNING")
+            except Exception as e:
+                log(f"  ChatterBox: Fehler: {e}", "WARNING")
+
         # ── 6. Custom Nodes klonen ────────────────────────────────────────────
         custom_nodes_dir = os.path.join(comfyui_dir, "custom_nodes")
         os.makedirs(custom_nodes_dir, exist_ok=True)
@@ -3084,7 +3423,22 @@ class ProductionOrchestrator:
         for node_name, node_url in custom_nodes:
             node_dir = os.path.join(custom_nodes_dir, node_name)
             if os.path.isdir(node_dir):
-                log(f"[ComfyUI-Install] {node_name} bereits vorhanden — ueberspringe.", "INFO")
+                # Vorhanden — git pull um auf neueste Version zu aktualisieren
+                try:
+                    r = subprocess.run(
+                        ["git", "pull", "--ff-only"],
+                        cwd=node_dir, capture_output=True, timeout=60
+                    )
+                    if r.returncode == 0:
+                        out = r.stdout.decode(errors="replace").strip()
+                        if "Already up to date" in out:
+                            log(f"[ComfyUI-Install] {node_name}: bereits aktuell ✓", "INFO")
+                        else:
+                            log(f"[ComfyUI-Install] {node_name}: aktualisiert ✓", "SUCCESS")
+                    else:
+                        log(f"[ComfyUI-Install] {node_name}: git pull fehlgeschlagen (nicht kritisch)", "WARNING")
+                except Exception:
+                    log(f"[ComfyUI-Install] {node_name}: bereits vorhanden (kein Update).", "INFO")
                 continue
             log(f"  Klone {node_name}...", "INFO")
             try:
@@ -3145,19 +3499,248 @@ class ProductionOrchestrator:
         tts_req = os.path.join(custom_nodes_dir, "TTS-Audio-Suite", "requirements.txt")
         if os.path.isfile(tts_req):
             log("  TTS-Audio-Suite: installiere requirements.txt...", "INFO")
-            _pip(["install", "-r", tts_req, "--no-cache-dir"], timeout=300)
-        elif os.path.isdir(os.path.join(custom_nodes_dir, "TTS-Audio-Suite")):
-            log("  TTS-Audio-Suite: installiere Kern-Dependencies...", "INFO")
-            _pip(["install", "f5-tts", "transformers", "pydub", "--no-cache-dir"], timeout=300)
+            _pip(["install", "-r", tts_req, "--no-cache-dir"], timeout=600)
+        if os.path.isdir(os.path.join(custom_nodes_dir, "TTS-Audio-Suite")):
+            # Fehlende Engine-Dependencies einzeln installieren —
+            # ein fehlgeschlagenes Paket soll die anderen nicht blockieren
+            log("  TTS-Audio-Suite: installiere fehlende Engine-Deps (einzeln)...", "INFO")
+            _tts_deps = [
+                ("s3tokenizer",             "ChatterBox",           "s3tokenizer"),
+                # chatterbox-tts wird SEPARAT nach der Schleife installiert
+                # (immer --no-deps, torch-Schutz danach)
+                # chatterbox-tts wird SEPARAT nach der Schleife installiert
+                # ("chatterbox-tts", "ChatterBox", "chatterbox"),  ← NICHT hier!
+                ("cached-path",             "F5-TTS",               "cached_path"),
+                ("descript-audio-codec",    "Higgs Audio 2",        "dac"),
+                ("vector-quantize-pytorch", "Higgs Audio 2",        "vector_quantize_pytorch"),
+                ("dacite",                  "Higgs Audio 2",        "dacite"),
+                ("torchcrepe",              "RVC",                  "torchcrepe"),
+                ("faiss-cpu",               "RVC",                  "faiss"),
+                ("onnxruntime-gpu",         "RVC",                  "onnxruntime"),
+                ("diffusers",               "ACE-Step/ChatterBox",  "diffusers"),
+                ("loguru",                  "ACE-Step",             "loguru"),
+                ("einops",                  "ACE-Step",             "einops"),
+                ("omegaconf",               "ACE-Step",             "omegaconf"),
+                ("huggingface-hub",         "ACE-Step",             "huggingface_hub"),
+                ("py3langid",               "ACE-Step",             "py3langid"),
+                ("langid",                  "ACE-Step/AudioTools",  "langid"),
+                ("pylangacq",               "ACE-Step",             "langacq"),
+                ("pydub",                   "Audio",                "pydub"),
+                ("sox",                     "Audio",                "sox"),
+                ("audioread",               "Audio",                "audioread"),
+            ]
+            for pkg, engine, import_name in _tts_deps:
+                check = subprocess.run(
+                    [python_exe, "-c", f"import {import_name}"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                )
+                if check.returncode == 0:
+                    log(f"    {pkg}: bereits installiert ✓", "INFO")
+                    continue
+                ok = _pip(["install", pkg, "--no-cache-dir"], timeout=180)
+                # Versionskonflikte/Build-Fehler umgehen
+                if not ok and pkg in ("descript-audio-codec", "omegaconf"):
+                    ok = _pip(["install", pkg, "--no-cache-dir", "--no-deps"], timeout=60)
+                if not ok and pkg == "chatterbox-tts":
+                    ok = _pip(["install", pkg, "--no-cache-dir", "--no-deps"], timeout=120)
+                    if ok:
+                        # Sicherheitscheck: torch CUDA nach chatterbox-tts Installation
+                        chk_torch = subprocess.run(
+                            [python_exe, "-c",
+                             "import torch; assert torch.cuda.is_available(), 'CUDA verloren';"
+                             "print('torch CUDA OK:', torch.__version__)"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+                            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                        )
+                        if chk_torch.returncode != 0:
+                            log("  ⚠️  torch CUDA nach chatterbox-tts verloren — stelle wieder her...", "WARNING")
+                            # torch CUDA aus Cache wiederherstellen
+                            torch_cache = os.path.join(setup_cache, f"torch_{cu_tag}")
+                            if os.path.isdir(torch_cache):
+                                _pip(["install", "torch", "torchvision", "torchaudio",
+                                      "--find-links", torch_cache, "--no-index"], timeout=300)
+                                log("  torch CUDA wiederhergestellt ✓", "SUCCESS")
+                        else:
+                            log(f"  torch CUDA nach chatterbox-tts: {chk_torch.stdout.decode().strip()}", "INFO")
+                if ok:
+                    log(f"    {pkg} ({engine}): installiert ✓", "INFO")
+                else:
+                    log(f"    {pkg} ({engine}): fehlgeschlagen — Engine beeintraechtigt", "WARNING")
 
-        # ACE-Step: Musik-Generierung (cinematic, ambient, orchestral)
+        # ACE-Step: requirements.txt zeilenweise installieren (robust gegen Konflikte)
         ace_req = os.path.join(custom_nodes_dir, "ComfyUI_ACE-Step", "requirements.txt")
         if os.path.isfile(ace_req):
-            log("  ACE-Step: installiere requirements.txt...", "INFO")
-            _pip(["install", "-r", ace_req, "--no-cache-dir"], timeout=300)
-        elif os.path.isdir(os.path.join(custom_nodes_dir, "ComfyUI_ACE-Step")):
-            log("  ACE-Step: installiere Kern-Dependencies...", "INFO")
-            _pip(["install", "ace-step", "einops", "omegaconf", "--no-cache-dir"], timeout=300)
+            log("  ACE-Step: installiere requirements.txt (zeilenweise)...", "INFO")
+            try:
+                with open(ace_req, encoding="utf-8", errors="replace") as _f:
+                    ace_lines = [
+                        l.strip() for l in _f
+                        if l.strip() and not l.strip().startswith("#")
+                    ]
+                for ace_pkg in ace_lines:
+                    # Bereits-Check
+                    _imp = ace_pkg.split(">=")[0].split("<=")[0].split("==")[0].strip()
+                    _imp = _imp.replace("-", "_").lower()
+                    chk = subprocess.run(
+                        [python_exe, "-c", f"import {_imp}"],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8,
+                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                    )
+                    if chk.returncode == 0:
+                        continue  # bereits vorhanden
+                    ok = _pip(["install", ace_pkg, "--no-cache-dir"], timeout=180)
+                    if ok:
+                        log(f"    ACE-Step dep '{ace_pkg}': installiert ✓", "INFO")
+                    else:
+                        # Fallback ohne Deps
+                        ok2 = _pip(["install", ace_pkg, "--no-cache-dir", "--no-deps"], timeout=60)
+                        if ok2:
+                            log(f"    ACE-Step dep '{ace_pkg}': installiert (--no-deps) ✓", "INFO")
+                        else:
+                            log(f"    ACE-Step dep '{ace_pkg}': fehlgeschlagen", "WARNING")
+            except Exception as e:
+                log(f"  ACE-Step requirements.txt Fehler: {e}", "WARNING")
+
+        # ACE-Step Modell-Ordner erstellen (verhindert FileNotFoundError beim Start)
+        ace_model_dir       = os.path.join(comfyui_dir, "models", "TTS", "ACE-Step-v1-3.5B")
+        ace_model_cache_dir = os.path.join(setup_cache, "ACE-Step-v1-3.5B")
+        for ace_sub in ("ace_step_transformer", "music_dcae_f8c8",
+                        "music_vocoder", "umt5-base", "loras"):
+            os.makedirs(os.path.join(ace_model_dir, ace_sub), exist_ok=True)
+            os.makedirs(os.path.join(ace_model_cache_dir, ace_sub), exist_ok=True)
+
+        _ACE_SUBS = ("ace_step_transformer", "music_dcae_f8c8", "music_vocoder", "umt5-base")
+
+        def _ace_model_complete(base: str) -> bool:
+            for sub in _ACE_SUBS:
+                d = os.path.join(base, sub)
+                if not os.path.isdir(d):
+                    return False
+                files = [f for f in os.listdir(d)
+                         if f.endswith((".safetensors", ".bin", ".json", ".pt"))]
+                if not files:
+                    return False
+            return True
+
+        if _ace_model_complete(ace_model_dir):
+            log("  ACE-Step: Modell bereits vorhanden ✓", "INFO")
+        elif _ace_model_complete(ace_model_cache_dir):
+            log("  ACE-Step: Kopiere aus Cache...", "SUCCESS")
+            import shutil as _shace
+            _shace.copytree(ace_model_cache_dir, ace_model_dir, dirs_exist_ok=True)
+            log("  ACE-Step: Modell kopiert ✓", "SUCCESS")
+        else:
+            log("  ACE-Step: Lade von HuggingFace (~5 GB) → Cache: setupfiles/ACE-Step-v1-3.5B/", "INFO")
+            try:
+                dl_ace = subprocess.run(
+                    [python_exe, "-c",
+                     "from huggingface_hub import snapshot_download; "
+                     "snapshot_download("
+                     "  repo_id='ACE-Step/ACE-Step-v1-3.5B',"
+                     f"  local_dir=r'{ace_model_cache_dir}',"
+                     "  repo_type='model',"
+                     "  ignore_patterns=['*.md','*.txt','*.gitattributes']"
+                     "); print('DONE')"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    timeout=3600,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                )
+                if "DONE" in dl_ace.stdout.decode(errors="replace") or _ace_model_complete(ace_model_cache_dir):
+                    log("  ACE-Step: Heruntergeladen ✓ — kopiere in Zielordner...", "SUCCESS")
+                    import shutil as _shace2
+                    _shace2.copytree(ace_model_cache_dir, ace_model_dir, dirs_exist_ok=True)
+                    log("  ACE-Step: Modell installiert ✓", "SUCCESS")
+                else:
+                    log(f"  ACE-Step: Download fehlgeschlagen — {dl_ace.stderr.decode(errors='replace')[-200:]}", "WARNING")
+            except subprocess.TimeoutExpired:
+                log("  ACE-Step: Timeout (>1h) — bitte erneut Install ComfyUI klicken.", "WARNING")
+            except Exception as e:
+                log(f"  ACE-Step: Fehler: {e}", "WARNING")
+
+        # ── chatterbox-tts: IMMER --no-deps, torch CUDA danach schützen ────────
+        # chatterbox-tts zieht torch CPU als Dependency — das zerstoert die CUDA-
+        # Installation. Loesung: --no-deps, dann torch CUDA aus Cache wiederherstellen.
+        # Prüfe ob ChatterboxTTS vollständig funktioniert (nicht nur ob chatterbox importierbar)
+        chk_cb = subprocess.run(
+            [python_exe, "-c", "from chatterbox.tts import ChatterboxTTS; print('OK')"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+        cb_ok = b"OK" in chk_cb.stdout
+        if cb_ok:
+            log("  chatterbox-tts: ChatterboxTTS verfügbar ✓", "INFO")
+        else:
+            err_cb = chk_cb.stderr.decode(errors="replace")[-300:]
+            log(f"  chatterbox-tts: ChatterboxTTS nicht verfügbar — installiere...", "INFO")
+            if err_cb:
+                log(f"  Fehler: {err_cb}", "INFO")
+
+            # Immer --no-deps (verhindert torch CPU-Downgrade)
+            _pip(["install", "chatterbox-tts", "--no-deps", "--no-cache-dir"], timeout=120)
+
+            # Alle benötigten Deps nachinstallieren (OHNE torch)
+            cb_deps = [
+                "resemble-perth",        # Wasserzeichen (Pflicht für ChatterboxTTS)
+                "conformer",             # Audio-Encoder
+                "vocos",                 # Vocoder
+                "encodec",               # Audio-Codec
+                "rotary-embedding-torch", # Transformer
+                "einops",                # Tensor-Ops
+                "s3tokenizer",           # Tokenizer
+                "antlr4-python3-runtime==4.9.3",  # Abhängigkeit von omegaconf
+            ]
+            for dep in cb_deps:
+                dep_imp = dep.split("==")[0].replace("-", "_").lower()
+                chk_dep = subprocess.run(
+                    [python_exe, "-c", f"import {dep_imp}"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                )
+                if chk_dep.returncode != 0:
+                    ok_dep = _pip(["install", dep, "--no-cache-dir"], timeout=120)
+                    if not ok_dep:
+                        # Fallback mit --no-deps
+                        ok_dep = _pip(["install", dep, "--no-cache-dir", "--no-deps"], timeout=60)
+                    log(f"    {dep}: {'✓' if ok_dep else 'fehlgeschlagen'}", "SUCCESS" if ok_dep else "WARNING")
+                else:
+                    log(f"    {dep}: bereits installiert ✓", "INFO")
+
+            # Verifikation
+            chk_cb2 = subprocess.run(
+                [python_exe, "-c", "from chatterbox.tts import ChatterboxTTS; print('OK')"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+            if b"OK" in chk_cb2.stdout:
+                log("  ChatterboxTTS: bereit ✓", "SUCCESS")
+            else:
+                log(f"  ChatterboxTTS: immer noch nicht verfügbar — {chk_cb2.stderr.decode(errors='replace')[-200:]}", "WARNING")
+
+            # torch CUDA sofort wiederherstellen (sicherheitshalber immer)
+            log("  Stelle torch CUDA sicher...", "INFO")
+            torch_cache_cb = os.path.join(setup_cache, f"torch_{cu_tag}")
+            cached_cb = [f for f in os.listdir(torch_cache_cb) if f.endswith(".whl")] \
+                        if os.path.isdir(torch_cache_cb) else []
+            if len(cached_cb) >= 3:
+                _pip(["install", "torch", "torchvision", "torchaudio",
+                      "--find-links", torch_cache_cb, "--no-index"], timeout=300)
+            else:
+                _pip(["install", "torch", "torchvision", "torchaudio",
+                      "--index-url", torch_index, "--no-cache-dir"], timeout=900)
+
+            # Verifikation
+            chk_t = subprocess.run(
+                [python_exe, "-c",
+                 "import torch; print(torch.cuda.is_available(), torch.__version__)"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+            out_t = chk_t.stdout.decode(errors="replace").strip()
+            if out_t.startswith("True"):
+                log(f"  torch CUDA gesichert ✓ — {out_t}", "SUCCESS")
+            else:
+                log(f"  ⚠️  torch CUDA Problem: {out_t}", "WARNING")
 
         log("[ComfyUI-Install] Custom Node Dependencies installiert ✓", "SUCCESS")
 
@@ -3219,6 +3802,9 @@ class ProductionOrchestrator:
             _comfy_env["PYTHONIOENCODING"]         = "utf-8"
             _comfy_env["PYTHONLEGACYWINDOWSSTDIO"] = "0"
             _comfy_env["PYTHONUNBUFFERED"]         = "1"
+            _comfy_env["NO_COLOR"]                 = "1"
+            _comfy_env["TERM"]                     = "dumb"
+            _comfy_env["FORCE_COLOR"]              = "0"
 
             proc = subprocess.Popen(
                 _start_cmd,
@@ -4044,6 +4630,8 @@ class ProducerApp(tk.Tk):
         # ── ComfyUI-Installations-Button (neu v1.1.0) ─────────────────────────
         self._action_btn(bf, "\U0001f5a5\ufe0f  Install ComfyUI",
                          self._on_install_comfyui, COLORS["success"]).pack(side="left", padx=4)
+        self._flat_btn(bf, "\U0001f50d  ComfyUI Nodes",
+                       self._on_diagnose_comfyui).pack(side="left", padx=4)
         self._flat_btn(bf, "\U0001f5d1  Clear Log", self._clear_log).pack(side="right", padx=4)
         self._action_btn(bf, "\u25a0  STOP",
                          self._stop_production, COLORS["error"]).pack(side="right", padx=4)
@@ -4806,6 +5394,47 @@ class ProducerApp(tk.Tk):
             self._orchestrator.stop()
             self._log("Stopping production...", "WARNING")
 
+    def _on_diagnose_comfyui(self):
+        """Fragt ComfyUI nach den exakten Node-Inputs und zeigt sie im Log."""
+        import threading, urllib.request, json as _json
+        COMFYUI_URL = "http://127.0.0.1:8188"
+        NODES_OF_INTEREST = [
+            "ChatterBoxEngineNode", "UnifiedTTSTextNode",
+            "ACEModelLoader", "ACEStepGen",
+            "ACELoRALoader", "SaveAudio",
+        ]
+
+        def _query():
+            self._log("🔍 Frage ComfyUI nach Node-Info...", "INFO")
+            try:
+                with urllib.request.urlopen(f"{COMFYUI_URL}/object_info", timeout=10) as r:
+                    data = _json.loads(r.read())
+                found = []
+                for name in NODES_OF_INTEREST:
+                    if name in data:
+                        found.append(name)
+                        node = data[name]
+                        inp = node.get("input", {})
+                        self._log(f"\n=== {name} ===", "SUCCESS")
+                        for cat in ("required", "optional"):
+                            if cat not in inp:
+                                continue
+                            self._log(f"  [{cat}]", "INFO")
+                            for k, v in inp[cat].items():
+                                typ = str(v[0]) if v else "?"
+                                # Listentypen kuerzen
+                                if isinstance(v[0], list) and len(v[0]) > 5:
+                                    typ = f"[{v[0][0]}, ...+{len(v[0])-1}]"
+                                self._log(f"    {k}: {typ}", "INFO")
+                    else:
+                        self._log(f"=== {name}: NICHT GEFUNDEN ===", "WARNING")
+                self._log(f"\n✅ {len(found)}/{len(NODES_OF_INTEREST)} Nodes gefunden.", "SUCCESS")
+            except Exception as e:
+                self._log(f"❌ Diagnose fehlgeschlagen: {e}", "ERROR")
+                self._log("  → Ist ComfyUI gestartet? http://127.0.0.1:8188", "WARNING")
+
+        threading.Thread(target=_query, daemon=True).start()
+
     def _on_install_comfyui(self):
         """GUI-Handler fuer den '🖥️ Install ComfyUI'-Button.
 
@@ -4897,8 +5526,11 @@ class ProducerApp(tk.Tk):
             try:
                 self._log_area.config(state="normal")
                 ts = datetime.datetime.now().strftime("%H:%M:%S")
+                # Auto-scroll nur wenn Benutzer bereits am Ende ist
+                at_bottom = self._log_area.yview()[1] >= 0.99
                 self._log_area.insert("end", f"[{ts}] {msg}\n", level)
-                self._log_area.see("end")
+                if at_bottom:
+                    self._log_area.see("end")
                 self._log_area.config(state="disabled")
             except Exception:
                 pass  # Widget zerstoert — ignorieren
