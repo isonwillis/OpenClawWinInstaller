@@ -2537,7 +2537,14 @@ class ProductionOrchestrator:
                                 for c in all_clips:
                                     f.write(f"file '{c}'\n")
                             concat_out = os.path.join(out_dir, "_clip_concat.mp4")
-                            ffmpeg_cc  = self._find_ffmpeg()
+                            # FFmpeg suchen
+                        import shutil as _shff
+                        ffmpeg_cc = _shff.which("ffmpeg")
+                        if not ffmpeg_cc:
+                            _ff_local = os.path.join(comfyui_out, "..", "venv", "Scripts", "ffmpeg.exe")
+                            _ff_local = os.path.normpath(_ff_local)
+                            if os.path.isfile(_ff_local):
+                                ffmpeg_cc = _ff_local
                             if ffmpeg_cc:
                                 try:
                                     subprocess.run(
