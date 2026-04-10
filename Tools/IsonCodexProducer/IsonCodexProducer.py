@@ -2790,33 +2790,36 @@ class ProductionOrchestrator:
         # ── 2. Workflow bauen ─────────────────────────────────────────────────
         workflow = self._build_comfyui_workflow(prompt, duration_sec, out_dir, sid)
 
-        # ── 3. ComfyUI Queue leeren (vorherige Jobs abbrechen) ───────────────
-        # Verhindert dass haengende Jobs den neuen Request blockieren.
+        # ── 3. ComfyUI Queue leeren (nur hängende/pending Jobs, NICHT laufende) ─
+        # IMPORTANT: Never send /interrupt — it would abort a running render.
+        # Only clear the pending queue (items not yet started).
         try:
-            clear_req = urllib.request.Request(
-                f"{COMFYUI_URL}/queue",
-                data    = json.dumps({"clear": True}).encode("utf-8"),
-                headers = {"Content-Type": "application/json"},
-                method  = "POST",
-            )
-            with urllib.request.urlopen(clear_req, timeout=10) as r:
-                r.read()
-            self.log(f"{TAG} Queue cleared ✓", "INFO")
-        except Exception as qe:
-            self.log(f"{TAG} Queue clear failed (non-critical): {qe}", "WARNING")
+            # Check current queue state first
+            with urllib.request.urlopen(f"{COMFYUI_URL}/queue", timeout=5) as _qr:
+                _qdata = json.loads(_qr.read())
+            _pending = _qdata.get("queue_pending", [])
+            _running = _qdata.get("queue_running", [])
 
-        # Interrupt (bricht laufenden Job ab)
-        try:
-            int_req = urllib.request.Request(
-                f"{COMFYUI_URL}/interrupt",
-                data    = b"{}",
-                headers = {"Content-Type": "application/json"},
-                method  = "POST",
-            )
-            with urllib.request.urlopen(int_req, timeout=10) as r:
-                r.read()
-        except Exception:
-            pass  # Kein Job laufend — ignorieren
+            if _pending:
+                # Only clear pending items — leave running job untouched
+                clear_req = urllib.request.Request(
+                    f"{COMFYUI_URL}/queue",
+                    data    = json.dumps({"clear": True}).encode("utf-8"),
+                    headers = {"Content-Type": "application/json"},
+                    method  = "POST",
+                )
+                with urllib.request.urlopen(clear_req, timeout=10) as r:
+                    r.read()
+                self.log(f"{TAG} Queue cleared ({len(_pending)} pending items) ✓", "INFO")
+            elif _running:
+                self.log(f"{TAG} Queue: {len(_running)} job(s) running — not interrupting.", "INFO")
+            else:
+                self.log(f"{TAG} Queue empty ✓", "INFO")
+        except Exception as qe:
+            self.log(f"{TAG} Queue check failed (non-critical): {qe}", "WARNING")
+
+        # DO NOT send /interrupt here — it aborts any currently running render.
+        # Interrupt is only sent by the STOP button explicitly.
 
         # Kurz warten bis ComfyUI bereit fuer neuen Job
         time.sleep(2)
