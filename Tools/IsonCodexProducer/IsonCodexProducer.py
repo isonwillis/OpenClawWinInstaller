@@ -1720,39 +1720,109 @@ class ProductionOrchestrator:
             # Verwendet ComfyUI-native WAN-Nodes (kein CheckpointLoaderSimple!)
             # Modell liegt in models/diffusion_models/, T5 in models/text_encoders/
             self.log("[ComfyUI] No template found — using embedded WAN-2.1 minimal workflow.", "INFO")
-            fps = 16
-            # WAN 2.1 1.3B Hardware-Limit auf RTX 3050 (6GB VRAM):
-            # Max 81 Frames @ 480p = 81/16 = ~5.1 Sekunden pro Render
-            # Fuer laengere Scenen (z.B. 18s) werden mehrere Clips gerendert
-            # und spaeter in CapCut zusammengeschnitten.
-            # WAN 2.1 5B wuerde laengere Sequenzen erlauben, braucht aber >8GB VRAM.
-            MAX_WAN_FRAMES = 81   # Hardware-Grenze RTX 3050 6GB @ 480p
-            raw_frames = duration_sec * fps
-            wan_frames = max(17, min(MAX_WAN_FRAMES, int(raw_frames)))
-            # WAN erwartet Frames in Form 4k+1: 17, 21, 25, ..., 81
-            wan_frames = ((wan_frames - 1) // 4) * 4 + 1
-            num_frames = wan_frames
-            actual_secs = num_frames / fps
-            if actual_secs < duration_sec - 1:
-                self.log(
-                    f"[ComfyUI] ⚠️  Scene {duration_sec}s → WAN 1.3B limit: {actual_secs:.1f}s "
-                    f"({num_frames} Frames @ {fps}fps). "
-                    f"Fuer volle {duration_sec}s: {int(duration_sec/actual_secs)+1} clips needed.",
-                    "WARNING"
-                )
-            else:
-                self.log(f"[ComfyUI] Frames: {num_frames} @ {fps}fps = {actual_secs:.1f}s", "INFO")
 
-            # Bestimme Dateiname: bf16 bevorzugt, fp16 als Fallback
+            # ── Model auto-detection: prefer 14B (GGUF/fp8) over 1.3B ───────────
             project_root   = os.path.dirname(os.path.normpath(self.storage_root))
             comfyui_dir    = os.path.join(project_root, "ComfyUI-Portable")
             diff_models    = os.path.join(comfyui_dir, "models", "diffusion_models")
-            model_bf16     = "wan2.1_t2v_1.3B_bf16.safetensors"
-            model_fp16     = "wan2.1_t2v_1.3B_fp16.safetensors"
-            if os.path.isfile(os.path.join(diff_models, model_bf16)):
-                diffusion_model = model_bf16
+            unet_dir       = os.path.join(comfyui_dir, "models", "unet")
+
+            # Priority order: 14B GGUF > 14B fp8 > 14B bf16 > 1.3B bf16 > 1.3B fp16
+            model_candidates_14b_gguf = [f for f in (os.listdir(unet_dir) if os.path.isdir(unet_dir) else [])
+                                          if "14b" in f.lower() and f.lower().endswith(".gguf")]
+            # Also check diffusion_models/ — some users place GGUF there
+            if not model_candidates_14b_gguf and os.path.isdir(diff_models):
+                gguf_in_diff = [f for f in os.listdir(diff_models)
+                                if "14b" in f.lower() and f.lower().endswith(".gguf")]
+                if gguf_in_diff:
+                    os.makedirs(unet_dir, exist_ok=True)
+                    import shutil as _shgguf
+                    for _gf in gguf_in_diff:
+                        _shgguf.move(os.path.join(diff_models, _gf), os.path.join(unet_dir, _gf))
+                        self.log(f"[ComfyUI] Moved {_gf} → models/unet/ ✓", "INFO")
+                    model_candidates_14b_gguf = [f for f in os.listdir(unet_dir)
+                                                 if "14b" in f.lower() and f.lower().endswith(".gguf")]
+            model_candidates_14b_diff = [f for f in (os.listdir(diff_models) if os.path.isdir(diff_models) else [])
+                                          if "14b" in f.lower() and f.endswith(".safetensors")]
+
+            use_14b_gguf = bool(model_candidates_14b_gguf)
+            use_14b_diff = bool(model_candidates_14b_diff) and not use_14b_gguf
+
+            self.log(f"[ComfyUI] Model scan — unet/: {model_candidates_14b_gguf} | diff/: {model_candidates_14b_diff}", "INFO")
+
+            # Verify UnetLoaderGGUF is available in ComfyUI before using it
+            if use_14b_gguf:
+                try:
+                    import urllib.request as _ur_chk
+                    with _ur_chk.urlopen("http://127.0.0.1:8188/object_info/UnetLoaderGGUF", timeout=5) as _r:
+                        _r.read()
+                    self.log("[ComfyUI] UnetLoaderGGUF node available ✓", "SUCCESS")
+                except Exception:
+                    self.log("[ComfyUI] UnetLoaderGGUF node NOT available — gguf not installed in active Python.", "WARNING")
+                    self.log("[ComfyUI] → Run 'Install ComfyUI' to install gguf package.", "INFO")
+                    use_14b_gguf = False
+
+            fps = 16
+            # Frame limits depend on model + offloading strategy:
+            # 1.3B @ 6GB VRAM only:   max 81 frames (5.1s) @ 480p
+            # 14B GGUF + CPU offload: max 81 frames per job (VRAM holds active layers only)
+            #   → quality is much higher, same render time constraint
+            # Resolution tradeoff: lower res = more frames possible
+            #   848×480 (16:9) = max 81 frames on 6GB
+            #   480×480 (1:1)  = up to 121 frames possible on 6GB
+            if use_14b_gguf or use_14b_diff:
+                MAX_WAN_FRAMES = 81   # Same VRAM constraint, but quality is far superior
+                width, height  = 848, 480
             else:
-                diffusion_model = model_fp16  # Fallback
+                MAX_WAN_FRAMES = 81
+                width, height  = 848, 480
+
+            raw_frames = duration_sec * fps
+            wan_frames = max(17, min(MAX_WAN_FRAMES, int(raw_frames)))
+            # WAN requires frames in form 4k+1: 17, 21, 25, ..., 81
+            wan_frames = ((wan_frames - 1) // 4) * 4 + 1
+            num_frames = wan_frames
+            actual_secs = num_frames / fps
+            model_label = "14B" if (use_14b_gguf or use_14b_diff) else "1.3B"
+            if actual_secs < duration_sec - 1:
+                clips_raw    = max(1, int(duration_sec / actual_secs + 0.5))
+                clips_capped = min(clips_raw, 6)
+                loop_note    = f" (capped at {clips_capped}, remainder looped)" if clips_raw > 6 else ""
+                self.log(
+                    f"[ComfyUI] ⚠️  Scene {duration_sec}s → WAN {model_label} limit: {actual_secs:.1f}s "
+                    f"({num_frames} Frames @ {fps}fps). "
+                    f"{clips_capped} clips will be rendered{loop_note}.",
+                    "WARNING"
+                )
+            else:
+                self.log(f"[ComfyUI] Frames: {num_frames} @ {fps}fps = {actual_secs:.1f}s [{model_label}]", "INFO")
+
+            if use_14b_gguf:
+                diffusion_model = sorted(model_candidates_14b_gguf)[0]
+                model_dir_used  = unet_dir
+                loader_class    = "UnetLoaderGGUF"
+                self.log(f"[ComfyUI] Using WAN 2.1 14B GGUF: {diffusion_model}", "SUCCESS")
+            elif use_14b_diff:
+                diffusion_model = sorted(model_candidates_14b_diff)[0]
+                # Prefer fp8 for VRAM efficiency
+                fp8_candidates = [f for f in model_candidates_14b_diff if "fp8" in f.lower()]
+                if fp8_candidates:
+                    diffusion_model = sorted(fp8_candidates)[0]
+                model_dir_used = diff_models
+                loader_class   = "UNETLoader"
+                self.log(f"[ComfyUI] Using WAN 2.1 14B: {diffusion_model}", "SUCCESS")
+            else:
+                # Fallback: 1.3B model
+                model_bf16     = "wan2.1_t2v_1.3B_bf16.safetensors"
+                model_fp16     = "wan2.1_t2v_1.3B_fp16.safetensors"
+                if os.path.isfile(os.path.join(diff_models, model_bf16)):
+                    diffusion_model = model_bf16
+                else:
+                    diffusion_model = model_fp16
+                model_dir_used = diff_models
+                loader_class   = "UNETLoader"
+                self.log(f"[ComfyUI] WAN 2.1 14B not found — using 1.3B: {diffusion_model}", "WARNING")
+                self.log("[ComfyUI] → Download 14B GGUF: place wan2.1_t2v_14B_Q4_K_M.gguf in models/unet/", "INFO")
 
             # T5 Text Encoder — ersten verfuegbaren in models/text_encoders/ suchen
             t5_dir_wf  = os.path.join(comfyui_dir, "models", "text_encoders")
@@ -1798,12 +1868,13 @@ class ProductionOrchestrator:
             self.log(f"[ComfyUI] Workflow: vae={wan_vae}", "INFO")
 
             workflow = {
-                # Node 1: Load WAN diffusion model
+                # Node 1: Load WAN diffusion model — GGUF or standard UNETLoader
                 "1": {
-                    "class_type": "UNETLoader",
+                    "class_type": loader_class,
                     "inputs": {
                         "unet_name": diffusion_model,
-                        "weight_dtype": "default"
+                        **({"weight_dtype": "fp8_e4m3fn"} if loader_class == "UNETLoader" and use_14b_diff else
+                           {"weight_dtype": "default"} if loader_class == "UNETLoader" else {})
                     }
                 },
                 # Node 2: Load T5 text encoder
@@ -1837,12 +1908,12 @@ class ProductionOrchestrator:
                         "text": "blurry, low quality, watermark, text, distorted, ugly, worst quality"
                     }
                 },
-                # Node 6: Leeres Latent Video
+                # Node 6: Empty latent video — EmptyHunyuanLatentVideo works for both 1.3B and 14B
                 "6": {
                     "class_type": "EmptyHunyuanLatentVideo",
                     "inputs": {
-                        "width":      848,
-                        "height":     480,
+                        "width":      width,
+                        "height":     height,
                         "length":     num_frames,
                         "batch_size": 1
                     }
@@ -2869,8 +2940,14 @@ class ProductionOrchestrator:
                     self.log(f"{TAG} ✅ Video copied: {clip_path}", "SUCCESS")
 
                     # ── Multi-Clip: weitere Clips rendern falls Scene > 5.1s ────
-                    MAX_CLIP_SEC = 5.1
-                    num_clips_needed = max(1, int(duration_sec / MAX_CLIP_SEC + 0.5))
+                    MAX_CLIP_SEC   = 5.1
+                    # Hard cap: max 6 clips regardless of scene duration.
+                    # For very long scenes (60-90s), we render 6 clips (~30s total)
+                    # and use FFmpeg to loop/extend to the target duration.
+                    MAX_CLIPS      = 6
+                    num_clips_raw  = max(1, int(duration_sec / MAX_CLIP_SEC + 0.5))
+                    num_clips_needed = min(num_clips_raw, MAX_CLIPS)
+                    use_loop       = num_clips_raw > MAX_CLIPS  # need to loop to reach target duration
 
                     if num_clips_needed > 1 and os.path.isfile(clip_path):
                         self.log(f"{TAG} 📽️  {num_clips_needed} clips needed for {duration_sec}s — rendering more...", "INFO")
@@ -2940,15 +3017,26 @@ class ProductionOrchestrator:
                                 self.log(f"{TAG} ⚠️  Clip {clip_idx} failed — stopping at {len(all_clips)} clip(s).", "WARNING")
                                 break
 
-                        # FFmpeg concat wenn mehr als 1 Clip
+                        # FFmpeg concat — with optional loop to reach target duration
                         if len(all_clips) > 1:
-                            self.log(f"{TAG} 🔗 Merging {len(all_clips)} clips together ({len(all_clips)*5:.0f}s)...", "INFO")
+                            rendered_sec = len(all_clips) * MAX_CLIP_SEC
+                            self.log(f"{TAG} 🔗 Merging {len(all_clips)} clips together ({rendered_sec:.0f}s)...", "INFO")
                             concat_list = os.path.join(out_dir, "_concat_list.txt")
-                            with open(concat_list, "w", encoding="utf-8") as f:
-                                for c in all_clips:
-                                    f.write(f"file '{c}'\n")
+
+                            # If we hit the MAX_CLIPS cap, loop the concat list to reach target duration
+                            if use_loop and rendered_sec < duration_sec:
+                                loops_needed = int(duration_sec / rendered_sec) + 1
+                                self.log(f"{TAG} 🔁 Looping {len(all_clips)} clips ×{loops_needed} to reach {duration_sec}s target...", "INFO")
+                                with open(concat_list, "w", encoding="utf-8") as f:
+                                    for _ in range(loops_needed):
+                                        for c in all_clips:
+                                            f.write(f"file '{c}'\n")
+                            else:
+                                with open(concat_list, "w", encoding="utf-8") as f:
+                                    for c in all_clips:
+                                        f.write(f"file '{c}'\n")
+
                             concat_out = os.path.join(out_dir, "_clip_concat.mp4")
-                            # FFmpeg suchen
                             import shutil as _shff
                             ffmpeg_cc = _shff.which("ffmpeg")
                             if not ffmpeg_cc:
@@ -2958,20 +3046,27 @@ class ProductionOrchestrator:
                                     ffmpeg_cc = _ff_local
                             if ffmpeg_cc:
                                 try:
+                                    # Concat + trim to exact target duration
+                                    ffmpeg_cmd = [ffmpeg_cc, "-y", "-f", "concat", "-safe", "0",
+                                                  "-i", concat_list]
+                                    if use_loop:
+                                        # Trim to exact target duration
+                                        ffmpeg_cmd += ["-t", str(duration_sec)]
+                                    ffmpeg_cmd += ["-c", "copy", concat_out]
                                     subprocess.run(
-                                        [ffmpeg_cc, "-y", "-f", "concat", "-safe", "0",
-                                         "-i", concat_list, "-c", "copy", concat_out],
+                                        ffmpeg_cmd,
                                         check=True,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                        timeout=120,
+                                        timeout=300,
                                         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                                     )
                                     if os.path.isfile(concat_out):
                                         import shutil as _shc2
                                         _shc2.copy2(concat_out, clip_path)
-                                        self.log(f"{TAG} ✅ {len(all_clips)} clips → {clip_path} ({len(all_clips)*5:.0f}s)", "SUCCESS")
+                                        final_dur = duration_sec if use_loop else rendered_sec
+                                        self.log(f"{TAG} ✅ {len(all_clips)} clips → {clip_path} ({final_dur:.0f}s)", "SUCCESS")
                                     else:
-                                        self.log(f"{TAG} ⚠️  Concat-Datei nicht erzeugt — nutze clip_001.", "WARNING")
+                                        self.log(f"{TAG} ⚠️  Concat output not created — using clip_001.", "WARNING")
                                 except Exception as fe:
                                     self.log(f"{TAG} FFmpeg concat failed: {fe}", "WARNING")
                             else:
@@ -3285,13 +3380,58 @@ class ProductionOrchestrator:
         venv_python = _find_64bit_python()
         log(f"[ComfyUI-Install] Python for venv: {venv_python}", "INFO")
 
-        # ── Altes venv-Verzeichnis bereinigen (verhindert Permission-denied) ──
-        if os.path.isdir(venv_dir):
+        # Initialize — will be set by intact check or creation strategies
+        venv_ok    = False
+        python_exe = venv_python
+        pip_exe    = None
+
+        # ── Check if existing venv is already functional ──────────────────────
+        venv_python_exe = os.path.join(venv_dir, "Scripts", "python.exe")
+        venv_intact = os.path.isfile(venv_python_exe)
+        if venv_intact:
+            # Quick check: can it import torch with CUDA?
+            try:
+                chk = _run_hidden(
+                    [venv_python_exe, "-c",
+                     "import torch; print('CUDA:', torch.cuda.is_available(), torch.__version__)"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+                )
+                chk_out = chk.stdout.decode(errors="replace").strip()
+                if "CUDA: True" in chk_out:
+                    log(f"[ComfyUI-Install] Existing venv is functional: {chk_out} — skipping rebuild.", "SUCCESS")
+                    # Skip venv creation, go straight to pip installs
+                    python_exe = venv_python_exe
+                    pip_exe    = os.path.join(venv_dir, "Scripts", "pip.exe")
+                    if not os.path.isfile(pip_exe):
+                        pip_exe = None
+                    # Jump to torch/requirements section by setting venv_ok
+                    venv_ok = True
+                else:
+                    log(f"[ComfyUI-Install] Existing venv has no CUDA torch ({chk_out}) — rebuilding.", "WARNING")
+                    venv_intact = False
+            except Exception:
+                venv_intact = False
+
+        # ── Delete old venv only if rebuild needed ────────────────────────────
+        if not venv_intact and os.path.isdir(venv_dir):
             log("[ComfyUI-Install] Existing venv directory found — deleting...", "INFO")
+            # Kill any process holding venv files (ComfyUI python.exe)
+            try:
+                import psutil as _psu
+                for _proc in _psu.process_iter(["pid", "name", "exe"]):
+                    try:
+                        _exe = (_proc.info.get("exe") or "").lower()
+                        if "comfyui-portable" in _exe and "python" in _exe:
+                            _proc.kill()
+                            log(f"[ComfyUI-Install] Killed ComfyUI process PID {_proc.pid} to free venv.", "INFO")
+                    except Exception:
+                        pass
+                import time as _t; _t.sleep(2)
+            except ImportError:
+                pass
             try:
                 import shutil as _shutil
                 _shutil.rmtree(venv_dir, ignore_errors=True)
-                # Sicherheitscheck: falls Prozess die Dateien noch haelt
                 if os.path.isdir(venv_dir):
                     log("[ComfyUI-Install] venv folder could not be fully deleted.", "WARNING")
                 else:
@@ -3304,27 +3444,27 @@ class ProductionOrchestrator:
         # maximum compatibility (also on older Python installations).
         PIPE   = subprocess.PIPE
         NO_WIN = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        venv_ok = False
 
-        # Strategy 1: Standard venv
-        try:
-            result = _run_hidden(
-                [venv_python, "-m", "venv", venv_dir],
-                timeout=120,
-                stdout=PIPE, stderr=PIPE,
-                creationflags=NO_WIN,
-            )
-            if result.returncode == 0:
-                venv_ok = True
-                log("[ComfyUI-Install] venv created ✓ (standard)", "SUCCESS")
-            else:
-                log(f"[ComfyUI-Install] venv standard failed (exit {result.returncode}):", "WARNING")
+        if not venv_ok:
+            # Strategy 1: Standard venv (only if venv not already intact)
+            try:
+                result = _run_hidden(
+                    [venv_python, "-m", "venv", venv_dir],
+                    timeout=120,
+                    stdout=PIPE, stderr=PIPE,
+                    creationflags=NO_WIN,
+                )
+                if result.returncode == 0:
+                    venv_ok = True
+                    log("[ComfyUI-Install] venv created ✓ (standard)", "SUCCESS")
+                else:
+                    log(f"[ComfyUI-Install] venv standard failed (exit {result.returncode}):", "WARNING")
                 if result.stdout and result.stdout.strip():
                     log(f"  stdout: {result.stdout.decode(errors='replace').strip()}", "WARNING")
                 if result.stderr and result.stderr.strip():
                     log(f"  stderr: {result.stderr.decode(errors='replace').strip()}", "WARNING")
-        except Exception as e:
-            log(f"[ComfyUI-Install] venv Standard Exception: {e}", "WARNING")
+            except Exception as e:
+                log(f"[ComfyUI-Install] venv Standard Exception: {e}", "WARNING")
 
         # Strategy 2: venv --without-pip (if ensurepip is missing)
         if not venv_ok:
@@ -3640,6 +3780,38 @@ class ProductionOrchestrator:
         log("[ComfyUI-Install] Upgrading sqlalchemy (fixes ImportError: cannot import 'select')...", "INFO")
         _pip(["install", "sqlalchemy>=2.0", "--upgrade", "--no-cache-dir"], timeout=120)
 
+        # ── Write tqdm pipe-safe patch to sitecustomize.py ────────────────────
+        # This must happen in the installer (not just at ComfyUI start) so that
+        # a freshly created venv already has the patch before first launch.
+        _tqdm_patch = (
+            "\n# tqdm pipe-safe patch — injected by IsonCodexProducer\n"
+            "try:\n"
+            "    import tqdm.std as _ts\n"
+            "    def _safe_fp_write(fp, s):\n"
+            "        try:\n"
+            "            if hasattr(fp, 'write'): fp.write(str(s))\n"
+            "            try:\n"
+            "                if hasattr(fp, 'flush'): fp.flush()\n"
+            "            except (OSError, AttributeError): pass\n"
+            "        except (OSError, AttributeError): pass\n"
+            "    _ts.std_tqdm.fp_write = staticmethod(_safe_fp_write)\n"
+            "except Exception: pass\n"
+        )
+        for _site_dir in [
+            os.path.join(venv_dir, "Lib", "site-packages"),           # fresh venv
+            os.path.join(venv_dir, "lib", "site-packages"),           # Linux/Mac
+        ]:
+            if os.path.isdir(_site_dir):
+                _sc_path = os.path.join(_site_dir, "sitecustomize.py")
+                try:
+                    _existing = open(_sc_path, "r", encoding="utf-8").read() if os.path.isfile(_sc_path) else ""
+                    if "_safe_fp_write" not in _existing:
+                        with open(_sc_path, "a", encoding="utf-8") as _sc:
+                            _sc.write(_tqdm_patch)
+                        log("  tqdm sitecustomize.py patch written ✓", "SUCCESS")
+                except Exception as _sce:
+                    log(f"  tqdm sitecustomize.py patch failed: {_sce}", "WARNING")
+
         # ── Verify torch CUDA after requirements.txt ──────────────────────────
         # requirements.txt may overwrite torch. Always verify afterwards and
         # restore from WHL cache if needed.
@@ -3736,6 +3908,59 @@ class ProductionOrchestrator:
                     "  Quelle: https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged",
                     "WARNING"
                 )
+
+        # ── 5a-2. WAN 2.1 14B GGUF — optional, much better quality ─────────────
+        # Q4_K_M quantization: ~8.5 GB, runs via GPU/CPU offloading on RTX 3050
+        # Place in models/unet/ — loaded via ComfyUI-GGUF node (UnetLoaderGGUF)
+        unet_dir_inst = os.path.join(comfyui_dir, "models", "unet")
+        os.makedirs(unet_dir_inst, exist_ok=True)
+
+        WAN14B_GGUF_NAME  = "wan2.1_t2v_14B_Q4_K_M.gguf"
+        WAN14B_GGUF_PATH  = os.path.join(unet_dir_inst, WAN14B_GGUF_NAME)
+        WAN14B_GGUF_CACHE = os.path.join(setup_cache, WAN14B_GGUF_NAME)
+        WAN14B_GGUF_URL   = (
+            "https://huggingface.co/city96/Wan2.1-T2V-14B-gguf/resolve/main/"
+            "wan2.1-t2v-14b-Q4_K_M.gguf?download=true"
+        )
+        WAN14B_MIN_SIZE   = 5_000_000_000  # 5 GB minimum (actual ~8.5 GB)
+
+        _14b_exists = (
+            (os.path.isfile(WAN14B_GGUF_PATH)  and os.path.getsize(WAN14B_GGUF_PATH)  > WAN14B_MIN_SIZE) or
+            (os.path.isfile(WAN14B_GGUF_CACHE) and os.path.getsize(WAN14B_GGUF_CACHE) > WAN14B_MIN_SIZE)
+        )
+
+        if _14b_exists:
+            log(f"[ComfyUI-Install] WAN 2.1 14B GGUF already present ✓", "INFO")
+            # Copy from cache to unet dir if needed
+            if not (os.path.isfile(WAN14B_GGUF_PATH) and os.path.getsize(WAN14B_GGUF_PATH) > WAN14B_MIN_SIZE):
+                import shutil as _sh14
+                _sh14.copy2(WAN14B_GGUF_CACHE, WAN14B_GGUF_PATH)
+                log(f"[ComfyUI-Install] WAN 2.1 14B copied from cache ✓", "SUCCESS")
+        else:
+            log(
+                f"[ComfyUI-Install] WAN 2.1 14B GGUF not found — skipping (optional).\n"
+                f"  To download manually (~8.5 GB):\n"
+                f"  URL: {WAN14B_GGUF_URL}\n"
+                f"  Place in: {unet_dir_inst}\n"
+                f"  Or cache at: {WAN14B_GGUF_CACHE}\n"
+                f"  Then click 'Install ComfyUI' again — will auto-copy and use 14B.",
+                "INFO"
+            )
+            # Attempt auto-download — skipped if file is large and connection is slow
+            # User can always download manually and click Install again
+            log("[ComfyUI-Install] WAN 2.1 14B: attempting auto-download (~8.5 GB) — this may take a long time.", "INFO")
+            log("[ComfyUI-Install] WAN 2.1 14B: close and place file manually if too slow.", "INFO")
+            try:
+                urllib.request.urlretrieve(WAN14B_GGUF_URL, WAN14B_GGUF_CACHE)
+                if os.path.isfile(WAN14B_GGUF_CACHE) and os.path.getsize(WAN14B_GGUF_CACHE) > WAN14B_MIN_SIZE:
+                    import shutil as _sh14b
+                    _sh14b.copy2(WAN14B_GGUF_CACHE, WAN14B_GGUF_PATH)
+                    log(f"[ComfyUI-Install] WAN 2.1 14B GGUF downloaded and installed ✓", "SUCCESS")
+                else:
+                    log("[ComfyUI-Install] WAN 2.1 14B download incomplete — place file manually.", "WARNING")
+            except Exception as _e14:
+                log(f"[ComfyUI-Install] WAN 2.1 14B auto-download failed: {_e14}", "WARNING")
+                log("[ComfyUI-Install] WAN 2.1 14B: download manually and click Install again.", "INFO")
 
         # ── 5b. WAN VAE + T5 Text Encoder herunterladen ─────────────────────
         # Both are required by ComfyUI — without them every
@@ -3932,17 +4157,21 @@ class ProductionOrchestrator:
         custom_nodes = [
             ("ComfyUI-Manager",
              "https://github.com/ltdrdata/ComfyUI-Manager.git"),
+            ("ComfyUI-GGUF",
+             "https://github.com/city96/ComfyUI-GGUF.git"),
             ("ComfyUI-VideoHelperSuite",
              "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git"),
             ("ComfyUI-AudioTools",
              "https://github.com/eigenpunk/ComfyUI-audio.git"),
             ("ComfyUI-Florence2",
              "https://github.com/kijai/ComfyUI-Florence2.git"),
+            # GGUF loader — required for WAN 2.1 14B quantized models
+            ("ComfyUI-GGUF",
+             "https://github.com/city96/ComfyUI-GGUF.git"),
             # ── Cinematic Audio Pipeline ──────────────────────────────────────
-            # TTS: F5-TTS, ChatterBox, Higgs Audio 2 — Narration + Dialogue
             ("TTS-Audio-Suite",
              "https://github.com/diodiogod/TTS-Audio-Suite.git"),
-            # Music: ACE-Step 1.5 — Cinematic orchestral soundtrack (Suno-Alternative)
+            # Music: ACE-Step 1.5 — Cinematic orchestral soundtrack
             ("ComfyUI_ACE-Step",
              "https://github.com/billwuhao/ComfyUI_ACE-Step.git"),
         ]
@@ -3987,6 +4216,30 @@ class ProductionOrchestrator:
         # ── Custom Node Dependencies installieren ─────────────────────────────
         log("[ComfyUI-Install] Installing custom node dependencies...", "INFO")
         tick("nodedeps", "run", "Node Dependencies installieren...")
+
+        # ComfyUI-GGUF: requires gguf package for 14B model loading
+        gguf_node_dir = os.path.join(custom_nodes_dir, "ComfyUI-GGUF")
+        if os.path.isdir(gguf_node_dir):
+            log("  ComfyUI-GGUF: installing gguf package...", "INFO")
+            gguf_ok = _pip(["install", "gguf", "--no-cache-dir"], timeout=120)
+            if gguf_ok:
+                log("  ComfyUI-GGUF: gguf installed ✓", "SUCCESS")
+            else:
+                log("  ComfyUI-GGUF: gguf install failed — 14B GGUF loading unavailable", "WARNING")
+            # Also install in pytorch_env if it exists — ComfyUI may run with that Python
+            pytorch_env_pip = os.path.join(
+                os.path.expanduser("~"), "pytorch_env", "venv", "Scripts", "pip.exe"
+            )
+            if os.path.isfile(pytorch_env_pip) and pytorch_env_pip != pip_exe:
+                try:
+                    _run_hidden(
+                        [pytorch_env_pip, "install", "gguf", "--no-cache-dir"],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                    )
+                    log("  ComfyUI-GGUF: gguf installed in pytorch_env ✓", "SUCCESS")
+                except Exception as _ge:
+                    log(f"  ComfyUI-GGUF: gguf in pytorch_env failed: {_ge}", "WARNING")
 
         # VideoHelperSuite: braucht opencv-python, imageio-ffmpeg
         vhs_req = os.path.join(custom_nodes_dir, "ComfyUI-VideoHelperSuite", "requirements.txt")
