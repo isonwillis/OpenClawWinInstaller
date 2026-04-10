@@ -2867,7 +2867,9 @@ class ProductionOrchestrator:
         self.log(f"{TAG} Job started — prompt_id={prompt_id}", "SUCCESS")
 
         # ── 5. Polling bis fertig ─────────────────────────────────────────────
-        max_wait = 1200   # 20 Minuten
+        # 14B GGUF: ~275s/step × 20 steps = ~5500s per clip.
+        # Use 7200s (2h) as safe upper bound for a single clip.
+        max_wait = 43200   # 12 hours — no practical timeout for large models
         interval = 8      # alle 8 Sekunden
         waited   = 0
 
@@ -2884,7 +2886,8 @@ class ProductionOrchestrator:
                 continue
 
             if prompt_id not in hist:
-                self.log(f"{TAG} Waiting for result... ({waited}s)", "INFO")
+                if waited % 60 == 0:   # Log every 60s, not every 8s
+                    self.log(f"{TAG} Waiting for result... ({waited}s)", "INFO")
                 continue
 
             job_data = hist[prompt_id]
@@ -2983,7 +2986,7 @@ class ProductionOrchestrator:
                             self.log(f"{TAG} Clip {clip_idx} Job gestartet — {pid_n[:8]}...", "INFO")
 
                             # Poll /history
-                            deadline_n = time.time() + 1200
+                            deadline_n = time.time() + 43200  # 12h per clip — no practical timeout
                             while time.time() < deadline_n:
                                 time.sleep(8)
                                 try:
