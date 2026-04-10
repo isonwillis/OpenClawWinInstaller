@@ -1186,10 +1186,11 @@ class ProductionOrchestrator:
         # ── music_duration_sec ────────────────────────────────────────────────
         try:
             music_dur = int(pkg.get("music_duration_sec", scene.get("duration_sec", 15)))
-            music_dur = max(5, min(60, music_dur))   # ACE-Step: 5–60s sinnvoll
+            # ACE-Step minimum 30s for audible output — model is trained on longer sequences
+            music_dur = max(30, min(60, music_dur))
         except (TypeError, ValueError):
-            music_dur = min(scene.get("duration_sec", 15) + 2, 30)
-            warnings.append("music_duration_sec invalid → Scenen-Dauer+2")
+            music_dur = 30
+            warnings.append("music_duration_sec invalid → 30s minimum")
 
         # ── music_num_steps ───────────────────────────────────────────────────
         try:
@@ -2344,7 +2345,7 @@ class ProductionOrchestrator:
                 "tts_exaggeration":  0.5,
                 "music_tags":        ["cinematic", "orchestral", "instrumental", "dark", "atmospheric"],
                 "music_lang_marker": "[inst]",
-                "music_duration_sec": min(duration_sec + 2, 30),
+                "music_duration_sec": max(30, min(duration_sec + 2, 60)),
                 "music_num_steps":   30,
             }
 
@@ -2552,20 +2553,30 @@ class ProductionOrchestrator:
                     "inputs": {
                         "models":     ["1", 0],
                         "prompt":     music_prompt,
-                        "lyrics":     music_lang,   # [inst] = keine Vocals
-                        # parameters: Python dict as string — the node calls ast.literal_eval()
-                        # NOT json.dumps: ast.literal_eval requires Python syntax (True/False not true/false)
+                        "lyrics":     music_lang,   # [inst] = no vocals
+                        # parameters: Python dict as string — node calls ast.literal_eval() then **parameters
+                        # Exact parameter names verified from ace_step_nodes.py sample_data() function:
+                        # audio_duration, infer_step, guidance_scale, scheduler_type, cfg_type,
+                        # omega_scale, seed (→ manual_seeds internally), guidance_interval,
+                        # guidance_interval_decay, min_guidance_scale, use_erg_tag, use_erg_lyric,
+                        # use_erg_diffusion, oss_steps, guidance_scale_text, guidance_scale_lyric
                         "parameters": str({
-                            "duration":           float(music_dur),
-                            "steps":              int(music_steps),
-                            "guidance_scale":     7.0,
-                            "seed":               int(music_seed),
-                            "scheduler":          "euler",
-                            "cfg_type":           "apg",
-                            "omega_scale":        10.0,
-                            "use_erg_tag":        True,
-                            "use_erg_lyric":      False,
-                            "use_erg_diffusion":  True,
+                            "audio_duration":          float(music_dur),
+                            "infer_step":              int(music_steps),
+                            "guidance_scale":          7.0,
+                            "scheduler_type":          "euler",
+                            "cfg_type":                "apg",
+                            "omega_scale":             10.0,
+                            "manual_seeds":            int(music_seed),
+                            "guidance_interval":       1.0,
+                            "guidance_interval_decay": 0.0,
+                            "min_guidance_scale":      3,
+                            "use_erg_tag":             True,
+                            "use_erg_lyric":           False,
+                            "use_erg_diffusion":       True,
+                            "oss_steps":               "",
+                            "guidance_scale_text":     0.0,
+                            "guidance_scale_lyric":    0.0,
                         }),
                     }
                 },
@@ -2605,21 +2616,30 @@ class ProductionOrchestrator:
         cmd = ["ffmpeg", "-y", "-i", video_path]
 
         if narration_path and music_path:
-            # Narration (laut) + Musik (leise im Hintergrund) mischen
+            # Narration (full volume) + music (background) with loudness normalization
+            # loudnorm ensures music is audible even if ACE-Step output is quiet
             cmd += [
                 "-i", narration_path,
                 "-i", music_path,
                 "-filter_complex",
-                f"[1:a]volume=1.0[narr];"           # Narration voll
-                f"[2:a]volume=0.25[mus];"            # Musik 25% Lautstaerke
-                f"[narr][mus]amix=inputs=2:duration=shortest[aout]",
+                "[1:a]loudnorm=I=-16:TP=-1.5:LRA=11[narr];"   # Normalize narration
+                "[2:a]loudnorm=I=-23:TP=-1.5:LRA=11,volume=0.4[mus];"  # Normalize + reduce music
+                "[narr][mus]amix=inputs=2:duration=shortest:normalize=0[aout]",
                 "-map", "0:v",
                 "-map", "[aout]",
             ]
         elif narration_path:
-            cmd += ["-i", narration_path, "-map", "0:v", "-map", "1:a"]
+            cmd += [
+                "-i", narration_path,
+                "-filter_complex", "[1:a]loudnorm=I=-16:TP=-1.5:LRA=11[aout]",
+                "-map", "0:v", "-map", "[aout]",
+            ]
         elif music_path:
-            cmd += ["-i", music_path, "-map", "0:v", "-map", "1:a"]
+            cmd += [
+                "-i", music_path,
+                "-filter_complex", "[1:a]loudnorm=I=-16:TP=-1.5:LRA=11[aout]",
+                "-map", "0:v", "-map", "[aout]",
+            ]
 
         cmd += [
             "-c:v", "copy",           # Video nicht neu encoden
