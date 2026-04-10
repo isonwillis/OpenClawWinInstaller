@@ -2495,19 +2495,23 @@ class ProductionOrchestrator:
                 "2": {
                     "class_type": "ACEStepGen",
                     "inputs": {
-                        "models":                ["1", 0],
-                        "prompt":                music_prompt,
-                        "lyrics":                music_lang,   # [inst] = keine Vocals
-                        "duration":              float(music_dur),
-                        "steps":                 music_steps,
-                        "guidance_scale":        7.0,
-                        "seed":                  music_seed,
-                        "scheduler":             "euler",
-                        "cfg_type":              "apg",
-                        "omega_scale":           10.0,
-                        "use_erg_tag":           True,
-                        "use_erg_lyric":         False,
-                        "use_erg_diffusion":     True,
+                        "models":     ["1", 0],
+                        "prompt":     music_prompt,
+                        "lyrics":     music_lang,   # [inst] = keine Vocals
+                        # parameters: JSON-String mit allen Generierungs-Parametern
+                        # Die Node-Version (billwuhao) braucht dieses Feld zwingend
+                        "parameters": json.dumps({
+                            "duration":           float(music_dur),
+                            "steps":              music_steps,
+                            "guidance_scale":     7.0,
+                            "seed":               music_seed,
+                            "scheduler":          "euler",
+                            "cfg_type":           "apg",
+                            "omega_scale":        10.0,
+                            "use_erg_tag":        True,
+                            "use_erg_lyric":      False,
+                            "use_erg_diffusion":  True,
+                        }),
                     }
                 },
                 "3": {
@@ -2518,7 +2522,7 @@ class ProductionOrchestrator:
                     }
                 }
             }
-            # max_wait: music_dur * 200s Puffer (30s Musik ~ 2000s Rechenzeit auf RTX 3050)
+            # max_wait: music_dur * 120s Puffer
             music_max_wait = max(3600, music_dur * 120)
             music_outputs = _submit_and_wait(music_workflow, "ACE-Step Musik", max_wait=music_max_wait)
         if music_outputs:
