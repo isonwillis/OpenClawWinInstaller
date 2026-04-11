@@ -752,15 +752,18 @@ class ProductionOrchestrator:
     """
 
     def __init__(self, storage_root: str, workers: list = None,
-                 log_cb=None, dry_run: bool = False, refresh_cb=None):
+                 log_cb=None, dry_run: bool = False, refresh_cb=None,
+                 force_video_model: str = "14b"):
         """
         Args:
-            storage_root: Base directory for all production assets.
-            workers:      Agent list from workers.json (API keys included).
-                          If None, tries to load from ~/.openclaw/workers.json.
-            log_cb:       Callable(msg, level) for log output.
-            dry_run:      If True, simulate API calls without real HTTP.
-            refresh_cb:   Optional callable fired after each scene to refresh GUI.
+            storage_root:       Base directory for all production assets.
+            workers:            Agent list from workers.json (API keys included).
+                                If None, tries to load from ~/.openclaw/workers.json.
+            log_cb:             Callable(msg, level) for log output.
+            dry_run:            If True, simulate API calls without real HTTP.
+            refresh_cb:         Optional callable fired after each scene to refresh GUI.
+            force_video_model:  '14b' to force 14B GGUF, '1.3b' to force 1.3B.
+                                Default '14b' — auto-detected from models/unet/.
         """
         self.storage_root = storage_root
         # Load workers from file if not provided
@@ -776,6 +779,7 @@ class ProductionOrchestrator:
         self._log_cb    = log_cb or (lambda m, l="INFO": print(f"[{l}] {m}"))
         self._refresh_cb = refresh_cb
         self.dry_run          = dry_run
+        self.force_video_model = force_video_model.lower()  # '14b' or '1.3b'
         self._status          = {}
         self._lock            = threading.Lock()
         self._stop            = threading.Event()
@@ -1748,6 +1752,14 @@ class ProductionOrchestrator:
             use_14b_gguf = bool(model_candidates_14b_gguf)
             use_14b_diff = bool(model_candidates_14b_diff) and not use_14b_gguf
 
+            # Override with GUI selection if set
+            if self.force_video_model == "1.3b":
+                use_14b_gguf = False
+                use_14b_diff = False
+                self.log("[ComfyUI] Video model override: 1.3B (selected in GUI)", "INFO")
+            elif self.force_video_model == "14b" and not (use_14b_gguf or use_14b_diff):
+                self.log("[ComfyUI] Video model override: 14B requested but not found — using 1.3B", "WARNING")
+
             self.log(f"[ComfyUI] Model scan — unet/: {model_candidates_14b_gguf} | diff/: {model_candidates_14b_diff}", "INFO")
 
             # Verify UnetLoaderGGUF is available in ComfyUI before using it
@@ -2204,35 +2216,55 @@ class ProductionOrchestrator:
             comfyui_env["TQDM_MININTERVAL"]          = "999"
             comfyui_env["COMFYUI_NO_PROGRESS"]       = "1"
 
-            # Write tqdm patch to a sitecustomize.py in the venv so it loads
-            # before any other code — this is the only reliable way to intercept
-            # tqdm before ComfyUI-Manager patches stderr.
+            # Write tqdm pipe-safe patch — THREE locations for maximum reliability:
+            # 1. sitecustomize.py  — loaded before any user code
+            # 2. usercustomize.py  — loaded after sitecustomize, catches late patchers
+            # 3. tqdm_patch.pth    — .pth files are executed at Python startup via site.py
+            _tqdm_patch_body = """\
+# tqdm pipe-safe patch — injected by IsonCodexProducer
+try:
+    import tqdm.std as _ts
+    def _safe_fp_write(fp, s):
+        try:
+            if hasattr(fp, 'write'): fp.write(str(s))
+            try:
+                if hasattr(fp, 'flush'): fp.flush()
+            except (OSError, AttributeError): pass
+        except (OSError, AttributeError): pass
+    _ts.std_tqdm.fp_write = staticmethod(_safe_fp_write)
+    # Also patch the module-level fp_write used by older tqdm versions
+    import tqdm.utils as _tu
+    _tu.SimpleTextIOWrapper  # ensure module loaded
+except Exception:
+    pass
+"""
             venv_site = os.path.join(comfyui_dir, "venv", "Lib", "site-packages")
             if os.path.isdir(venv_site):
-                patch_path = os.path.join(venv_site, "sitecustomize.py")
+                for _fname in ("sitecustomize.py", "usercustomize.py"):
+                    _patch_path = os.path.join(venv_site, _fname)
+                    try:
+                        _existing = open(_patch_path, "r", encoding="utf-8").read() \
+                                    if os.path.isfile(_patch_path) else ""
+                        if "_safe_fp_write" not in _existing:
+                            with open(_patch_path, "a", encoding="utf-8") as _pf:
+                                _pf.write("\n" + _tqdm_patch_body)
+                    except Exception:
+                        pass
+                # .pth file: execute= prefix runs code at startup (Python 3.11+)
+                # For older Python, we use a import-trick via a stub module
+                _pth_path = os.path.join(venv_site, "tqdm_lyra_patch.pth")
                 try:
-                    # Only write if not already patched
-                    existing = ""
-                    if os.path.isfile(patch_path):
-                        with open(patch_path, "r", encoding="utf-8") as _f:
-                            existing = _f.read()
-                    if "_safe_fp_write" not in existing:
-                        with open(patch_path, "a", encoding="utf-8") as _f:
-                            _f.write("\n# tqdm pipe-safe patch — injected by IsonCodexProducer\n")
-                            _f.write("try:\n")
-                            _f.write("    import tqdm.std as _ts\n")
-                            _f.write("    def _safe_fp_write(fp, s):\n")
-                            _f.write("        try:\n")
-                            _f.write("            if hasattr(fp, 'write'): fp.write(str(s))\n")
-                            _f.write("            try:\n")
-                            _f.write("                if hasattr(fp, 'flush'): fp.flush()\n")
-                            _f.write("            except (OSError, AttributeError): pass\n")
-                            _f.write("        except (OSError, AttributeError): pass\n")
-                            _f.write("    _ts.std_tqdm.fp_write = staticmethod(_safe_fp_write)\n")
-                            _f.write("except Exception: pass\n")
-                        self.log("[ComfyUI] tqdm pipe-safe patch written to sitecustomize.py ✓", "INFO")
-                except Exception as _pe:
-                    self.log(f"[ComfyUI] sitecustomize patch write failed (non-critical): {_pe}", "WARNING")
+                    if not os.path.isfile(_pth_path):
+                        # Write stub module
+                        _stub_path = os.path.join(venv_site, "_tqdm_lyra_patch.py")
+                        with open(_stub_path, "w", encoding="utf-8") as _sf:
+                            _sf.write(_tqdm_patch_body)
+                        # .pth imports stub at startup
+                        with open(_pth_path, "w", encoding="utf-8") as _pf:
+                            _pf.write("import _tqdm_lyra_patch\n")
+                except Exception:
+                    pass
+                self.log("[ComfyUI] tqdm pipe-safe patch written to sitecustomize + usercustomize + .pth ✓", "INFO")
 
             proc = subprocess.Popen(
                 cmd,
@@ -2788,7 +2820,9 @@ class ProductionOrchestrator:
         self.log(f"{TAG} ComfyUI ready. Building workflow...", "INFO")
 
         # ── 2. Workflow bauen ─────────────────────────────────────────────────
-        workflow = self._build_comfyui_workflow(prompt, duration_sec, out_dir, sid)
+        # Clip 1 always gets the establishing wide shot prefix
+        _clip1_prompt = f"Cinematic establishing wide shot, {prompt}"
+        workflow = self._build_comfyui_workflow(_clip1_prompt, duration_sec, out_dir, sid)
 
         # ── 3. ComfyUI Queue leeren (nur hängende/pending Jobs, NICHT laufende) ─
         # IMPORTANT: Never send /interrupt — it would abort a running render.
@@ -2947,23 +2981,37 @@ class ProductionOrchestrator:
 
                     # ── Multi-Clip: weitere Clips rendern falls Scene > 5.1s ────
                     MAX_CLIP_SEC   = 5.1
-                    # Hard cap: max 6 clips regardless of scene duration.
-                    # For very long scenes (60-90s), we render 6 clips (~30s total)
-                    # and use FFmpeg to loop/extend to the target duration.
                     MAX_CLIPS      = 6
                     num_clips_raw  = max(1, int(duration_sec / MAX_CLIP_SEC + 0.5))
                     num_clips_needed = min(num_clips_raw, MAX_CLIPS)
-                    use_loop       = num_clips_raw > MAX_CLIPS  # need to loop to reach target duration
+                    use_loop       = num_clips_raw > MAX_CLIPS
+
+                    # Camera direction prefixes per clip — creates visual variety.
+                    # Each clip gets a different shot type so renders don't look identical.
+                    _CLIP_SHOTS = [
+                        "Cinematic establishing wide shot,",           # Clip 1
+                        "Medium shot, different angle,",               # Clip 2
+                        "Close-up detail shot,",                       # Clip 3
+                        "Low angle dramatic shot,",                    # Clip 4
+                        "Over-the-shoulder perspective shot,",         # Clip 5
+                        "Wide panoramic shot, slow camera movement,",  # Clip 6
+                    ]
+
+                    def _clip_prompt(base_prompt: str, idx: int) -> str:
+                        """Returns prompt with clip-specific camera direction prepended."""
+                        shot = _CLIP_SHOTS[(idx - 1) % len(_CLIP_SHOTS)]
+                        return f"{shot} {base_prompt}"
 
                     if num_clips_needed > 1 and os.path.isfile(clip_path):
                         self.log(f"{TAG} 📽️  {num_clips_needed} clips needed for {duration_sec}s — rendering more...", "INFO")
                         all_clips = [clip_path]
 
                         def _render_extra_clip(clip_idx: int) -> str | None:
-                            """Renders an additional clip and returns its path."""
-                            sid_n  = f"{sid}_c{clip_idx}"
-                            wf_n   = self._build_comfyui_workflow(prompt, duration_sec, out_dir, sid_n)
-                            # Seed variieren damit Clips visuell variieren
+                            """Renders an additional clip with clip-specific camera direction."""
+                            sid_n        = f"{sid}_c{clip_idx}"
+                            clip_prompt  = _clip_prompt(prompt, clip_idx)
+                            wf_n         = self._build_comfyui_workflow(clip_prompt, duration_sec, out_dir, sid_n)
+                            # Vary seed per clip for visual diversity
                             if "7" in wf_n and "inputs" in wf_n.get("7", {}):
                                 wf_n["7"]["inputs"]["seed"] = 42 + clip_idx * 1337
 
@@ -3787,8 +3835,7 @@ class ProductionOrchestrator:
         _pip(["install", "sqlalchemy>=2.0", "--upgrade", "--no-cache-dir"], timeout=120)
 
         # ── Write tqdm pipe-safe patch to sitecustomize.py ────────────────────
-        # This must happen in the installer (not just at ComfyUI start) so that
-        # a freshly created venv already has the patch before first launch.
+        # Written during install so fresh venv already has the patch before first launch.
         _tqdm_patch = (
             "\n# tqdm pipe-safe patch — injected by IsonCodexProducer\n"
             "try:\n"
@@ -3804,19 +3851,32 @@ class ProductionOrchestrator:
             "except Exception: pass\n"
         )
         for _site_dir in [
-            os.path.join(venv_dir, "Lib", "site-packages"),           # fresh venv
-            os.path.join(venv_dir, "lib", "site-packages"),           # Linux/Mac
+            os.path.join(venv_dir, "Lib", "site-packages"),
+            os.path.join(venv_dir, "lib", "site-packages"),
         ]:
             if os.path.isdir(_site_dir):
-                _sc_path = os.path.join(_site_dir, "sitecustomize.py")
+                for _sc_name in ("sitecustomize.py", "usercustomize.py"):
+                    _sc_path = os.path.join(_site_dir, _sc_name)
+                    try:
+                        _existing = open(_sc_path, "r", encoding="utf-8").read() \
+                                    if os.path.isfile(_sc_path) else ""
+                        if "_safe_fp_write" not in _existing:
+                            with open(_sc_path, "a", encoding="utf-8") as _sc:
+                                _sc.write(_tqdm_patch)
+                    except Exception as _sce:
+                        log(f"  tqdm {_sc_name} patch failed: {_sce}", "WARNING")
+                # Also write stub module + .pth for belt-and-suspenders
                 try:
-                    _existing = open(_sc_path, "r", encoding="utf-8").read() if os.path.isfile(_sc_path) else ""
-                    if "_safe_fp_write" not in _existing:
-                        with open(_sc_path, "a", encoding="utf-8") as _sc:
-                            _sc.write(_tqdm_patch)
-                        log("  tqdm sitecustomize.py patch written ✓", "SUCCESS")
-                except Exception as _sce:
-                    log(f"  tqdm sitecustomize.py patch failed: {_sce}", "WARNING")
+                    _stub = os.path.join(_site_dir, "_tqdm_lyra_patch.py")
+                    _pth  = os.path.join(_site_dir, "tqdm_lyra_patch.pth")
+                    if not os.path.isfile(_pth):
+                        with open(_stub, "w", encoding="utf-8") as _sf:
+                            _sf.write(_tqdm_patch)
+                        with open(_pth, "w", encoding="utf-8") as _pf:
+                            _pf.write("import _tqdm_lyra_patch\n")
+                except Exception:
+                    pass
+                log("  tqdm sitecustomize + usercustomize + .pth patch written ✓", "SUCCESS")
 
         # ── Verify torch CUDA after requirements.txt ──────────────────────────
         # requirements.txt may overwrite torch. Always verify afterwards and
@@ -5400,8 +5460,28 @@ class ProducerApp(tk.Tk):
         # Options
         r3 = tk.Frame(frame, bg=COLORS["panel"])
         r3.pack(fill="x", pady=(4, 8), padx=8)
+
+        # Video model selector
+        r_model = tk.Frame(r3, bg=COLORS["panel"])
+        r_model.pack(fill="x", pady=(0, 6))
+        tk.Label(r_model, text="Video Model:",
+                 font=FONT_UI, fg=COLORS["text"],
+                 bg=COLORS["panel"], width=18, anchor="w").pack(side="left")
+        self._video_model_var = tk.StringVar(value="14B GGUF (Q4_K_M) — High Quality, ~92min/clip")
+        self._video_model_cb  = ttk.Combobox(
+            r_model, textvariable=self._video_model_var,
+            state="readonly", width=44)
+        self._video_model_cb["values"] = [
+            "14B GGUF (Q4_K_M) — High Quality, ~92min/clip",
+            "1.3B bf16 — Fast, ~15min/clip",
+        ]
+        self._video_model_cb.pack(side="left", padx=4)
+
+        # Dry run checkbox
+        r_dry = tk.Frame(r3, bg=COLORS["panel"])
+        r_dry.pack(fill="x")
         self._dry_run_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(r3, text="Dry Run (prompt files only, NO DeepSeek, no real API calls)",
+        tk.Checkbutton(r_dry, text="Dry Run (prompt files only, NO DeepSeek, no real API calls)",
                        variable=self._dry_run_var, font=FONT_UI,
                        fg=COLORS["text"], bg=COLORS["panel"],
                        selectcolor=COLORS["input"], activebackground=COLORS["panel"]
@@ -5993,12 +6073,18 @@ class ProducerApp(tk.Tk):
 
     def _make_orchestrator(self) -> ProductionOrchestrator:
         """Creates and returns a fresh ProductionOrchestrator using API keys from workers.json."""
+        # Read video model selection from dropdown
+        model_sel = getattr(self, "_video_model_var", None)
+        force_14b = True  # default to 14B if dropdown not yet built
+        if model_sel:
+            force_14b = "1.3B" not in model_sel.get()
         return ProductionOrchestrator(
-            storage_root = os.path.normpath(self._storage_var.get().strip()),
-            workers      = self._loaded_workers,
-            log_cb       = self._log,
-            dry_run      = self._dry_run_var.get(),
-            refresh_cb   = lambda: self.after(0, self._refresh_scene_list),
+            storage_root      = os.path.normpath(self._storage_var.get().strip()),
+            workers           = self._loaded_workers,
+            log_cb            = self._log,
+            dry_run           = self._dry_run_var.get(),
+            refresh_cb        = lambda: self.after(0, self._refresh_scene_list),
+            force_video_model = "1.3b" if not force_14b else "14b",
         )
 
     def _populate_llm_import_dropdown(self):
