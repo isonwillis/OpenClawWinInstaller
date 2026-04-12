@@ -753,17 +753,17 @@ class ProductionOrchestrator:
 
     def __init__(self, storage_root: str, workers: list = None,
                  log_cb=None, dry_run: bool = False, refresh_cb=None,
-                 force_video_model: str = "14b", max_clip_sec: float = 10.0):
+                 force_video_model: str = "14b"):
         """
         Args:
             storage_root:       Base directory for all production assets.
-            workers:            Agent list from workers.json.
+            workers:            Agent list from workers.json (API keys included).
+                                If None, tries to load from ~/.openclaw/workers.json.
             log_cb:             Callable(msg, level) for log output.
-            dry_run:            If True, simulate without real API calls.
-            refresh_cb:         Optional callable fired after each scene.
-            force_video_model:  '14b' or '1.3b' — overrides auto-detection.
-            max_clip_sec:       Max seconds per single WAN render clip (VRAM limit).
-                                Scene is split into ceil(duration/max_clip_sec) clips.
+            dry_run:            If True, simulate API calls without real HTTP.
+            refresh_cb:         Optional callable fired after each scene to refresh GUI.
+            force_video_model:  '14b' to force 14B GGUF, '1.3b' to force 1.3B.
+                                Default '14b' — auto-detected from models/unet/.
         """
         self.storage_root = storage_root
         # Load workers from file if not provided
@@ -780,7 +780,6 @@ class ProductionOrchestrator:
         self._refresh_cb = refresh_cb
         self.dry_run          = dry_run
         self.force_video_model = force_video_model.lower()  # '14b' or '1.3b'
-        self.max_clip_sec      = float(max_clip_sec)        # max seconds per WAN render clip
         self._status          = {}
         self._lock            = threading.Lock()
         self._stop            = threading.Event()
@@ -1776,33 +1775,39 @@ class ProductionOrchestrator:
                     use_14b_gguf = False
 
             fps = 16
-            # Dynamic clip duration from GUI "Max clip" field.
-            # User sets max seconds per clip — code splits scene into N clips.
-            # WAN requires frames in form 4k+1: 17, 21, 25, ...
-            width, height = 848, 480
-            model_label   = "14B" if (use_14b_gguf or use_14b_diff) else "1.3B"
+            # Frame limits depend on model + offloading strategy:
+            # 1.3B @ 6GB VRAM only:   max 81 frames (5.1s) @ 480p
+            # 14B GGUF + CPU offload: max 81 frames per job (VRAM holds active layers only)
+            #   → quality is much higher, same render time constraint
+            # Resolution tradeoff: lower res = more frames possible
+            #   848×480 (16:9) = max 81 frames on 6GB
+            #   480×480 (1:1)  = up to 121 frames possible on 6GB
+            if use_14b_gguf or use_14b_diff:
+                MAX_WAN_FRAMES = 81   # Same VRAM constraint, but quality is far superior
+                width, height  = 848, 480
+            else:
+                MAX_WAN_FRAMES = 81
+                width, height  = 848, 480
 
-            # Snap max_clip_sec to valid 4k+1 frame count
-            max_clip_frames = max(17, int(self.max_clip_sec * fps))
-            max_clip_frames = ((max_clip_frames - 1) // 4) * 4 + 1
-            clip_secs       = max_clip_frames / fps
-
-            # Total frames for full scene — split into clips of max_clip_frames
-            total_frames    = int(duration_sec * fps)
-            num_clips_total = max(1, -(-total_frames // max_clip_frames))  # ceiling div
-            num_frames      = max_clip_frames  # frames per individual clip render
-
-            if num_clips_total > 1:
+            raw_frames = duration_sec * fps
+            wan_frames = max(17, min(MAX_WAN_FRAMES, int(raw_frames)))
+            # WAN requires frames in form 4k+1: 17, 21, 25, ..., 81
+            wan_frames = ((wan_frames - 1) // 4) * 4 + 1
+            num_frames = wan_frames
+            actual_secs = num_frames / fps
+            model_label = "14B" if (use_14b_gguf or use_14b_diff) else "1.3B"
+            if actual_secs < duration_sec - 1:
+                clips_raw    = max(1, int(duration_sec / actual_secs + 0.5))
+                clips_capped = min(clips_raw, 6)
+                loop_note    = f" (capped at {clips_capped}, remainder looped)" if clips_raw > 6 else ""
                 self.log(
-                    f"[ComfyUI] Scene {duration_sec}s → {clip_secs:.1f}s/clip "
-                    f"({max_clip_frames}f @ {fps}fps) × {num_clips_total} clips [{model_label}]",
-                    "INFO"
+                    f"[ComfyUI] ⚠️  Scene {duration_sec}s → WAN {model_label} limit: {actual_secs:.1f}s "
+                    f"({num_frames} Frames @ {fps}fps). "
+                    f"{clips_capped} clips will be rendered{loop_note}.",
+                    "WARNING"
                 )
             else:
-                self.log(
-                    f"[ComfyUI] Frames: {num_frames} @ {fps}fps = {clip_secs:.1f}s [{model_label}]",
-                    "INFO"
-                )
+                self.log(f"[ComfyUI] Frames: {num_frames} @ {fps}fps = {actual_secs:.1f}s [{model_label}]", "INFO")
 
             if use_14b_gguf:
                 diffusion_model = sorted(model_candidates_14b_gguf)[0]
@@ -2815,7 +2820,9 @@ except Exception:
         self.log(f"{TAG} ComfyUI ready. Building workflow...", "INFO")
 
         # ── 2. Workflow bauen ─────────────────────────────────────────────────
-        workflow = self._build_comfyui_workflow(prompt, duration_sec, out_dir, sid)
+        # Clip 1 always gets the establishing wide shot prefix
+        _clip1_prompt = f"Cinematic establishing wide shot, {prompt}"
+        workflow = self._build_comfyui_workflow(_clip1_prompt, duration_sec, out_dir, sid)
 
         # ── 3. ComfyUI Queue leeren (nur hängende/pending Jobs, NICHT laufende) ─
         # IMPORTANT: Never send /interrupt — it would abort a running render.
@@ -2970,33 +2977,45 @@ except Exception:
                 try:
                     import shutil as _shc
                     _shc.copy2(src_path, clip_path)
-                    self.log(f"{TAG} ✅ Clip 1 copied: {clip_path}", "SUCCESS")
+                    self.log(f"{TAG} ✅ Video copied: {clip_path}", "SUCCESS")
 
-                    # ── Multi-Clip: render remaining clips if scene > clip_secs ──
+                    # ── Multi-Clip: weitere Clips rendern falls Scene > 5.1s ────
+                    MAX_CLIP_SEC   = 5.1
+                    MAX_CLIPS      = 6
+                    num_clips_raw  = max(1, int(duration_sec / MAX_CLIP_SEC + 0.5))
+                    num_clips_needed = min(num_clips_raw, MAX_CLIPS)
+                    use_loop       = num_clips_raw > MAX_CLIPS
+
+                    # Camera direction prefixes per clip — creates visual variety.
+                    # Each clip gets a different shot type so renders don't look identical.
                     _CLIP_SHOTS = [
-                        "Cinematic establishing wide shot,",
-                        "Medium shot, different angle,",
-                        "Close-up detail shot,",
-                        "Low angle dramatic shot,",
-                        "Over-the-shoulder perspective shot,",
-                        "Wide panoramic shot, slow camera movement,",
+                        "Cinematic establishing wide shot,",           # Clip 1
+                        "Medium shot, different angle,",               # Clip 2
+                        "Close-up detail shot,",                       # Clip 3
+                        "Low angle dramatic shot,",                    # Clip 4
+                        "Over-the-shoulder perspective shot,",         # Clip 5
+                        "Wide panoramic shot, slow camera movement,",  # Clip 6
                     ]
 
-                    def _clip_prompt(base: str, idx: int) -> str:
-                        """Prepends a clip-specific camera direction to the base prompt."""
-                        return f"{_CLIP_SHOTS[(idx-1) % len(_CLIP_SHOTS)]} {base}"
+                    def _clip_prompt(base_prompt: str, idx: int) -> str:
+                        """Returns prompt with clip-specific camera direction prepended."""
+                        shot = _CLIP_SHOTS[(idx - 1) % len(_CLIP_SHOTS)]
+                        return f"{shot} {base_prompt}"
 
-                    if num_clips_total > 1:
-                        self.log(f"{TAG} 📽️  Rendering {num_clips_total - 1} more clip(s)...", "INFO")
+                    if num_clips_needed > 1 and os.path.isfile(clip_path):
+                        self.log(f"{TAG} 📽️  {num_clips_needed} clips needed for {duration_sec}s — rendering more...", "INFO")
                         all_clips = [clip_path]
 
                         def _render_extra_clip(clip_idx: int) -> str | None:
-                            """Renders an additional clip with camera-direction prefix."""
-                            sid_n   = f"{sid}_c{clip_idx}"
-                            cp      = _clip_prompt(prompt, clip_idx)
-                            wf_n    = self._build_comfyui_workflow(cp, clip_secs, out_dir, sid_n)
+                            """Renders an additional clip with clip-specific camera direction."""
+                            sid_n        = f"{sid}_c{clip_idx}"
+                            clip_prompt  = _clip_prompt(prompt, clip_idx)
+                            wf_n         = self._build_comfyui_workflow(clip_prompt, duration_sec, out_dir, sid_n)
+                            # Vary seed per clip for visual diversity
                             if "7" in wf_n and "inputs" in wf_n.get("7", {}):
                                 wf_n["7"]["inputs"]["seed"] = 42 + clip_idx * 1337
+
+                            # POST /prompt
                             try:
                                 req_n = urllib.request.Request(
                                     f"{COMFYUI_URL}/prompt",
@@ -3009,77 +3028,101 @@ except Exception:
                             except Exception as pe:
                                 self.log(f"{TAG} Clip {clip_idx} POST failed: {pe}", "WARNING")
                                 return None
+
                             if not pid_n:
                                 return None
-                            self.log(f"{TAG} Clip {clip_idx} started — {pid_n[:8]}...", "INFO")
-                            deadline_n = time.time() + 43200
+                            self.log(f"{TAG} Clip {clip_idx} Job gestartet — {pid_n[:8]}...", "INFO")
+
+                            # Poll /history
+                            deadline_n = time.time() + 43200  # 12h per clip — no practical timeout
                             while time.time() < deadline_n:
                                 time.sleep(8)
                                 try:
-                                    with urllib.request.urlopen(
-                                        f"{COMFYUI_URL}/history/{pid_n}", timeout=15
-                                    ) as r:
+                                    with urllib.request.urlopen(f"{COMFYUI_URL}/history/{pid_n}", timeout=15) as r:
                                         hist_n = json.loads(r.read())
                                     if pid_n in hist_n:
                                         msgs_n = hist_n[pid_n].get("status", {}).get("messages", [])
                                         if any(m[0] == "execution_success" for m in msgs_n):
+                                            # Output finden
                                             outs_n = hist_n[pid_n].get("outputs", {})
                                             for nid, nout in outs_n.items():
                                                 for key in ("gifs", "videos", "images"):
-                                                    for item in nout.get(key, []):
-                                                        sp = os.path.join(comfyui_out, item.get("filename", ""))
+                                                    items = nout.get(key, [])
+                                                    if items:
+                                                        fn = items[0].get("filename", "")
+                                                        sp = os.path.join(comfyui_out, fn)
                                                         if os.path.isfile(sp):
                                                             dst_n = os.path.join(out_dir, f"clip_{clip_idx:03d}.mp4")
                                                             _shc.copy2(sp, dst_n)
                                                             self.log(f"{TAG} ✅ Clip {clip_idx} complete", "SUCCESS")
                                                             return dst_n
                                         if any(m[0] == "execution_error" for m in msgs_n):
-                                            self.log(f"{TAG} ⚠️  Clip {clip_idx} failed.", "WARNING")
+                                            self.log(f"{TAG} ⚠️  Clip {clip_idx} Fehler.", "WARNING")
                                             return None
                                 except Exception:
                                     pass
                             return None
 
-                        for clip_idx in range(2, num_clips_total + 1):
+                        for clip_idx in range(2, num_clips_needed + 1):
                             result_n = _render_extra_clip(clip_idx)
                             if result_n:
                                 all_clips.append(result_n)
                             else:
-                                self.log(f"{TAG} ⚠️  Clip {clip_idx} failed — stopping at {len(all_clips)}.", "WARNING")
+                                self.log(f"{TAG} ⚠️  Clip {clip_idx} failed — stopping at {len(all_clips)} clip(s).", "WARNING")
                                 break
 
-                        # FFmpeg concat all clips → final clip_001.mp4
+                        # FFmpeg concat — with optional loop to reach target duration
                         if len(all_clips) > 1:
-                            self.log(f"{TAG} 🔗 Merging {len(all_clips)} clips...", "INFO")
+                            rendered_sec = len(all_clips) * MAX_CLIP_SEC
+                            self.log(f"{TAG} 🔗 Merging {len(all_clips)} clips together ({rendered_sec:.0f}s)...", "INFO")
                             concat_list = os.path.join(out_dir, "_concat_list.txt")
-                            with open(concat_list, "w", encoding="utf-8") as f:
-                                for c in all_clips:
-                                    f.write(f"file '{c}'\n")
+
+                            # If we hit the MAX_CLIPS cap, loop the concat list to reach target duration
+                            if use_loop and rendered_sec < duration_sec:
+                                loops_needed = int(duration_sec / rendered_sec) + 1
+                                self.log(f"{TAG} 🔁 Looping {len(all_clips)} clips ×{loops_needed} to reach {duration_sec}s target...", "INFO")
+                                with open(concat_list, "w", encoding="utf-8") as f:
+                                    for _ in range(loops_needed):
+                                        for c in all_clips:
+                                            f.write(f"file '{c}'\n")
+                            else:
+                                with open(concat_list, "w", encoding="utf-8") as f:
+                                    for c in all_clips:
+                                        f.write(f"file '{c}'\n")
+
                             concat_out = os.path.join(out_dir, "_clip_concat.mp4")
                             import shutil as _shff
-                            ffmpeg_cc = _shff.which("ffmpeg") or ""
+                            ffmpeg_cc = _shff.which("ffmpeg")
                             if not ffmpeg_cc:
-                                _ff_local = os.path.normpath(os.path.join(
-                                    comfyui_out, "..", "venv", "Scripts", "ffmpeg.exe"))
+                                _ff_local = os.path.join(comfyui_out, "..", "venv", "Scripts", "ffmpeg.exe")
+                                _ff_local = os.path.normpath(_ff_local)
                                 if os.path.isfile(_ff_local):
                                     ffmpeg_cc = _ff_local
                             if ffmpeg_cc:
                                 try:
+                                    # Concat + trim to exact target duration
+                                    ffmpeg_cmd = [ffmpeg_cc, "-y", "-f", "concat", "-safe", "0",
+                                                  "-i", concat_list]
+                                    if use_loop:
+                                        # Trim to exact target duration
+                                        ffmpeg_cmd += ["-t", str(duration_sec)]
+                                    ffmpeg_cmd += ["-c", "copy", concat_out]
                                     subprocess.run(
-                                        [ffmpeg_cc, "-y", "-f", "concat", "-safe", "0",
-                                         "-i", concat_list, "-c", "copy", concat_out],
-                                        check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        ffmpeg_cmd,
+                                        check=True,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                         timeout=300,
                                         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                                     )
                                     if os.path.isfile(concat_out):
                                         import shutil as _shc2
                                         _shc2.copy2(concat_out, clip_path)
-                                        self.log(f"{TAG} ✅ {len(all_clips)} clips → {clip_path}", "SUCCESS")
+                                        final_dur = duration_sec if use_loop else rendered_sec
+                                        self.log(f"{TAG} ✅ {len(all_clips)} clips → {clip_path} ({final_dur:.0f}s)", "SUCCESS")
                                     else:
-                                        self.log(f"{TAG} ⚠️  Concat failed — using clip 1 only.", "WARNING")
+                                        self.log(f"{TAG} ⚠️  Concat output not created — using clip_001.", "WARNING")
                                 except Exception as fe:
-                                    self.log(f"{TAG} FFmpeg concat error: {fe}", "WARNING")
+                                    self.log(f"{TAG} FFmpeg concat failed: {fe}", "WARNING")
                             else:
                                 self.log(f"{TAG} ⚠️  FFmpeg not found — concat skipped.", "WARNING")
 
@@ -5418,7 +5461,7 @@ class ProducerApp(tk.Tk):
         r3 = tk.Frame(frame, bg=COLORS["panel"])
         r3.pack(fill="x", pady=(4, 8), padx=8)
 
-        # Video model selector + max clip duration
+        # Video model selector
         r_model = tk.Frame(r3, bg=COLORS["panel"])
         r_model.pack(fill="x", pady=(0, 6))
         tk.Label(r_model, text="Video Model:",
@@ -5433,19 +5476,6 @@ class ProducerApp(tk.Tk):
             "1.3B bf16 — Fast, ~15min/clip",
         ]
         self._video_model_cb.pack(side="left", padx=4)
-
-        tk.Label(r_model, text="Max clip:",
-                 font=FONT_UI, fg=COLORS["dim"],
-                 bg=COLORS["panel"]).pack(side="left", padx=(12, 2))
-        self._max_clip_sec_var = tk.StringVar(value="10")
-        _clip_entry = tk.Entry(r_model, textvariable=self._max_clip_sec_var,
-                               width=4, font=FONT_UI,
-                               bg=COLORS["input"], fg=COLORS["text"],
-                               insertbackground=COLORS["text"], relief="flat")
-        _clip_entry.pack(side="left")
-        tk.Label(r_model, text="s/clip",
-                 font=FONT_UI, fg=COLORS["dim"],
-                 bg=COLORS["panel"]).pack(side="left", padx=(2, 0))
 
         # Dry run checkbox
         r_dry = tk.Frame(r3, bg=COLORS["panel"])
@@ -6045,14 +6075,9 @@ class ProducerApp(tk.Tk):
         """Creates and returns a fresh ProductionOrchestrator using API keys from workers.json."""
         # Read video model selection from dropdown
         model_sel = getattr(self, "_video_model_var", None)
-        force_14b = True
+        force_14b = True  # default to 14B if dropdown not yet built
         if model_sel:
             force_14b = "1.3B" not in model_sel.get()
-        # Read max clip duration
-        try:
-            max_clip_sec = max(1.0, float(self._max_clip_sec_var.get()))
-        except Exception:
-            max_clip_sec = 5.0
         return ProductionOrchestrator(
             storage_root      = os.path.normpath(self._storage_var.get().strip()),
             workers           = self._loaded_workers,
@@ -6060,7 +6085,6 @@ class ProducerApp(tk.Tk):
             dry_run           = self._dry_run_var.get(),
             refresh_cb        = lambda: self.after(0, self._refresh_scene_list),
             force_video_model = "1.3b" if not force_14b else "14b",
-            max_clip_sec      = max_clip_sec,
         )
 
     def _populate_llm_import_dropdown(self):
