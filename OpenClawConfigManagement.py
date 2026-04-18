@@ -736,9 +736,110 @@ export default {
             with open(skill_path, "w", encoding="utf-8") as f:
                 f.write(skill_js)
             self.log(f"  [skill] delegate_to_worker.js written: {skill_path}  ✓", "SUCCESS")
+        except Exception as e:
+            self.log(f"  [skill] delegate_to_worker.js write failed: {e}", "WARNING")
+            return False
+
+        # DECISION #22 — call_observer.js: on-demand Claude Code Observer trigger.
+        # Lyra calls this skill when she cannot fix an error herself (3× LLM timeout,
+        # 3× tool failure, recurring [CORRECTION], SOUL.md contradiction, [SOUL-UPDATE-VORSCHLAG]).
+        # No background service — pure skill invocation. Written alongside delegate_to_worker.
+        observer_skill_path = os.path.join(skills_dir, "call_observer.js")
+        observer_skill_js = r"""// call_observer.js — LYRA v1
+// DECISION #22 (ClawBotInstaller): On-demand Claude Code Observer trigger.
+// Lyra calls this skill when she detects errors she cannot fix herself.
+// NO background service — pure on-demand. Registered by OpenClawConfigManagement.py.
+//
+// WANN aufrufen:
+//   1. LLM-Request schlug 3× fehl (Timeout, Body Timeout Error, exit status 2
+//      nach docker restart)
+//   2. Tool schlug 3× mit demselben Fehler fehl
+//   3. [CORRECTION]-Eintrag im Memory der sich wiederholt (gleicher Fehler an 2+
+//      verschiedenen Tagen)
+//   4. SOUL.md-Widerspruch erkannt (Regeln widersprechen sich)
+//   5. [SOUL-UPDATE-VORSCHLAG] in Memory geschrieben → Observer soll umsetzen
+//
+// NICHT aufrufen bei:
+//   - Einmaligen Fehlern die beim zweiten Versuch funktioniert haben
+//   - Worker-Fehlern (Junior nicht erreichbar → melden, nicht Observer starten)
+//   - Normalen User-Anfragen
+//
+// This skill file is re-written on every installer run (DECISION #5).
+
+export default {
+  name: "call_observer",
+  description: "Starts the Claude Code Observer when Lyra cannot fix an error herself. Call after 3 failed LLM requests, 3 identical tool failures, recurring [CORRECTION] entries, SOUL.md contradictions, or after writing [SOUL-UPDATE-VORSCHLAG]. Returns immediately — observer runs independently.",
+  parameters: {
+    type: "object",
+    properties: {
+      reason: {
+        type: "string",
+        description: "Why the observer is needed. Examples: 'LLM timeout after 3 retries', 'exit status 2 after docker restart', 'SOUL.md contradiction: rule A vs rule B', '[SOUL-UPDATE-VORSCHLAG] written in memory'"
+      }
+    },
+    required: ["reason"]
+  },
+  async run({ reason }) {
+    // Dynamic import of child_process (ESM-compatible, Node.js >= 14)
+    let execSync;
+    try {
+      const cp = await import('child_process');
+      execSync = cp.execSync;
+    } catch (_) {
+      return JSON.stringify({
+        status: "no_exec",
+        reason,
+        fallback: "Run manually: powershell -ExecutionPolicy Bypass -File \"C:\\Python\\Projects\\ClawBotInstaller\\lyra_observer.ps1\""
+      });
+    }
+
+    // Check if observer is already running
+    let alreadyRunning = false;
+    try {
+      const out = execSync(
+        'wmic process where "commandline like \'%lyra_observer%\'" get processid /value 2>nul',
+        { encoding: 'utf8', timeout: 5000 }
+      );
+      alreadyRunning = /ProcessId=\d+/.test(out);
+    } catch (_) {}
+
+    if (alreadyRunning) {
+      return JSON.stringify({
+        status: "already_running",
+        message: "Claude Code Observer is already active.",
+        reason
+      });
+    }
+
+    // Start observer in a new PowerShell window (detached, does not block Lyra)
+    const ps1 = "C:\\Python\\Projects\\ClawBotInstaller\\lyra_observer.ps1";
+    try {
+      execSync(
+        `powershell -Command "Start-Process powershell -ArgumentList '-ExecutionPolicy Bypass -File \\"${ps1}\\"' -WindowStyle Normal"`,
+        { timeout: 10000 }
+      );
+      return JSON.stringify({
+        status: "started",
+        reason,
+        message: "Claude Code Observer started in a new window. It will analyze the error and apply fixes independently."
+      });
+    } catch (e) {
+      return JSON.stringify({
+        status: "error",
+        error: e.message,
+        fallback: `Run manually: powershell -ExecutionPolicy Bypass -File "${ps1}"`
+      });
+    }
+  }
+};
+"""
+        try:
+            with open(observer_skill_path, "w", encoding="utf-8") as f:
+                f.write(observer_skill_js)
+            self.log(f"  [skill] call_observer.js written: {observer_skill_path}  ✓", "SUCCESS")
             return True
         except Exception as e:
-            self.log(f"  [skill] Write failed: {e}", "WARNING")
+            self.log(f"  [skill] call_observer.js write failed: {e}", "WARNING")
             return False
 
     def _write_tool_config_doc(self):
@@ -1172,11 +1273,14 @@ class OpenClawConfig:
                     f"    STATUS: Kein HTTP-Endpunkt — Erreichbarkeit via Prozesscheck.\n"
                     f"    PRÜFEN: exec → wmic process where \"name='powershell.exe'\" get CommandLine\n"
                     f"            'lyra_observer' im Output → läuft | nicht vorhanden → gestoppt\n"
-                    f"    STARTEN: exec → powershell -ExecutionPolicy Bypass -File \"C:\\Python\\Projects\\ClawBotInstaller\\lyra_observer.ps1\"\n"
-                    f"    STOPPEN: exec → powershell -ExecutionPolicy Bypass -File \"C:\\Python\\Projects\\ClawBotInstaller\\lyra_observer_stop.ps1\"\n"
-                    f"    NICHT: Online nach Repository suchen — Observer ist LOKAL: C:\\Python\\Projects\\ClawBotInstaller\\lyra_observer.ps1\n"
+                    f"    STARTEN VIA SKILL: call_observer(reason=\"<Fehlerbeschreibung>\")  \u2190 bevorzugt\n"
+                    f"    STARTEN VIA EXEC: exec \u2192 powershell -ExecutionPolicy Bypass -File \"C:\\Python\\Projects\\ClawBotInstaller\\lyra_observer.ps1\"\n"
+                    f"    STOPPEN: exec \u2192 powershell -ExecutionPolicy Bypass -File \"C:\\Python\\Projects\\ClawBotInstaller\\lyra_observer_stop.ps1\"\n"
+                    f"    NICHT: Online nach Repository suchen \u2014 Observer ist LOKAL: C:\\Python\\Projects\\ClawBotInstaller\\lyra_observer.ps1\n"
                     f"    NICHT: HTTP-Request versuchen (port=0, kein Server)\n"
-                    f"    NICHT: claude_code Tasks senden — Observer läuft eigenständig\n"
+                    f"    NICHT: claude_code Tasks senden \u2014 Observer l\u00e4uft eigenst\u00e4ndig\n"
+                    f"    WANN (Pflicht): 1) LLM 3\u00d7 Timeout/exit-status-2  2) Tool 3\u00d7 gleicher Fehler  "
+                    f"3) [CORRECTION] wiederholt  4) SOUL.md-Widerspruch  5) [SOUL-UPDATE-VORSCHLAG] geschrieben\n"
                 )
                 if rules:
                     for rule_line in rules.splitlines():
@@ -1616,6 +1720,11 @@ class OpenClawConfig:
                     # Default 20000 truncates SOUL.md in Lyra's context (confirmed 2026-03-20).
                     # resolveBootstrapMaxChars() in auth-profiles-iXW75sRj.js reads this field.
                     "bootstrapMaxChars": 40000,
+                    # DECISION #21 — bootstrapTotalMaxChars set to 150000
+                    # Default 60000 (hardcoded in pi-embedded-helpers) exhausted before BOOTSTRAP.md
+                    # and MEMORY.md are injected (SOUL.md 34846 + AGENTS.md 7874 + others consume budget).
+                    # 150000 covers all workspace files in full and allows MEMORY.md to grow to 10000 chars.
+                    "bootstrapTotalMaxChars": 150000,
                     # DECISION #17 — compaction.mode=safeguard, maxHistoryShare=0.7
                     # Without this, sessions grow past 200K tokens → VRAM crash on gateway restart.
                     # Threshold = maxHistoryShare × model_context_tokens.
@@ -1834,7 +1943,8 @@ class OpenClawConfig:
         preload_path = os.path.join(cfg_dir, "undici-timeout-preload.cjs")
         preload_content = (
             "// undici-timeout-preload.cjs\n"
-            "// DECISION #20: Fix OpenClaw/undici hardcoded 300s headersTimeout.\n"
+            "// DECISION #20: Fix OpenClaw/undici hardcoded 300s bodyTimeout.\n"
+            "// v2: Also patches Agent + Pool constructors (openclaw 2026.4.15 bypasses global dispatcher).\n"
             "// Reads timeoutSeconds from openclaw.json — stays in sync with GUI setting.\n"
             "// Written by OpenClawWinInstaller patch_gateway_cmd() — do not edit.\n"
             "'use strict';\n"
@@ -1850,7 +1960,7 @@ class OpenClawConfig:
             "    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));\n"
             "    const sec = cfg?.agents?.defaults?.timeoutSeconds;\n"
             "    if (typeof sec === 'number' && sec > 0) {\n"
-            "      return sec * 1000; // convert to ms, add 60s buffer\n"
+            "      return sec * 1000;\n"
             "    }\n"
             "  } catch (_) {}\n"
             "  return 2 * 60 * 60 * 1000; // fallback: 2h\n"
@@ -1885,12 +1995,37 @@ class OpenClawConfig:
             "    process.stderr.write('[undici-preload] undici not found — skipping patch\\n');\n"
             "  } else {\n"
             "    const timeoutMs = readTimeoutMs();\n"
-            "    const { EnvHttpProxyAgent } = undici;\n"
             "    const OPTS = { headersTimeout: timeoutMs, bodyTimeout: 0 };\n"
+            "\n"
+            "    // Patch 1: global dispatcher — covers fetch() without explicit dispatcher\n"
+            "    const { EnvHttpProxyAgent } = undici;\n"
             "    const realSet = undici.setGlobalDispatcher.bind(undici);\n"
             "    function enforce() { realSet(new EnvHttpProxyAgent(OPTS)); }\n"
             "    enforce();\n"
             "    undici.setGlobalDispatcher = function () { enforce(); };\n"
+            "\n"
+            "    // Patch 2: Agent constructor — covers new Agent() with explicit dispatcher (openclaw 2026.4.15+)\n"
+            "    if (undici.Agent) {\n"
+            "      const _Agent = undici.Agent;\n"
+            "      class PatchedAgent extends _Agent {\n"
+            "        constructor(opts = {}) {\n"
+            "          super({ ...opts, bodyTimeout: 0, headersTimeout: Math.max(opts.headersTimeout || 0, timeoutMs) });\n"
+            "        }\n"
+            "      }\n"
+            "      undici.Agent = PatchedAgent;\n"
+            "    }\n"
+            "\n"
+            "    // Patch 3: Pool constructor — covers connection pools (HTTP/2 keep-alive paths)\n"
+            "    if (undici.Pool) {\n"
+            "      const _Pool = undici.Pool;\n"
+            "      class PatchedPool extends _Pool {\n"
+            "        constructor(origin, opts = {}) {\n"
+            "          super(origin, { ...opts, bodyTimeout: 0, headersTimeout: Math.max(opts.headersTimeout || 0, timeoutMs) });\n"
+            "        }\n"
+            "      }\n"
+            "      undici.Pool = PatchedPool;\n"
+            "    }\n"
+            "\n"
             "    // patch applied silently (two processes inherit NODE_OPTIONS → no duplicate output)\n"
             "  }\n"
             "} catch (e) {\n"
@@ -2671,9 +2806,9 @@ f"REGEL: Wenn {primary_short} 3x hintereinander Timeout → Fallback-Modell wäh
 "     Ergänzung: <konkrete Regel in 1-3 Sätzen>\n"
 "     Grund: <warum diese Regel fehlt>\n"
 "\n"
-"Der Claude Code Observer (FileSystemWatcher, 30s-Poll) erkennt den Tag automatisch.\n"
-"Nach 5-Minuten-Debounce startet Claude Code und führt die Verbesserung in beiden\n"
-"Tracks aus (SOUL.md + OpenClawConfigManagement.py) — kein Eingriff des Menschen nötig.\n"
+"Danach: call_observer(reason=\"[SOUL-UPDATE-VORSCHLAG] geschrieben: <Sektion>\") aufrufen.\n"
+"Der Observer startet in einem neuen Fenster und setzt die Verbesserung in beiden\n"
+"Tracks um (SOUL.md + OpenClawConfigManagement.py) — kein Eingriff des Menschen nötig.\n"
 "LYRA schlägt vor — Claude Code setzt um.\n"
 "\n"
 "### Wann ein [CONTEXT]-Eintrag geschrieben wird\n"
@@ -2728,7 +2863,7 @@ f"REGEL: Wenn {primary_short} 3x hintereinander Timeout → Fallback-Modell wäh
 "Hat sich gezeigt dass eine SOUL.md-Regel fehlt oder widerspr\u00fcchlich ist?\n"
 "\n"
 "→ JA: [SOUL-UPDATE-VORSCHLAG] in memory/YYYY-MM-DD.md schreiben.\n"
-"     Claude Code Observer reagiert automatisch (5-Min-Debounce).\n"
+"     dann: call_observer(reason=\"[SOUL-UPDATE-VORSCHLAG]: <Sektion>\") aufrufen.\n"
 "→ NEIN: Nichts schreiben.\n"
 "\n"
 "### Schritt 3 — Kontext-Persistenz-Check\n"

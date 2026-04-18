@@ -1,7 +1,7 @@
 # OpenClawWinInstaller
 
-> **Status: v1.0.4 — PRODUCTION READY** · 2026-04-03  
-> ⚠️ OpenClaw pinned on v2026.3.28 (2026.4.x has hardcoded 60s Timeout — [Issue #43946](https://github.com/openclaw/openclaw/issues/43946))
+> **Status: v1.0.4 — PRODUCTION READY** · 2026-04-19  
+> ✅ OpenClaw 2026.4.x fully supported — undici preload v2 patches all timeout paths (headersTimeout + Agent + Pool constructors)
 
 A fully automated Windows installer that sets up **OpenClaw** with a local LLM (LYRA via Ollama).  
 After running the script, LYRA is immediately ready to use — no manual configuration, no token issues, no approval prompts.
@@ -43,6 +43,7 @@ From v1.0.4 the system also supports **external LLM agents** (OpenAI-compatible 
 ## Table of Contents
 
 - [What's New in v1.0.4](#whats-new-in-v104)
+  - [Observer Session 2026-04-19](#-observer-session-2026-04-19--openclaw-2026-4x-timeout-resolved--call_observer-skill)
   - [Observer Session 2026-04-03](#-observer-session-2026-04-03--openclaw-2026-4x-breaking-changes--version-pin)
   - [Observer Session 2026-03-30](#-observer-session-2026-03-30)
   - [Observer Session 2026-03-25](#-observer-session-2026-03-25)
@@ -166,11 +167,67 @@ complete documentation.
 
 ## What's New in v1.0.4
 
+### 🔭 Observer Session 2026-04-19 — OpenClaw 2026.4.x Timeout Resolved + `call_observer` Skill
+
+#### ✅ undici Preload v2 — All Timeout Paths Patched
+
+**Problem resolved:** OpenClaw 2026.4.15 creates `new Agent()` instances directly in `extensions/codex/index.js`, bypassing the global undici dispatcher. undici v8 default `bodyTimeout` = 300s → embedded agent requests timed out after exactly 5m04s → HTTP 500.
+
+**Preload v1** (previous) only patched `setGlobalDispatcher`. Requests via direct `new Agent()` hit the 300s wall regardless.
+
+**Preload v2** (current) adds three patches:
+
+| Patch | What it covers |
+|---|---|
+| Patch 1 | `setGlobalDispatcher` — global dispatcher override |
+| Patch 2 | `undici.Agent` constructor — all `new Agent()` instances get `bodyTimeout: 0` |
+| Patch 3 | `undici.Pool` constructor — all connection pools get `bodyTimeout: 0` |
+
+`headersTimeout` is set to the value of `agents.defaults.timeoutSeconds` from `openclaw.json` (stays in sync with the GUI dropdown). `bodyTimeout: 0` = unlimited (Ollama streams responses of variable length).
+
+**Version pin lifted:** OpenClaw can now be updated to 2026.4.x or later. The installer no longer pins to `2026.3.28`. Both `npm install -g openclaw@latest` and upgrades via the Installer GUI work without timeout issues.
+
+```
+Gateway log on start:
+[undici-preload] headersTimeout=86400000ms, bodyTimeout=0ms — all constructors patched OK
+```
+
+All three patches written automatically by `patch_gateway_cmd()` and injected via `NODE_OPTIONS` in `gateway.cmd`. `bootstrapTotalMaxChars: 150000` ensures MEMORY.md and BOOTSTRAP.md receive their full budget (default 60000 was too small for all workspace files combined).
+
+#### 🤖 `call_observer` Skill — On-Demand Observer Trigger (DECISION #22)
+
+**Problem:** The Claude Code Observer had no automatic trigger from Lyra's side. SOUL.md referenced a "FileSystemWatcher / 5-Min-Debounce" mechanism for SOUL.md self-improvement that was never implemented. Lyra was told to wait for something that did not exist.
+
+**Fix:** New skill `call_observer.js` — Lyra calls it herself when she hits errors she cannot resolve:
+
+| Trigger | Condition |
+|---|---|
+| 1 | LLM request failed 3× (Timeout / Body Timeout Error / exit status 2 after docker restart) |
+| 2 | Same tool failed 3× with identical error |
+| 3 | `[CORRECTION]` entry recurs (same error on 2+ different days in memory) |
+| 4 | SOUL.md contradiction detected |
+| 5 | `[SOUL-UPDATE-VORSCHLAG]` written to memory → observer should apply it |
+
+The skill checks whether the observer is already running (via `wmic`), then starts `lyra_observer.ps1` in a new PowerShell window via `Start-Process` — non-blocking, Lyra continues immediately. Written alongside `delegate_to_worker.js` by `_write_skill_file()` on every `Apply fixes`.
+
+```javascript
+call_observer({ reason: "LLM timeout after 3 retries — embedded agent bodyTimeout" })
+// → { status: "started", message: "Claude Code Observer started in a new window." }
+```
+
+**workers.json cleanup:** `delegation_rules` for `type=claude_code` entries are now force-cleared on every `Apply fixes` (DECISION #22 in `OpenClawWinInstaller.py`) — the comprehensive WANN block is hardcoded in the `_build_worker_soul_section()` template, so dynamic rules would create duplicates in SOUL.md.
+
+**`bootstrapTotalMaxChars: 150000`** (DECISION #21): Default total budget of 60000 chars was exhausted before BOOTSTRAP.md and MEMORY.md were injected (SOUL.md 34846 + AGENTS.md 7874 alone consume most of it). Raised to 150000 — all workspace files load in full, MEMORY.md can grow to 10000+ chars without truncation.
+
+---
+
 ### 🔭 Observer Session 2026-04-03 — OpenClaw 2026.4.x Breaking Changes & Version Pin
 
-#### 💀 DECISION #49 — OpenClaw pinned to v2026.3.28
+#### ~~💀 DECISION #49 — OpenClaw pinned to v2026.3.28~~ ✅ Resolved 2026-04-19
 
-**Problem:** OpenClaw 2026.4.0–2026.4.2 introduced a hardcoded 60-second LLM-fetch timeout ([Issue #43946](https://github.com/openclaw/openclaw/issues/43946)). This timeout is **not configurable** via `openclaw.json` — `requestTimeout` is rejected as an unrecognized schema key. On a machine with 6 GB VRAM and a 30 GB model (glm-4.7-flash), responding in under 60 seconds is physically impossible.
+> **Pin lifted.** undici preload v2 patches all timeout paths — OpenClaw 2026.4.x works without issues. See [Observer Session 2026-04-19](#-observer-session-2026-04-19--openclaw-2026-4x-timeout-resolved--call_observer-skill).
+
+**Original problem (archived):** OpenClaw 2026.4.0–2026.4.2 introduced a hardcoded 60-second LLM-fetch timeout ([Issue #43946](https://github.com/openclaw/openclaw/issues/43946)). This timeout is **not configurable** via `openclaw.json` — `requestTimeout` is rejected as an unrecognized schema key. On a machine with 6 GB VRAM and a 30 GB model (glm-4.7-flash), responding in under 60 seconds is physically impossible.
 
 **Symptom:**
 ```
@@ -228,10 +285,10 @@ auth-profiles.json array format → Marker filter removes ollama:default
 openclaw@latest → contains hardcoded 60s timeout → local models broken
 ```
 
-#### ✅ Workaround until [Issue #43946](https://github.com/openclaw/openclaw/issues/43946) is fixed
+#### ✅ Resolution — undici preload v2 (2026-04-19)
 
-Installer installs exactly `npm install -g openclaw@2026.3.28` — no newer version.
-Manual recovery: `npm install -g openclaw@2026.3.28 && openclaw doctor --fix`
+Issue resolved by patching undici Agent + Pool constructors at Node.js level — no OpenClaw source change needed.
+`npm install -g openclaw@latest` works. Manual recovery if needed: `npm install -g openclaw@latest && openclaw doctor --fix`
 
 ---
 
@@ -521,13 +578,16 @@ New timeout selector in **Lyra Config Tab** (and Worker Config Tab):
 
 **Symptoms:** `error=LLM request timed out` at exactly 5 minutes, reproducible on Windows and Linux (it's Node.js-internal, not Ollama).
 
-**Fix:** A monkey-patch preload script (`~/.openclaw/undici-timeout-preload.cjs`) is written automatically by `patch_gateway_cmd()` and injected via `NODE_OPTIONS` in `gateway.cmd`. The script:
-- Reads `timeoutSeconds` from `openclaw.json` at gateway start — always in sync with the GUI
-- Sets `headersTimeout` to that value, `bodyTimeout` to 0
-- Overrides `setGlobalDispatcher` to prevent pi-ai from resetting the timeout
+**Fix (v2, 2026-04-19):** A monkey-patch preload script (`~/.openclaw/undici-timeout-preload.cjs`) is written automatically by `patch_gateway_cmd()` and injected via `NODE_OPTIONS` in `gateway.cmd`. Three patches:
+
+1. **Global dispatcher** — `setGlobalDispatcher` override (covers standard requests)
+2. **Agent constructor** — `undici.Agent` subclassed (`PatchedAgent extends _Agent`) so every `new Agent()` gets `bodyTimeout: 0` and the configured `headersTimeout` (covers OpenClaw 2026.4.15+ embedded agents)
+3. **Pool constructor** — `undici.Pool` subclassed (`PatchedPool extends _Pool`) — same for HTTP/2 keep-alive connection pools
+
+All three read `timeoutSeconds` from `openclaw.json` at gateway start — always in sync with the GUI dropdown.
 
 ```
-[undici-preload] headersTimeout patched to 4h OK   ← appears in gateway log
+NODE_OPTIONS=--require ~/.openclaw/undici-timeout-preload.cjs
 ```
 
 If undici is not found the script exits silently — gateway always starts normally.
@@ -833,12 +893,13 @@ python Tools/pytorch_setup_gui/pytorch_setup_gui.py
 - ✅ Watcher detects `[SOUL-UPDATE-VORSCHLAG:role]` and `[CORRECTION:role]` tags
 
 ### Autonomous Observer Loop
-- ✅ FileSystemWatcher: `[SOUL-UPDATE-VORSCHLAG]` / `[CORRECTION]` tags auto-trigger Claude Code
+- ✅ FileSystemWatcher (Python/LyraHeadServer): `[SOUL-UPDATE-VORSCHLAG]` / `[CORRECTION]` tags auto-trigger Claude Code
 - ✅ 30s poll + 300s debounce — no spam, tolerates multi-entry sessions
 - ✅ `_is_claude_running()` checks node.exe CommandLine — no double starts
 - ✅ System tray: close button minimizes installer when "Work autonomously" is enabled
 - ✅ Tray restore + exit via context menu
 - ✅ Tray icon: RGB mode (RGBA silent failure on Windows fixed)
+- ✅ `call_observer` skill: Lyra triggers observer herself on 3× LLM timeout, 3× tool failure, recurring `[CORRECTION]`, SOUL.md contradiction, or after writing `[SOUL-UPDATE-VORSCHLAG]` (DECISION #22)
 
 ### Core Infrastructure
 - ✅ Gateway auto-starts at Windows login
@@ -944,6 +1005,9 @@ External LLM ──────────────────────�
 | Kein Erfinden block | Full "NIEMALS erfundenes Ergebnis" rule inline — no cross-reference | v1.0.4 |
 | models block sync | `_write_llm_to_config()` replaces models block on primary change — no OOM from stale entries (DECISION #29) | v1.0.4 |
 | Session error monitor | `_check_session_errors()` triggers observer after 3× stopReason=error — Lyra silence no longer invisible (DECISION #30) | v1.0.4 |
+| undici preload v2 | Agent + Pool constructor patches — covers `new Agent()` in OpenClaw 2026.4.15+ (DECISION #20 v2) | v1.0.4 |
+| bootstrapTotalMaxChars | 150000 — all workspace files load in full, MEMORY.md up to 10000 chars (DECISION #21) | v1.0.4 |
+| call_observer skill | On-demand observer trigger — 5 trigger conditions, non-blocking Start-Process (DECISION #22) | v1.0.4 |
 
 ---
 
@@ -1080,7 +1144,8 @@ Gateway overwrites `skills.json` on startup. **Fix:** `_write_skill_file()` call
 ~\.openclaw\workspace\memory\YYYY-MM-DD.md          LYRA self-learning entries (all roles, tag-based)
 ~\.openclaw\lyra_role.json                           Active LYRA role (pattern_recognition / cinematic_coordinator)
 ~\.openclaw\ison_producer.json                       IsonCodexProducer storage path
-~\.openclaw\skills\delegate_to_worker.js            Only required skill
+~\.openclaw\skills\delegate_to_worker.js            Worker delegation skill
+~\.openclaw\skills\call_observer.js                 On-demand observer trigger skill (DECISION #22)
 ~\.openclaw\agents\main\agent\auth-profiles.json    Ollama provider (no ollama/ prefix!)
 ~\.openclaw\agents\main\sessions\sessions.json      Delete before gateway start
 ```

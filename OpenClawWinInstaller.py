@@ -3133,6 +3133,23 @@ class OpenClawWinInstaller(OpenClawOperations):
                                     f"{_mdl!r} → qwen2.5:0.5b (cloud model on local worker)"
                                 )
 
+                        # DECISION #22: claude_code delegation_rules must stay EMPTY.
+                        # The _build_worker_soul_section() template now contains a
+                        # comprehensive hardcoded WANN block for claude_code.
+                        # Any non-empty delegation_rules in workers.json would be
+                        # appended as duplicate DELEGATION-REGEL: lines in SOUL.md.
+                        # Fix: always clear delegation_rules for type=claude_code.
+                        for _agent in _workers:
+                            if _agent.get("type") == "claude_code":
+                                if _agent.get("delegation_rules", "").strip():
+                                    _agent["delegation_rules"] = ""
+                                    _changed = True
+                                    fixes_applied.append(
+                                        f"workers.json {_agent.get('name','?')}: "
+                                        f"claude_code delegation_rules cleared "
+                                        f"(handled by SOUL.md template WANN block)"
+                                    )
+
                         if _changed:
                             import shutil as _shutil
                             _shutil.copy2(workers_path, workers_path + f".bak_{int(time.time())}")
