@@ -1,0 +1,10 @@
+{
+  "language": "de",
+  "max_seq_length": 50000,
+  "gc_window_size": 1000,
+  "golden_ratio_tolerance": 0.05,
+  "fibonacci_tolerance": 0.1,
+  "max_parallel_workers": 6,
+  "significance_permutations": 1000,
+  "use_caching": true
+}
