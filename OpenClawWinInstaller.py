@@ -40,6 +40,17 @@ v1.0.4 (2026-03-25):
   DECISION #24: gateway.cmd stub created from dist/index.js if missing after npm reinstall.
   DECISION #23: Node.js >=22.16.0 enforced before Worker gateway setup.
   DECISION #22: hasattr guard for _gw_status — Worker role has no status widget.
+  DECISION #43: tools.exec.profile = "coding" — workaround 2026.1.x–2026.5.17.
+                RETIRED 2026.5.18: OpenClaw tightened exec schema in strict mode;
+                "profile" is now an unrecognized key → gateway.startup_failed.
+                profile="coding" REMOVED from write_openclaw_config() and added
+                to REJECTED_KEYS_EXEC so Apply-fixes strips it from existing configs.
+                exec is now activated via tools.profile="full" (already set at
+                the tools level). _apply_fixes_and_update() no longer writes it.
+  DECISION #44: Auto-update disabled — v2026.5.7 wipes entire openclaw.json.
+                update.auto.enabled=false + update.checkOnStart=false prevent
+                npm-triggered config resets (issue #80077).
+                Added to write_openclaw_config() and _apply_fixes_and_update().
   DECISION #21: workers.json delegation_rules seeded with canonical policy on Apply fixes.
   Bug fix: "Port {port} refused" literal in log — missing f-prefix on f-string.
   Removed duplicate check_node() with wrong major>=18 check; kept >22 or (==22 and minor>=16).
@@ -1576,9 +1587,9 @@ class OpenClawWinInstaller(OpenClawOperations):
             ),
             "research_agent": (
                 "🔬 Research Agent — "
-                "ICIJ Netzwerk-Analyse + Narrative Forensics (Unified Platform).  "
+                "Autonome Hypothesen-Recherche zu Machtstrukturen & Offshore-Netzwerken.  "
                 "📚 Memory: [:research_agent] + [:shared]  "
-                "🌐 UI: http://127.0.0.1:18800"
+                "🌐 UI: http://127.0.0.1:18800/research"
             ),
         }
         if hasattr(self, "_lyra_role_info"):
@@ -1650,13 +1661,11 @@ class OpenClawWinInstaller(OpenClawOperations):
 
         # ── research_agent ────────────────────────────────────────────────────
         if role == "research_agent":
-            # Kandidatenpfade: lyra_unified.py bevorzugt; Fallback auf standalone builder
+            # Kandidatenpfade in Reihenfolge: korrekter Pfad, v2-Variante, cwd
             candidates = [
-                os.path.join(proj, "Tools", "lyra_network_builder", "lyra_unified.py"),
                 os.path.join(proj, "Tools", "lyra_network_builder", "lyra_network_builder.py"),
                 os.path.join(proj, "Tools", "lyra_network_builder", "lyra_network_builder_v2.py"),
-                os.path.join(proj, "lyra_unified.py"),
-                os.path.join(os.getcwd(), "lyra_unified.py"),
+                os.path.join(proj, "lyra_network_builder_v2.py"),
                 os.path.join(os.getcwd(), "lyra_network_builder.py"),
             ]
             app_path = next((p for p in candidates if os.path.isfile(p)), None)
@@ -1673,15 +1682,15 @@ class OpenClawWinInstaller(OpenClawOperations):
             if already_running:
                 # App läuft schon – nur Browser öffnen
                 import webbrowser
-                webbrowser.open("http://127.0.0.1:18800")
-                self.log("[Role] LYRA Unified läuft bereits – UI geöffnet ✓", "SUCCESS")
+                webbrowser.open("http://127.0.0.1:18800/research")
+                self.log("[Role] LYRA-NET läuft bereits – Research UI geöffnet ✓", "SUCCESS")
                 return
 
             if not app_path:
                 self.log(
-                    "[Role] lyra_unified.py nicht gefunden.\n"
+                    "[Role] lyra_network_builder_v2.py nicht gefunden.\n"
                     f"       Gesucht in: {', '.join(candidates)}\n"
-                    "       Bitte lyra_unified.py in den Projektordner kopieren.",
+                    "       Bitte Datei in den Projektordner kopieren.",
                     "ERROR"
                 )
                 return
@@ -1697,7 +1706,7 @@ class OpenClawWinInstaller(OpenClawOperations):
                 self.log(f"[Role] {os.path.basename(app_path)} gestartet (--auto) ✓", "SUCCESS")
                 # Browser öffnen sobald Server erreichbar ist (max 60s warten)
                 self.root.after(500, lambda: self._open_browser_when_ready(
-                    "http://127.0.0.1:18800", retries=24, interval_ms=2500))
+                    "http://127.0.0.1:18800/research", retries=24, interval_ms=2500))
             except Exception as e:
                 self.log(f"[Role] Start fehlgeschlagen: {e}", "ERROR")
             return
@@ -3084,10 +3093,24 @@ class OpenClawWinInstaller(OpenClawOperations):
         One backup per run. Gateway restarted once at the end.
 
         Adding new fixes here keeps the GUI clean — one button for all corrections.
+        Each fix is idempotent — safe to run repeatedly without side effects.
 
-        Current fixes applied:
+        Current fixes applied (in order):
           - DECISION #11: gateway.auth.password — add '' if absent or sentinel present.
             (OpenClaw 2026.3.2 requires this field; absent → sentinel → rejected)
+          - DECISION #12: commands.ownerDisplaySecret — generate if absent or sentinel.
+          - DECISION #13: tools.exec.allowlist — strip if present (schema rejected).
+          - DECISION #14: tools.web.fetch.allowPrivateIPs — strip (schema rejected).
+          - DECISION #15: memorySearch.provider=local, fallback=none, remote removed.
+          - DECISION #21: workers.json delegation_rules — seed canonical rules.
+          - DECISION #32: workers.json type=worker — strip api_key and cloud models.
+          - DECISION #41: models.providers.ollama — timeoutSeconds=86400, baseUrl, models=[].
+          - DECISION #43: RETIRED 2026.5.18 — profile="coding" rejected as unrecognized key
+            in OpenClaw 2026.5.18 strict exec schema → gateway.startup_failed.
+            Apply-fixes now strips profile from existing configs (REJECTED_KEYS_EXEC).
+            exec activated via tools.profile="full" at the outer tools level.
+          - DECISION #44: update.auto.enabled=false — prevent 2026.5.7-style config wipe.
+            OpenClaw 2026.5.7 npm auto-update resets openclaw.json entirely (issue #80077).
         """
         cfg_dir       = self.cfg._find_openclaw_config_dir()
         cfg_path      = os.path.join(cfg_dir, "openclaw.json")
@@ -3136,6 +3159,36 @@ class OpenClawWinInstaller(OpenClawOperations):
                 if exec_cfg.get("security") == "allowlist":
                     cfg["tools"]["exec"]["security"] = "full"
                     fixes_applied.append("tools.exec.security (allowlist → full)")
+
+                # DECISION #43 RETIRED (2026.5.18): profile="coding" was a workaround
+                # for OpenClaw 2026.1.x–2026.5.17 where tools.exec.security="full" alone
+                # had no runtime effect. In 2026.5.18 the exec schema was tightened to
+                # strict mode — "profile" is now an unrecognized key → gateway.startup_failed
+                # (5 startup_failed entries confirmed 2026-05-20, issue log entry #43-retired).
+                # This block STRIPS profile if still present (e.g. from a previous installer
+                # run) — mirrors REJECTED_KEYS_EXEC in OpenClawConfigManagement.py.
+                # exec is now activated via tools.profile="full" at the outer tools level.
+                # security="full" + ask="off" remain correct and are verified here.
+                cfg.setdefault("tools", {}).setdefault("exec", {})
+                exec_needs_fix = (
+                    exec_cfg.get("security") != "full"
+                    or exec_cfg.get("ask")    != "off"
+                    or "profile" in exec_cfg          # RETIRED — must be stripped
+                )
+                if exec_needs_fix:
+                    cfg["tools"]["exec"]["security"] = "full"
+                    cfg["tools"]["exec"]["ask"]      = "off"
+                    if "profile" in cfg["tools"]["exec"]:
+                        del cfg["tools"]["exec"]["profile"]
+                        fixes_applied.append(
+                            "tools.exec.profile stripped (DECISION #43 RETIRED — "
+                            "rejected as unrecognized key in OpenClaw >= 2026.5.18)"
+                        )
+                    else:
+                        fixes_applied.append(
+                            "tools.exec (security=full, ask=off verified — "
+                            "DECISION #43 retired, profile not present)"
+                        )
 
                 # DECISION #14: tools.web.fetch.allowPrivateIPs — schema rejected, strip if present
                 fetch_cfg = cfg.get("tools", {}).get("web", {}).get("fetch", {})
@@ -3281,6 +3334,29 @@ class OpenClawWinInstaller(OpenClawOperations):
                     fixes_applied.append(
                         "models.providers.ollama (DECISION #41 — timeoutSeconds=86400, "
                         "baseUrl, models=[] for auto-discovery)"
+                    )
+
+                # DECISION #44: update.auto.enabled = false — v2026.5.7 wipes openclaw.json.
+                # OpenClaw 2026.5.7 (npm auto-update) resets the entire openclaw.json,
+                # wiping agents, channels, plugins and credentials (issue #80077).
+                # Disable auto-updates so the config survives between installer runs.
+                # The user must update manually and click Apply fixes afterwards.
+                # Backwards-compatible: older versions accept but ignore the update block.
+                # update.checkOnStart=false also suppresses the "new version available"
+                # banner that can trigger background auto-update in some environments.
+                # Safe: only disables auto-update, never prevents manual npm update.
+                _upd = cfg.get("update", {})
+                needs_44 = (
+                    _upd.get("auto",   {}).get("enabled",      True)  is not False
+                    or _upd.get("checkOnStart", True) is not False
+                )
+                if needs_44:
+                    cfg.setdefault("update", {})
+                    cfg["update"].setdefault("auto", {})["enabled"] = False
+                    cfg["update"]["checkOnStart"] = False
+                    fixes_applied.append(
+                        "update.auto.enabled=false, update.checkOnStart=false "
+                        "(DECISION #44 — prevent 2026.5.7-style config wipe on auto-update)"
                     )
 
                 # Example:
