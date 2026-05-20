@@ -875,7 +875,7 @@ class OpenClawWinInstaller(OpenClawOperations):
         self._lyra_role_cb  = ttk.Combobox(
             role_frame,
             textvariable=self._lyra_role_var,
-            values=["pattern_recognition", "cinematic_coordinator"],
+            values=["pattern_recognition", "cinematic_coordinator", "research_agent"],
             state="readonly", width=24
         )
         self._lyra_role_cb.pack(side=tk.LEFT)
@@ -1520,6 +1520,35 @@ class OpenClawWinInstaller(OpenClawOperations):
         if hasattr(self, "_lyra_role_var"):
             self._lyra_role_var.set(role)
         self._apply_role_info(role)
+        # Auto-Start LYRA-NET wenn research_agent gespeichert ist und nicht läuft
+        if role == "research_agent" and not self._is_lyra_net_running():
+            self.log("[Role] research_agent geladen – starte LYRA-NET in 3s...", "INFO")
+            self.root.after(3000, self._start_role_app)
+
+    def _open_browser_when_ready(self, url: str, retries: int = 24, interval_ms: int = 2500):
+        """Öffnet Browser erst wenn Server antwortet – max retries * interval_ms Wartezeit."""
+        try:
+            import urllib.request
+            urllib.request.urlopen("http://127.0.0.1:18800/api/health", timeout=2)
+            import webbrowser
+            webbrowser.open(url)
+            self.log(f"[Role] Browser geöffnet: {url}", "SUCCESS")
+        except Exception:
+            if retries > 0:
+                self.root.after(interval_ms,
+                    lambda: self._open_browser_when_ready(url, retries - 1, interval_ms))
+            else:
+                self.log("[Role] Server nicht erreichbar nach 60s – Browser nicht geöffnet", "WARNING")
+
+    def _is_lyra_net_running(self) -> bool:
+        """Prüft ob LYRA-NET bereits läuft (Port 18800 antwortet)."""
+        try:
+            import urllib.request
+            urllib.request.urlopen("http://127.0.0.1:18800/api/health", timeout=2)
+            return True
+        except Exception:
+            return False
+        self._apply_role_info(role)
 
     def _save_lyra_role(self, role: str):
         """Persists role to lyra_role.json."""
@@ -1544,6 +1573,12 @@ class OpenClawWinInstaller(OpenClawOperations):
                 "🎬 Cinematic Coordinator — "
                 "LYRA produziert den Film ueber ihre eigene Entstehung.  "
                 "📚 Memory: [:cinematic_coordinator] + [:shared]"
+            ),
+            "research_agent": (
+                "🔬 Research Agent — "
+                "ICIJ Netzwerk-Analyse + Narrative Forensics (Unified Platform).  "
+                "📚 Memory: [:research_agent] + [:shared]  "
+                "🌐 UI: http://127.0.0.1:18800"
             ),
         }
         if hasattr(self, "_lyra_role_info"):
@@ -1574,9 +1609,13 @@ class OpenClawWinInstaller(OpenClawOperations):
         """Background: writes SOUL.md role section."""
         try:
             self.cfg.set_lyra_role(role)
-            self.cfg.write_soul_md()
+            self.cfg.write_soul_files(log_prefix="role-switch")
             self.log(f"[Role] SOUL.md updated for role: {role}", "SUCCESS")
             self.root.after(0, lambda: self._role_restart_prompt(role))
+            # Auto-Start LYRA-NET wenn research_agent gewählt
+            if role == "research_agent" and not self._is_lyra_net_running():
+                self.log("[Role] Starte LYRA-NET automatisch...", "INFO")
+                self.root.after(500, self._start_role_app)
         except Exception as e:
             self.log(f"[Role] SOUL.md update failed: {e}", "WARNING")
 
@@ -1592,25 +1631,78 @@ class OpenClawWinInstaller(OpenClawOperations):
         """Launches the standalone app for the selected role."""
         role = self._lyra_role_var.get() if hasattr(self, "_lyra_role_var") else ""
         proj = self._cc_project_dir()
-        role_apps = {
-            "cinematic_coordinator": os.path.join(
-                proj, "Tools", "IsonCodexProducer", "IsonCodexProducer.py"),
-        }
-        app_path = role_apps.get(role)
-        if not app_path:
-            self.log(f"[Role] Keine App fuer Rolle '{role}' konfiguriert.", "WARNING")
+
+        # ── cinematic_coordinator ─────────────────────────────────────────────
+        if role == "cinematic_coordinator":
+            app_path = os.path.join(proj, "Tools", "IsonCodexProducer", "IsonCodexProducer.py")
+            if not os.path.isfile(app_path):
+                self.log(f"[Role] App nicht gefunden: {app_path}", "ERROR")
+                return
+            try:
+                import subprocess
+                subprocess.Popen(["python", app_path],
+                                 creationflags=0x00000010,
+                                 cwd=os.path.dirname(app_path))
+                self.log(f"[Role] {os.path.basename(app_path)} gestartet ✓", "SUCCESS")
+            except Exception as e:
+                self.log(f"[Role] Start fehlgeschlagen: {e}", "ERROR")
             return
-        if not os.path.isfile(app_path):
-            self.log(f"[Role] App nicht gefunden: {app_path}", "ERROR")
+
+        # ── research_agent ────────────────────────────────────────────────────
+        if role == "research_agent":
+            # Kandidatenpfade: lyra_unified.py bevorzugt; Fallback auf standalone builder
+            candidates = [
+                os.path.join(proj, "Tools", "lyra_network_builder", "lyra_unified.py"),
+                os.path.join(proj, "Tools", "lyra_network_builder", "lyra_network_builder.py"),
+                os.path.join(proj, "Tools", "lyra_network_builder", "lyra_network_builder_v2.py"),
+                os.path.join(proj, "lyra_unified.py"),
+                os.path.join(os.getcwd(), "lyra_unified.py"),
+                os.path.join(os.getcwd(), "lyra_network_builder.py"),
+            ]
+            app_path = next((p for p in candidates if os.path.isfile(p)), None)
+
+            # Prüfen ob LYRA-NET bereits läuft (Port 18800 antwortet)
+            already_running = False
+            try:
+                import urllib.request
+                urllib.request.urlopen("http://127.0.0.1:18800/api/health", timeout=2)
+                already_running = True
+            except Exception:
+                pass
+
+            if already_running:
+                # App läuft schon – nur Browser öffnen
+                import webbrowser
+                webbrowser.open("http://127.0.0.1:18800")
+                self.log("[Role] LYRA Unified läuft bereits – UI geöffnet ✓", "SUCCESS")
+                return
+
+            if not app_path:
+                self.log(
+                    "[Role] lyra_unified.py nicht gefunden.\n"
+                    f"       Gesucht in: {', '.join(candidates)}\n"
+                    "       Bitte lyra_unified.py in den Projektordner kopieren.",
+                    "ERROR"
+                )
+                return
+
+            # App starten – sichtbares Konsolenfenster (CREATE_NEW_CONSOLE = 0x10)
+            import subprocess
+            try:
+                subprocess.Popen(
+                    ["python", app_path, "--auto"],
+                    creationflags=0x00000010,   # CREATE_NEW_CONSOLE
+                    cwd=os.path.dirname(app_path)
+                )
+                self.log(f"[Role] {os.path.basename(app_path)} gestartet (--auto) ✓", "SUCCESS")
+                # Browser öffnen sobald Server erreichbar ist (max 60s warten)
+                self.root.after(500, lambda: self._open_browser_when_ready(
+                    "http://127.0.0.1:18800", retries=24, interval_ms=2500))
+            except Exception as e:
+                self.log(f"[Role] Start fehlgeschlagen: {e}", "ERROR")
             return
-        import subprocess
-        try:
-            subprocess.Popen(["python", app_path],
-                             creationflags=0x00000010,
-                             cwd=os.path.dirname(app_path))
-            self.log(f"[Role] {os.path.basename(app_path)} gestartet ✓", "SUCCESS")
-        except Exception as e:
-            self.log(f"[Role] Start fehlgeschlagen: {e}", "ERROR")
+
+        self.log(f"[Role] Keine App fuer Rolle '{role}' konfiguriert.", "WARNING")
 
 
     def _detect_ollama_runtime(self) -> dict:
@@ -2560,10 +2652,10 @@ class OpenClawWinInstaller(OpenClawOperations):
             "2h":          7200,
             "4h":         14400,
             "8h":         28800,
-            "Unlimited": 86400,   # 24h — OpenClaw rejects 0 as invalid
+            "Unlimited":  86400,  # Max accepted by OpenClaw 5.7 schema (> 0 required)
         }
         selection = self._timeout_var.get()
-        seconds   = TIMEOUT_MAP.get(selection, 7200)
+        seconds   = TIMEOUT_MAP.get(selection, 86400)
 
         cfg_dir  = self.cfg._find_openclaw_config_dir()
         cfg_path = os.path.join(cfg_dir, "openclaw.json")
@@ -2572,12 +2664,19 @@ class OpenClawWinInstaller(OpenClawOperations):
                 cfg = json.load(f)
             cfg.setdefault("agents", {}).setdefault("defaults", {})
             cfg["agents"]["defaults"]["timeoutSeconds"] = seconds
+            # Remove legacy llm key (rejected by OpenClaw 5.7 schema)
+            cfg["agents"]["defaults"].pop("llm", None)
+            # DECISION #41: also set provider-level timeout (correct key in OpenClaw 5.x)
+            cfg.setdefault("models", {}).setdefault("providers", {})
+            cfg["models"]["providers"].setdefault("ollama", {})
+            cfg["models"]["providers"]["ollama"]["timeoutSeconds"] = seconds
             shutil.copy2(cfg_path, cfg_path + f".bak_{int(time.time())}")
             with open(cfg_path, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=2, ensure_ascii=False)
 
-            label = f"{seconds}s" if seconds != 86400 else "86400s (24h — max)"
+            label = f"{seconds}s (24h — max)" if seconds == 86400 else f"{seconds}s"
             self.log(f"[Timeout] agents.defaults.timeoutSeconds = {label}  ✓", "SUCCESS")
+            self.log(f"[Timeout] models.providers.ollama.timeoutSeconds = {label}  ✓", "SUCCESS")
             if hasattr(self, "_timeout_info"):
                 self._timeout_info.config(
                     text=f"⏱  timeoutSeconds: {label}",
@@ -3133,23 +3232,6 @@ class OpenClawWinInstaller(OpenClawOperations):
                                     f"{_mdl!r} → qwen2.5:0.5b (cloud model on local worker)"
                                 )
 
-                        # DECISION #22: claude_code delegation_rules must stay EMPTY.
-                        # The _build_worker_soul_section() template now contains a
-                        # comprehensive hardcoded WANN block for claude_code.
-                        # Any non-empty delegation_rules in workers.json would be
-                        # appended as duplicate DELEGATION-REGEL: lines in SOUL.md.
-                        # Fix: always clear delegation_rules for type=claude_code.
-                        for _agent in _workers:
-                            if _agent.get("type") == "claude_code":
-                                if _agent.get("delegation_rules", "").strip():
-                                    _agent["delegation_rules"] = ""
-                                    _changed = True
-                                    fixes_applied.append(
-                                        f"workers.json {_agent.get('name','?')}: "
-                                        f"claude_code delegation_rules cleared "
-                                        f"(handled by SOUL.md template WANN block)"
-                                    )
-
                         if _changed:
                             import shutil as _shutil
                             _shutil.copy2(workers_path, workers_path + f".bak_{int(time.time())}")
@@ -3176,6 +3258,31 @@ class OpenClawWinInstaller(OpenClawOperations):
                         if not cfg.get("models"):
                             del cfg["models"]
                         fixes_applied.append("models.providers.ollama (removed — schema rejected, was accidental installer entry)")
+                # DECISION #41: models.providers.ollama — LLM idle watchdog fix (2026-05-11)
+                # agents.defaults.timeoutSeconds=86400 alone caps idle to 120s via
+                # clampImplicitTimeoutMs. Fix: set models.providers.ollama.timeoutSeconds=86400
+                # → activates modelRequestTimeoutMs path (no 120s cap → 24h idle).
+                # Schema: baseUrl (string) + models (array) REQUIRED alongside timeoutSeconds.
+                # models=[] keeps ambient auto-discovery active (hasExplicitModels=false).
+                _providers = cfg.setdefault("models", {}).setdefault("providers", {})
+                _ollama = _providers.get("ollama", {})
+                _needs_41 = (
+                    "ollama" not in _providers
+                    or _ollama.get("timeoutSeconds", 0) != 86400
+                    or not _ollama.get("baseUrl", "")
+                    or "models" not in _ollama
+                )
+                if _needs_41:
+                    _providers["ollama"] = {
+                        "baseUrl":        "http://127.0.0.1:11434",
+                        "models":         _ollama.get("models", []),
+                        "timeoutSeconds": 86400,
+                    }
+                    fixes_applied.append(
+                        "models.providers.ollama (DECISION #41 — timeoutSeconds=86400, "
+                        "baseUrl, models=[] for auto-discovery)"
+                    )
+
                 # Example:
                 #   current = cfg.get("some", {}).get("key", "__NOT_SET__")
                 #   if current == "__NOT_SET__":
