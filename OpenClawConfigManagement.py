@@ -160,7 +160,7 @@ ARCHITECTURAL DECISIONS  (read before changing anything)
     tools.exec.allowlist and tools.web.fetch.allowPrivateIPs → "Unrecognized key" → Gateway crash.
     Workaround: SOUL.md instructs LYRA to use curl.exe via .ps1 scripts for external HTTPS,
     and Invoke-RestMethod only for local health checks on 127.0.0.1.
-    REJECTED_KEYS_EXEC  = {"allowlist"}
+    REJECTED_KEYS_EXEC  = {"allowlist", "profile"}  # profile: DECISION #43 retired in 2026.5.18
     REJECTED_KEYS_FETCH = {"allowPrivateIPs"}
     Confirmed schema-rejected 2026-03-04.
 
@@ -736,110 +736,9 @@ export default {
             with open(skill_path, "w", encoding="utf-8") as f:
                 f.write(skill_js)
             self.log(f"  [skill] delegate_to_worker.js written: {skill_path}  ✓", "SUCCESS")
-        except Exception as e:
-            self.log(f"  [skill] delegate_to_worker.js write failed: {e}", "WARNING")
-            return False
-
-        # DECISION #22 — call_observer.js: on-demand Claude Code Observer trigger.
-        # Lyra calls this skill when she cannot fix an error herself (3× LLM timeout,
-        # 3× tool failure, recurring [CORRECTION], SOUL.md contradiction, [SOUL-UPDATE-VORSCHLAG]).
-        # No background service — pure skill invocation. Written alongside delegate_to_worker.
-        observer_skill_path = os.path.join(skills_dir, "call_observer.js")
-        observer_skill_js = r"""// call_observer.js — LYRA v1
-// DECISION #22 (ClawBotInstaller): On-demand Claude Code Observer trigger.
-// Lyra calls this skill when she detects errors she cannot fix herself.
-// NO background service — pure on-demand. Registered by OpenClawConfigManagement.py.
-//
-// WANN aufrufen:
-//   1. LLM-Request schlug 3× fehl (Timeout, Body Timeout Error, exit status 2
-//      nach docker restart)
-//   2. Tool schlug 3× mit demselben Fehler fehl
-//   3. [CORRECTION]-Eintrag im Memory der sich wiederholt (gleicher Fehler an 2+
-//      verschiedenen Tagen)
-//   4. SOUL.md-Widerspruch erkannt (Regeln widersprechen sich)
-//   5. [SOUL-UPDATE-VORSCHLAG] in Memory geschrieben → Observer soll umsetzen
-//
-// NICHT aufrufen bei:
-//   - Einmaligen Fehlern die beim zweiten Versuch funktioniert haben
-//   - Worker-Fehlern (Junior nicht erreichbar → melden, nicht Observer starten)
-//   - Normalen User-Anfragen
-//
-// This skill file is re-written on every installer run (DECISION #5).
-
-export default {
-  name: "call_observer",
-  description: "Starts the Claude Code Observer when Lyra cannot fix an error herself. Call after 3 failed LLM requests, 3 identical tool failures, recurring [CORRECTION] entries, SOUL.md contradictions, or after writing [SOUL-UPDATE-VORSCHLAG]. Returns immediately — observer runs independently.",
-  parameters: {
-    type: "object",
-    properties: {
-      reason: {
-        type: "string",
-        description: "Why the observer is needed. Examples: 'LLM timeout after 3 retries', 'exit status 2 after docker restart', 'SOUL.md contradiction: rule A vs rule B', '[SOUL-UPDATE-VORSCHLAG] written in memory'"
-      }
-    },
-    required: ["reason"]
-  },
-  async run({ reason }) {
-    // Dynamic import of child_process (ESM-compatible, Node.js >= 14)
-    let execSync;
-    try {
-      const cp = await import('child_process');
-      execSync = cp.execSync;
-    } catch (_) {
-      return JSON.stringify({
-        status: "no_exec",
-        reason,
-        fallback: "Run manually: powershell -ExecutionPolicy Bypass -File \"C:\\Python\\Projects\\ClawBotInstaller\\lyra_observer.ps1\""
-      });
-    }
-
-    // Check if observer is already running
-    let alreadyRunning = false;
-    try {
-      const out = execSync(
-        'wmic process where "commandline like \'%lyra_observer%\'" get processid /value 2>nul',
-        { encoding: 'utf8', timeout: 5000 }
-      );
-      alreadyRunning = /ProcessId=\d+/.test(out);
-    } catch (_) {}
-
-    if (alreadyRunning) {
-      return JSON.stringify({
-        status: "already_running",
-        message: "Claude Code Observer is already active.",
-        reason
-      });
-    }
-
-    // Start observer in a new PowerShell window (detached, does not block Lyra)
-    const ps1 = "C:\\Python\\Projects\\ClawBotInstaller\\lyra_observer.ps1";
-    try {
-      execSync(
-        `powershell -Command "Start-Process powershell -ArgumentList '-ExecutionPolicy Bypass -File \\"${ps1}\\"' -WindowStyle Normal"`,
-        { timeout: 10000 }
-      );
-      return JSON.stringify({
-        status: "started",
-        reason,
-        message: "Claude Code Observer started in a new window. It will analyze the error and apply fixes independently."
-      });
-    } catch (e) {
-      return JSON.stringify({
-        status: "error",
-        error: e.message,
-        fallback: `Run manually: powershell -ExecutionPolicy Bypass -File "${ps1}"`
-      });
-    }
-  }
-};
-"""
-        try:
-            with open(observer_skill_path, "w", encoding="utf-8") as f:
-                f.write(observer_skill_js)
-            self.log(f"  [skill] call_observer.js written: {observer_skill_path}  ✓", "SUCCESS")
             return True
         except Exception as e:
-            self.log(f"  [skill] call_observer.js write failed: {e}", "WARNING")
+            self.log(f"  [skill] Write failed: {e}", "WARNING")
             return False
 
     def _write_tool_config_doc(self):
@@ -1005,6 +904,7 @@ class OpenClawConfig:
             [LEARNING:shared]               for ALL roles
             [LEARNING:pattern_recognition]  DNA/genomics
             [CONTEXT:cinematic_coordinator] film production
+            [CONTEXT:research_agent]        offshore network research / hypotheses
         """
         if role is None:
             role = getattr(self, "_lyra_role", "pattern_recognition")
@@ -1125,6 +1025,10 @@ class OpenClawConfig:
     def set_lyra_role(self, role: str):
         """Sets the active LYRA role and persists it to lyra_role.json."""
         import datetime
+        valid_roles = {"pattern_recognition", "cinematic_coordinator", "research_agent"}
+        if role not in valid_roles:
+            self._log(f"[Config] Unknown role '{role}' — keeping current role.", "WARNING")
+            return
         self._lyra_role = role
         path = os.path.join(self._find_openclaw_config_dir(), "lyra_role.json")
         with open(path, "w", encoding="utf-8") as f:
@@ -1273,14 +1177,11 @@ class OpenClawConfig:
                     f"    STATUS: Kein HTTP-Endpunkt — Erreichbarkeit via Prozesscheck.\n"
                     f"    PRÜFEN: exec → wmic process where \"name='powershell.exe'\" get CommandLine\n"
                     f"            'lyra_observer' im Output → läuft | nicht vorhanden → gestoppt\n"
-                    f"    STARTEN VIA SKILL: call_observer(reason=\"<Fehlerbeschreibung>\")  \u2190 bevorzugt\n"
-                    f"    STARTEN VIA EXEC: exec \u2192 powershell -ExecutionPolicy Bypass -File \"C:\\Python\\Projects\\ClawBotInstaller\\lyra_observer.ps1\"\n"
-                    f"    STOPPEN: exec \u2192 powershell -ExecutionPolicy Bypass -File \"C:\\Python\\Projects\\ClawBotInstaller\\lyra_observer_stop.ps1\"\n"
-                    f"    NICHT: Online nach Repository suchen \u2014 Observer ist LOKAL: C:\\Python\\Projects\\ClawBotInstaller\\lyra_observer.ps1\n"
+                    f"    STARTEN: exec → powershell -ExecutionPolicy Bypass -File \"C:\\Python\\Projects\\ClawBotInstaller\\lyra_observer.ps1\"\n"
+                    f"    STOPPEN: exec → powershell -ExecutionPolicy Bypass -File \"C:\\Python\\Projects\\ClawBotInstaller\\lyra_observer_stop.ps1\"\n"
+                    f"    NICHT: Online nach Repository suchen — Observer ist LOKAL: C:\\Python\\Projects\\ClawBotInstaller\\lyra_observer.ps1\n"
                     f"    NICHT: HTTP-Request versuchen (port=0, kein Server)\n"
-                    f"    NICHT: claude_code Tasks senden \u2014 Observer l\u00e4uft eigenst\u00e4ndig\n"
-                    f"    WANN (Pflicht): 1) LLM 3\u00d7 Timeout/exit-status-2  2) Tool 3\u00d7 gleicher Fehler  "
-                    f"3) [CORRECTION] wiederholt  4) SOUL.md-Widerspruch  5) [SOUL-UPDATE-VORSCHLAG] geschrieben\n"
+                    f"    NICHT: claude_code Tasks senden — Observer läuft eigenständig\n"
                 )
                 if rules:
                     for rule_line in rules.splitlines():
@@ -1539,6 +1440,22 @@ class OpenClawConfig:
             LYRA to use allowed patterns (powershell -Command "...") that pass
             the built-in security filter.
 
+        DECISION #43 (v1.0.4, RETIRED 2026.5.18): tools.exec.profile = "coding".
+            Was a workaround for 2026.1.x–2026.5.17 where tools.exec.security="full"
+            alone had no runtime effect on exec enforcement (issues #59270, #64361, #78311).
+            RETIRED: OpenClaw 2026.5.18 tightened exec schema to strict mode — "profile"
+            is now an unrecognized key → gateway.startup_failed (confirmed 2026-05-20).
+            profile="coding" removed from config; added to REJECTED_KEYS_EXEC so
+            Apply-fixes strips it from existing configs automatically.
+            exec is now activated via tools.profile="full" (already set at tools level).
+
+        DECISION #44 (v1.0.4): update.auto.enabled = false — v2026.5.7 wipes config.
+            OpenClaw 2026.5.7 (npm auto-update) resets the entire openclaw.json,
+            wiping agents, channels, plugins, and credentials (issue #80077).
+            update.auto.enabled=false + update.checkOnStart=false prevent this.
+            Written once at install time; Apply fixes restores after any update.
+            Backwards-compatible: older builds accept but ignore the update block.
+
         DECISION #14 (v1.0.2): tools.web.fetch.allowPrivateIPs — schema rejected.
             OpenClaw 2026.3.2 does not support this key — "Unrecognized key:
             allowPrivateIPs" → Gateway cannot start.
@@ -1550,9 +1467,9 @@ class OpenClawConfig:
         """
         # Keys OpenClaw writes but then rejects on startup — strip before writing
         REJECTED_KEYS_ROOT   = {"lastChecks", "runTimeoutSeconds"}
-        REJECTED_KEYS_AGENTS = {"runTimeoutSeconds"}
+        REJECTED_KEYS_AGENTS = {"runTimeoutSeconds", "llm"}  # "llm" rejected by OpenClaw 5.7
         # Keys the installer must never write (schema rejects them)
-        REJECTED_KEYS_EXEC   = {"allowlist"}           # DECISION #13
+        REJECTED_KEYS_EXEC   = {"allowlist", "profile"} # DECISION #13 + #43 retired
         REJECTED_KEYS_FETCH  = {"allowPrivateIPs"}     # DECISION #14
         cfg_dir  = self._find_openclaw_config_dir()
         cfg_path = os.path.join(cfg_dir, "openclaw.json")
@@ -1641,29 +1558,14 @@ class OpenClawConfig:
         # hw_profile comes from HardwareProfile.detect() when available.
         # Falls back to 7200s (2h) — glm-4.7-flash on CPU offloading needs > 1h.
         # DECISION #3 updated v1.0.4: Default raised from 3600 to 7200.
-        # DECISION #44: preserve user-set timeoutSeconds (GUI dropdown)
-        existing_timeout = None
-        if os.path.isfile(cfg_path):
-            try:
-                with open(cfg_path, "r", encoding="utf-8") as _f:
-                    existing_timeout = (
-                        json.load(_f).get("agents",{}).get("defaults",{})
-                        .get("timeoutSeconds", None)
-                    )
-            except Exception:
-                pass
-        if existing_timeout is not None and existing_timeout >= 3600:
-            timeout_seconds = existing_timeout
-            self._log(f"  Config: timeoutSeconds={timeout_seconds} (preserved — set via GUI)", "INFO")
-        else:
-            timeout_seconds = (
-                hw_profile.get("recommended_timeout", 7200)
-                if hw_profile else 7200
-            )
-            self._log(
-                f"  Config: timeoutSeconds={timeout_seconds} "
-                f"({'from HW profile' if hw_profile else 'default'})", "INFO"
-            )
+        timeout_seconds = (
+            hw_profile.get("recommended_timeout", 7200)
+            if hw_profile else 7200
+        )
+        self._log(
+            f"  Config: timeoutSeconds={timeout_seconds} "
+            f"({'from HW profile' if hw_profile else 'default'})", "INFO"
+        )
 
         config = {
             # DECISION #9: meta block required by 2026.3.1
@@ -1713,18 +1615,15 @@ class OpenClawConfig:
                     #                   ?? lookupContextTokens(model) ?? 2e5
                     "contextTokens": 131072,
                     # DECISION #1 — timeoutSeconds only, NOT runTimeoutSeconds
-                    # DECISION #3 — 3600s correct for RTX 3050 GPU-hybrid
-                    # DECISION #9 — 7200 causes orphaned session-write-locks
-                    "timeoutSeconds": timeout_seconds,  # from HardwareProfile (v1.0.3)
+                    # DECISION #3/41 — 86400 (24h) ist der höchste Wert den OpenClaw 5.7
+                    #   akzeptiert (schema: > 0). timeoutSeconds: 0 wird abgelehnt.
+                    #   Der eigentliche Slow-Model-Timeout wird per Provider gesetzt:
+                    #   models.providers.ollama.timeoutSeconds (siehe unten).
+                    "timeoutSeconds": 86400,
                     # DECISION #16 — bootstrapMaxChars raised to 40000
                     # Default 20000 truncates SOUL.md in Lyra's context (confirmed 2026-03-20).
                     # resolveBootstrapMaxChars() in auth-profiles-iXW75sRj.js reads this field.
                     "bootstrapMaxChars": 40000,
-                    # DECISION #21 — bootstrapTotalMaxChars set to 150000
-                    # Default 60000 (hardcoded in pi-embedded-helpers) exhausted before BOOTSTRAP.md
-                    # and MEMORY.md are injected (SOUL.md 34846 + AGENTS.md 7874 + others consume budget).
-                    # 150000 covers all workspace files in full and allows MEMORY.md to grow to 10000 chars.
-                    "bootstrapTotalMaxChars": 150000,
                     # DECISION #17 — compaction.mode=safeguard, maxHistoryShare=0.7
                     # Without this, sessions grow past 200K tokens → VRAM crash on gateway restart.
                     # Threshold = maxHistoryShare × model_context_tokens.
@@ -1820,6 +1719,10 @@ class OpenClawConfig:
                     # powershell -Command "..." patterns that pass the built-in
                     # security filter. SOUL.md documents this workaround.
                     "security":     "full",
+                    # DECISION #43 RETIRED (2026.5.18): profile="coding" removed.
+                    # Was a workaround for 2026.1.x; rejected as unrecognized key
+                    # since 2026.5.18 schema tightening → gateway.startup_failed.
+                    # exec is now activated via tools.profile="full" (already set).
                     "ask":          "off",
                     "host":         "gateway",
                     "backgroundMs": 30000,
@@ -1844,6 +1747,32 @@ class OpenClawConfig:
             # sub-block is never created with a missing apiKey.
             "skills": {
                 "install": {"nodeManager": "npm"},
+            },
+            # DECISION #44: Disable auto-updates — v2026.5.7 wiped entire
+            # openclaw.json on npm auto-update (issue #80077). Disabling
+            # prevents silent config resets between installer runs.
+            # checkOnStart=false suppresses update banner that can trigger
+            # background auto-update in some environments.
+            # Backwards-compatible: older builds accept but ignore this block.
+            "update": {
+                "auto":         {"enabled": False},
+                "checkOnStart": False,
+            },
+            # DECISION #41 (updated 2026-05-11): models.providers.ollama.timeoutSeconds
+            # agents.defaults.timeoutSeconds=86400 alone caps idle watchdog at 120s
+            # (resolveLlmIdleTimeoutMs clampImplicitTimeoutMs — selection-BeP8qtCb.js).
+            # Fix: explicit provider entry activates modelRequestTimeoutMs path (no 120s cap).
+            # SCHEMA (OpenClaw 2026.5.7): baseUrl + models[] are REQUIRED when ollama key exists.
+            # timeoutSeconds-only → schema rejects: "expected string, received undefined".
+            # models=[] keeps auto-discovery active (hasExplicitModels=false → ambient discovery).
+            "models": {
+                "providers": {
+                    "ollama": {
+                        "baseUrl":        "http://127.0.0.1:11434",
+                        "models":         [],
+                        "timeoutSeconds": 86400,
+                    },
+                },
             },
         }
 
@@ -1943,8 +1872,7 @@ class OpenClawConfig:
         preload_path = os.path.join(cfg_dir, "undici-timeout-preload.cjs")
         preload_content = (
             "// undici-timeout-preload.cjs\n"
-            "// DECISION #20: Fix OpenClaw/undici hardcoded 300s bodyTimeout.\n"
-            "// v2: Also patches Agent + Pool constructors (openclaw 2026.4.15 bypasses global dispatcher).\n"
+            "// DECISION #20: Fix OpenClaw/undici hardcoded 300s headersTimeout.\n"
             "// Reads timeoutSeconds from openclaw.json — stays in sync with GUI setting.\n"
             "// Written by OpenClawWinInstaller patch_gateway_cmd() — do not edit.\n"
             "'use strict';\n"
@@ -1960,7 +1888,7 @@ class OpenClawConfig:
             "    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));\n"
             "    const sec = cfg?.agents?.defaults?.timeoutSeconds;\n"
             "    if (typeof sec === 'number' && sec > 0) {\n"
-            "      return sec * 1000;\n"
+            "      return sec * 1000; // convert to ms, add 60s buffer\n"
             "    }\n"
             "  } catch (_) {}\n"
             "  return 2 * 60 * 60 * 1000; // fallback: 2h\n"
@@ -1994,38 +1922,14 @@ class OpenClawConfig:
             "  if (!undici) {\n"
             "    process.stderr.write('[undici-preload] undici not found — skipping patch\\n');\n"
             "  } else {\n"
-            "    const timeoutMs = readTimeoutMs();\n"
-            "    const OPTS = { headersTimeout: timeoutMs, bodyTimeout: 0 };\n"
-            "\n"
-            "    // Patch 1: global dispatcher — covers fetch() without explicit dispatcher\n"
             "    const { EnvHttpProxyAgent } = undici;\n"
+            "    // headersTimeout/bodyTimeout/connectTimeout: 0 = disabled (undici convention).\n"
+            "    // This is necessary because LLM responses can take minutes on slow hardware.\n"
+            "    const OPTS = { headersTimeout: 0, bodyTimeout: 0, connectTimeout: 30_000 };\n"
             "    const realSet = undici.setGlobalDispatcher.bind(undici);\n"
             "    function enforce() { realSet(new EnvHttpProxyAgent(OPTS)); }\n"
             "    enforce();\n"
             "    undici.setGlobalDispatcher = function () { enforce(); };\n"
-            "\n"
-            "    // Patch 2: Agent constructor — covers new Agent() with explicit dispatcher (openclaw 2026.4.15+)\n"
-            "    if (undici.Agent) {\n"
-            "      const _Agent = undici.Agent;\n"
-            "      class PatchedAgent extends _Agent {\n"
-            "        constructor(opts = {}) {\n"
-            "          super({ ...opts, bodyTimeout: 0, headersTimeout: Math.max(opts.headersTimeout || 0, timeoutMs) });\n"
-            "        }\n"
-            "      }\n"
-            "      undici.Agent = PatchedAgent;\n"
-            "    }\n"
-            "\n"
-            "    // Patch 3: Pool constructor — covers connection pools (HTTP/2 keep-alive paths)\n"
-            "    if (undici.Pool) {\n"
-            "      const _Pool = undici.Pool;\n"
-            "      class PatchedPool extends _Pool {\n"
-            "        constructor(origin, opts = {}) {\n"
-            "          super(origin, { ...opts, bodyTimeout: 0, headersTimeout: Math.max(opts.headersTimeout || 0, timeoutMs) });\n"
-            "        }\n"
-            "      }\n"
-            "      undici.Pool = PatchedPool;\n"
-            "    }\n"
-            "\n"
             "    // patch applied silently (two processes inherit NODE_OPTIONS → no duplicate output)\n"
             "  }\n"
             "} catch (e) {\n"
@@ -2061,8 +1965,8 @@ class OpenClawConfig:
                 "SET OLLAMA_HOST=http://127.0.0.1:11434\r\n",
                 "SET OLLAMA_HOST=http://127.0.0.1:11434\n",
                 # DECISION #28: OLLAMA_KEEP_ALIVE cleanup
-                "SET OLLAMA_KEEP_ALIVE=10m\r\n",
-                "SET OLLAMA_KEEP_ALIVE=10m\n",
+                "SET OLLAMA_KEEP_ALIVE=60m\r\n",
+                "SET OLLAMA_KEEP_ALIVE=60m\n",
                 "SET OPENCLAW_GATEWAY_TOKEN=lyra-local-token\r\n",
                 "SET OPENCLAW_GATEWAY_TOKEN=lyra-local-token\n",
                 f"SET OPENCLAW_GATEWAY_TOKEN={gw_token}\r\n",
@@ -2082,7 +1986,6 @@ class OpenClawConfig:
             ]:
                 clean = clean.replace(old_line, "")
 
-            import re  # must be before first re.sub — scoping fix
             import re  # must be before first re.sub — scoping fix
             # DECISION #40/#40b: Strip old Ollama wait-loop + warmup blocks (idempotent)
             # Matches from the rem DECISION #40 comment through the warmup powershell line.
@@ -2119,10 +2022,24 @@ class OpenClawConfig:
                 # DECISION #28: OLLAMA_KEEP_ALIVE — unload model after 10min
                 # idle. Prevents VRAM accumulation that causes exit status 2.
                 # 10m balances responsiveness vs VRAM pressure.
-                "SET OLLAMA_KEEP_ALIVE=10m\r\n"
+                "SET OLLAMA_KEEP_ALIVE=60m\r\n"
                 # ⚠️  DECISION #20: undici 300s timeout fix
                 f"{node_opts_line}"
-
+                # DECISION #40: Ollama runs in Docker — container may start
+                # slower than the gateway. If Ollama is not reachable at startup,
+                # buildOllamaProvider() returns models:[] → cached → "Unknown model".
+                # Wait loop ensures Ollama is ready before gateway discovery runs.
+                "rem DECISION #40: Wait for Ollama (Docker) before starting gateway\r\n"
+                ":wait_ollama\r\n"
+                "curl.exe -s -o NUL -w \"%%{http_code}\" http://127.0.0.1:11434/api/tags 2>NUL | findstr \"200\" >NUL 2>&1\r\n"
+                "if errorlevel 1 (\r\n"
+                "    echo [gateway] Waiting for Ollama at http://127.0.0.1:11434 ...\r\n"
+                "    timeout /t 5 /nobreak >NUL\r\n"
+                "    goto wait_ollama\r\n"
+                ")\r\n"
+                "echo [gateway] Ollama ready.\r\n"
+                "rem DECISION #40b: Warmup removed — Ollama runs in Docker/WSL2 as independent service.\r\n"
+                "rem              No warmup needed; model is already loaded and reachable.\r\n"
             )
 
             if "@echo off" in clean.lower():
@@ -2148,7 +2065,7 @@ class OpenClawConfig:
                     and node_ok):
                 self._log(
                     "  gateway.cmd: TZ + OLLAMA_API_KEY + OPENCLAW_GATEWAY_TOKEN "
-                    "+ NODE_OPTIONS (undici fix) + OLLAMA_KEEP_ALIVE=10m injected  ✓",
+                    "+ NODE_OPTIONS (undici fix) + OLLAMA_KEEP_ALIVE=60m injected  ✓",
                     "SUCCESS"
                 )
                 self._log(f"  First 4 lines: {verify[:200]!r}", "INFO")
@@ -2342,16 +2259,23 @@ class OpenClawConfig:
 
         # ── Apply additional fixes if anything changed ────────────────────────
         if changed:
-            # DECISION #9 (v1.0.1): ensure critical fields are always correct,
-            # DECISION #3 updated v1.0.4: Default timeoutSeconds = 7200 (2h).
-            # glm-4.7-flash on RTX 3050 with CPU offloading needs > 1h for complex tasks.
-            # Only lower to 7200 if currently above 28800 (8h) — never override
-            # a user-set value that's within reasonable bounds.
+            # DECISION #41: timeoutSeconds = 86400 (max accepted by OpenClaw 5.7 schema).
+            # timeoutSeconds: 0 is rejected (schema: must be > 0).
+            # The actual slow-model timeout is set via models.providers.ollama.timeoutSeconds
+            # which overrides undici at the provider level without schema rejection.
             try:
                 cfg.setdefault("agents", {}).setdefault("defaults", {})
-                current_to = cfg["agents"]["defaults"].get("timeoutSeconds", 0)
-                if current_to == 0 or current_to > 28800:
-                    cfg["agents"]["defaults"]["timeoutSeconds"] = 7200
+                cfg["agents"]["defaults"]["timeoutSeconds"] = 86400
+                # Remove legacy llm key if present (OpenClaw 5.7 rejects it)
+                cfg["agents"]["defaults"].pop("llm", None)
+            except Exception:
+                pass
+            # Set provider-level timeout: models.providers.ollama.timeoutSeconds
+            # This is the correct key in OpenClaw 5.x for slow local model timeouts.
+            try:
+                cfg.setdefault("models", {}).setdefault("providers", {})
+                cfg["models"]["providers"].setdefault("ollama", {})
+                cfg["models"]["providers"]["ollama"]["timeoutSeconds"] = 86400
             except Exception:
                 pass
             try:
@@ -2620,6 +2544,24 @@ f"REGEL: Wenn {primary_short} 3x hintereinander Timeout → Fallback-Modell wäh
 "  User informieren: \"[MODELL-WECHSEL] Primary \u2192 $fallback (VRAM-Crash exit status 2, Ollama-Neustart+Retry fehlgeschlagen).\"\n"
 "  Zurueck zum konfigurierten Primary: nvidia-smi pruefen, dann Installer \u2192 Primary LLM Dropdown.\n"
 "\n"
+"REGEL: Bei \"terminated | Body Timeout Error\" nach ~120-130 Sekunden (DECISION #41):\n"
+"  NICHT Ollama-Health oder VRAM \u2014 das ist der LLM-Idle-Watchdog, kein Absturz.\n"
+"  Ursache: resolveLlmIdleTimeoutMs() cappt idle auf 120s wenn agents.defaults.timeoutSeconds\n"
+"           gesetzt ist (clampImplicitTimeoutMs-Pfad, DEFAULT_LLM_IDLE_TIMEOUT_MS=120s).\n"
+"           Fix: models.providers.ollama.timeoutSeconds=86400 in openclaw.json.\n"
+"           Aktiviert modelRequestTimeoutMs-Pfad \u2192 kein 120s-Cap \u2192 24h idle.\n"
+"\n"
+"  DIAGNOSE via exec:\n"
+"  ```powershell\n"
+"  $cfg = Get-Content \"$env:USERPROFILE\\.openclaw\\openclaw.json\" -Raw | ConvertFrom-Json\n"
+"  $cfg.models.providers.ollama | ConvertTo-Json\n"
+"  ```\n"
+"  \u2192 Kein \"timeoutSeconds\" im ollama-Block \u2192 Installer \"Apply fixes\" klicken.\n"
+"  \u2192 timeoutSeconds=86400 vorhanden \u2192 andere Ursache \u2192 Gateway-Log pr\u00fcfen.\n"
+"\n"
+"  SCHEMA-PFLICHT (OpenClaw 2026.5.7): ollama-Block ben\u00f6tigt baseUrl (string) + models (array).\n"
+"  models=[] \u2192 Auto-Discovery bleibt aktiv. Installer schreibt diesen Block automatisch.\n"
+"\n"
 "---\n"
 "\n"
 "## Session-Start-Checkliste\n"
@@ -2645,6 +2587,15 @@ f"REGEL: Wenn {primary_short} 3x hintereinander Timeout → Fallback-Modell wäh
 "    → SOFORT referenzieren: 'Letztes Mal haben wir [Stand] erarbeitet.'\n"
 "    → NICHT nochmal fragen was bereits bekannt ist.\n"
 "    → Nahtlos weitermachen — kein 'hast du das schon mal erwähnt?'.\n"
+"\n"
+"Vor technischen Problemlösungen (Python, Packages, Docker, Umgebungen):\n"
+"  Durchsuche memory/YYYY-MM-DD.md der letzten 30 Tage nach:\n"
+"    - [CORRECTION]-Einträgen mit ähnlichem Fehler (Torch, pip, Docker, venv)\n"
+"    - Bereits dokumentierten funktionierenden Umgebungen (z.B. Docker-Container)\n"
+"  → Wenn Lösung in Memory gefunden: Nutze sie — kein ad-hoc Raten.\n"
+"  → Wenn nichts gefunden: Dann eigene Lösungsversuche starten.\n"
+"  REGEL: Bekannte Goldstandard-Umgebung (z.B. Docker dna-runner:v1) hat Vorrang\n"
+"         vor lokalen PowerShell-Installationsversuchen.\n"
 "\n"
 "---\n"
 "\n"
@@ -2806,9 +2757,9 @@ f"REGEL: Wenn {primary_short} 3x hintereinander Timeout → Fallback-Modell wäh
 "     Ergänzung: <konkrete Regel in 1-3 Sätzen>\n"
 "     Grund: <warum diese Regel fehlt>\n"
 "\n"
-"Danach: call_observer(reason=\"[SOUL-UPDATE-VORSCHLAG] geschrieben: <Sektion>\") aufrufen.\n"
-"Der Observer startet in einem neuen Fenster und setzt die Verbesserung in beiden\n"
-"Tracks um (SOUL.md + OpenClawConfigManagement.py) — kein Eingriff des Menschen nötig.\n"
+"Der Claude Code Observer (FileSystemWatcher, 30s-Poll) erkennt den Tag automatisch.\n"
+"Nach 5-Minuten-Debounce startet Claude Code und führt die Verbesserung in beiden\n"
+"Tracks aus (SOUL.md + OpenClawConfigManagement.py) — kein Eingriff des Menschen nötig.\n"
 "LYRA schlägt vor — Claude Code setzt um.\n"
 "\n"
 "### Wann ein [CONTEXT]-Eintrag geschrieben wird\n"
@@ -2863,7 +2814,7 @@ f"REGEL: Wenn {primary_short} 3x hintereinander Timeout → Fallback-Modell wäh
 "Hat sich gezeigt dass eine SOUL.md-Regel fehlt oder widerspr\u00fcchlich ist?\n"
 "\n"
 "→ JA: [SOUL-UPDATE-VORSCHLAG] in memory/YYYY-MM-DD.md schreiben.\n"
-"     dann: call_observer(reason=\"[SOUL-UPDATE-VORSCHLAG]: <Sektion>\") aufrufen.\n"
+"     Claude Code Observer reagiert automatisch (5-Min-Debounce).\n"
 "→ NEIN: Nichts schreiben.\n"
 "\n"
 "### Schritt 3 — Kontext-Persistenz-Check\n"
@@ -3411,8 +3362,77 @@ f"   Sobald VRAM wieder frei: nvidia-smi pruefen, dann zu {primary_short} zuruec
 "\n"
 "REGEL: Was nicht geschrieben ist, existiert nach dem Session-Ende nicht mehr.\n"
 "       Nur exec-Output ist real. Nur Datei-Inhalt überlebt den Neustart.\n"
-        )
+        ) + self._build_role_soul_section()
 
+    def _build_role_soul_section(self) -> str:
+        """
+        Appends a role-specific SOUL.md block when the active role is not the default.
+        Called by _build_soul_content() — result is appended to the main content string.
+        """
+        role = getattr(self, "_lyra_role", "pattern_recognition")
+        if role == "research_agent":
+            return (
+"\n"
+"---\n"
+"\n"
+"## Aktive Rolle: Research Agent (LYRA-NET)\n"
+"\n"
+"LYRA-NET ist ein HTTP-Dienst auf Port 18800.\n"
+"KEIN OpenClaw-Agent, KEIN Worker, KEIN Subagent.\n"
+"\n"
+"---\n"
+"\n"
+"### BEIM START JEDES TURNS ZUERST PRÜFEN:\n"
+"\n"
+"  exec → Test-Path \"$env:USERPROFILE\\.openclaw\\workspace\\research_report.md\"\n"
+"\n"
+"  Wenn True (Datei existiert):\n"
+"    exec → Get-Content \"$env:USERPROFILE\\.openclaw\\workspace\\research_report.md\"\n"
+"    → Inhalt dem User präsentieren als Zwischenbericht vom Research Agent\n"
+"    exec → Remove-Item \"$env:USERPROFILE\\.openclaw\\workspace\\research_report.md\"\n"
+"    → Datei löschen damit sie nicht nochmal gelesen wird\n"
+"\n"
+"---\n"
+"\n"
+"### EINZIGE ERLAUBTE METHODE fuer Recherche-Anfragen:\n"
+"\n"
+"  SCHRITT 1 — Hypothese setzen und Skript aufrufen:\n"
+"    exec → $env:RESEARCH_HYPOTHESIS='<Frage>'; powershell -ExecutionPolicy Bypass -File \"$env:USERPROFILE\\.openclaw\\workspace\\research_query.ps1\"\n"
+"\n"
+"  SCHRITT 2 — An User melden (Turn danach BEENDEN):\n"
+"    'Recherche gestartet. Ich melde mich wenn Ergebnisse vorliegen.'\n"
+"\n"
+"  SCHRITT 3 — Ergebnisse in neuem Turn holen:\n"
+"    exec → Invoke-RestMethod -Uri 'http://127.0.0.1:18800/api/research/dossiers'\n"
+"    exec → Invoke-RestMethod -Uri 'http://127.0.0.1:18800/api/research/dossier/<name>'\n"
+"    Feld 'content' = Markdown → zusammenfassen und zeigen.\n"
+"\n"
+"---\n"
+"\n"
+"### VERBOTEN:\n"
+"\n"
+"  Inline JSON in PowerShell ($body = '{...}') IMMER FALSCH\n"
+"  Invoke-RestMethod direkt mit -Body JSON-String IMMER FALSCH\n"
+"  Sub-agent spawn, Agents-Tool, workers.json lesen\n"
+"  Im selben Turn auf Ergebnis warten\n"
+"\n"
+"---\n"
+"\n"
+"### Status und Dossiers:\n"
+"\n"
+"  exec → Invoke-RestMethod -Uri 'http://127.0.0.1:18800/api/research/status'\n"
+"  exec → Invoke-RestMethod -Uri 'http://127.0.0.1:18800/api/research/dossiers'\n"
+"  exec → Get-Content \"$env:USERPROFILE\\.openclaw\\workspace\\dossiers\\<name>.md\"\n"
+"\n"
+"### Memory-Tags:\n"
+"\n"
+"  [LEARNING:research_agent]  Fallstricke, was funktioniert\n"
+"  [CONTEXT:research_agent]   laufende Hypothesen, Dossiers\n"
+"\n"
+"---\n"
+            )
+        # Kein zusätzlicher Block für andere Rollen nötig (bereits in Hauptinhalt)
+        return ""
     def write_soul_files(self, log_prefix: str = "",
                          hw_profile: dict | None = None) -> None:
         """
@@ -3478,6 +3498,49 @@ ASKING FOR API KEY = ERROR. NEVER DO. Call delegate_to_worker.
             self._log(f"  {tag} FORCE-DELEGATE.md: {force_path}  ✓", "SUCCESS")
         except Exception as e:
             self._log(f"  {tag} FORCE-DELEGATE.md error: {e}", "WARNING")
+
+        # ── research_query.ps1 — LYRA-NET Werkzeug (immer überschreiben) ──────
+        # Löst das PowerShell JSON-Escaping-Problem.
+        # LYRA ruft es via $env:RESEARCH_HYPOTHESIS auf — keine Sonderzeichen-Probleme.
+        rq_path    = os.path.join(workspace_dir, "research_query.ps1")
+        rq_content = (
+            'param(\r\n'
+            '    [string]$hypothesis = $env:RESEARCH_HYPOTHESIS,\r\n'
+            '    [string]$source     = "lyra",\r\n'
+            '    [string]$baseUrl    = "http://127.0.0.1:18800"\r\n'
+            ')\r\n'
+            'if (-not $hypothesis) {\r\n'
+            '    Write-Host "[ERROR] Kein hypothesis-Parameter angegeben"\r\n'
+            '    exit 1\r\n'
+            '}\r\n'
+            'try {\r\n'
+            '    Invoke-RestMethod -Uri "$baseUrl/api/health" -TimeoutSec 3 | Out-Null\r\n'
+            '    Write-Host "[OK] LYRA-NET erreichbar"\r\n'
+            '} catch {\r\n'
+            '    Write-Host "[ERROR] LYRA-NET nicht erreichbar auf $baseUrl"\r\n'
+            '    exit 1\r\n'
+            '}\r\n'
+            '$b = [ordered]@{\r\n'
+            '    hypothesis = $hypothesis\r\n'
+            '    is_seed    = $true\r\n'
+            '    source     = $source\r\n'
+            '} | ConvertTo-Json -Compress\r\n'
+            'try {\r\n'
+            '    $r = Invoke-RestMethod -Uri "$baseUrl/api/research/hypothesis" -Method POST -ContentType "application/json" -Body $b\r\n'
+            '    Write-Host "[OK] Gestartet: $($r.hypotheses_generated) Hypothesen"\r\n'
+            '    Write-Host "[OK] ID: $($r.id)"\r\n'
+            '    Write-Host "[OK] Text: $($r.text)"\r\n'
+            '} catch {\r\n'
+            '    Write-Host "[ERROR] Anfrage fehlgeschlagen: $_"\r\n'
+            '    exit 1\r\n'
+            '}\r\n'
+        )
+        try:
+            with open(rq_path, "w", encoding="utf-8") as f:
+                f.write(rq_content)
+            self._log(f"  {tag} research_query.ps1 written: {rq_path}  ✓", "SUCCESS")
+        except Exception as e:
+            self._log(f"  {tag} research_query.ps1 error: {e}", "WARNING")
 
     # ── openclaw CLI operations ────────────────────────────────────────────────
 
@@ -7361,6 +7424,8 @@ exit 1
 
         # Installation – with live output and extended environment
         sources = [
+            ("npm openclaw@2026.5.7",
+             "npm install -g openclaw@2026.5.7"),
             ("npm openclaw@latest",
              "npm install -g openclaw@latest"),
             ("npm openclaw@latest (skip-llama-download)",

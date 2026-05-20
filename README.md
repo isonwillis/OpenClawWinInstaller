@@ -1,7 +1,9 @@
 # OpenClawWinInstaller
 
-> **Status: v1.0.4 — PRODUCTION READY** · 2026-04-19  
-> ✅ OpenClaw 2026.4.x fully supported — undici preload v2 patches all timeout paths (headersTimeout + Agent + Pool constructors)
+> **Status: v1.0.4 — PRODUCTION READY** · 2026-05-20  
+> ✅ OpenClaw 2026.5.18 fully supported — exec schema tightened; `tools.exec.profile` removed (DECISION #43 RETIRED)  
+> ✅ Auto-update disabled by default — prevents 2026.5.7-style config wipe (DECISION #44)  
+> ✅ undici preload v2 patches all timeout paths (headersTimeout + Agent + Pool constructors)
 
 A fully automated Windows installer that sets up **OpenClaw** with a local LLM (LYRA via Ollama).  
 After running the script, LYRA is immediately ready to use — no manual configuration, no token issues, no approval prompts.
@@ -37,11 +39,15 @@ From v1.0.4 the system also supports **external LLM agents** (OpenAI-compatible 
 - ✅ IsonCodexProducer: full AI film production orchestrator as standalone tool
 - ✅ Script Supervisor: any novel → LLM scene list via multi-turn conversation
 - ✅ Central utility functions: `diag_api()` + `strip_ansi()` — zero duplication across modules
+- ✅ Auto-update safeguard: `update.auto.enabled=false` — prevents silent config wipe on npm update
+- ✅ exec schema hardening: `tools.exec.profile` stripped on Apply-fixes (rejected by OpenClaw 2026.5.18)
 
 ---
 
 ## Table of Contents
 
+- [What's New in v1.0.4](#whats-new-in-v105)
+  - [Observer Session 2026-05-20](#-observer-session-2026-05-20--openclaw-2026518-exec-schema--auto-update-safeguard)
 - [What's New in v1.0.4](#whats-new-in-v104)
   - [Observer Session 2026-04-19](#-observer-session-2026-04-19--openclaw-2026-4x-timeout-resolved--call_observer-skill)
   - [Observer Session 2026-04-03](#-observer-session-2026-04-03--openclaw-2026-4x-breaking-changes--version-pin)
@@ -162,6 +168,54 @@ complete documentation.
 | `SCENES[i]` refs after `_get_active_scenes()` | All 19 remaining `SCENES[` references replaced with `_get_active_scenes()[i]` |
 | `_run_single_scene` used SCENES directly | Fixed to use `_get_active_scenes()` |
 
+
+---
+
+## What's New in v1.0.4
+
+### 🔭 Observer Session 2026-05-20 — OpenClaw 2026.5.18 exec Schema + Auto-Update Safeguard
+
+#### ~~✅ DECISION #43~~ — `tools.exec.profile = "coding"` RETIRED
+
+**Background (2026-01 → 2026-05-17):** Since the January 2026 security hardening, OpenClaw shipped exec disabled by default. `tools.exec.security = "full"` alone had no runtime effect — the gateway enforced exec via a separate profile lookup. The workaround: `tools.exec.profile = "coding"` in the exec block. Accepted but ignored by older builds.
+
+**Breaking change in 2026.5.18:** The exec config schema was tightened to strict mode. `"profile"` is now an unrecognized key inside `tools.exec` → `"tools.exec: Invalid input"` → `gateway.startup_failed`. Confirmed by 5 startup_failed entries (2026-05-20 15:55–16:54).
+
+**Binary search result:** removing `profile` → `openclaw config validate` → "Config valid" → Gateway PID listening on 18789.
+
+**Fix applied:**
+
+| Location | Change |
+|---|---|
+| `openclaw.json` | `"profile": "coding"` removed from `tools.exec` |
+| `OpenClawConfigManagement.py` | `"profile"` added to `REJECTED_KEYS_EXEC` (both occurrences: line ~163 + ~1473) |
+| `write_openclaw_config()` | `"profile"` key removed from generated exec block |
+| `_apply_fixes_and_update()` | Strips `profile` if still present; no longer writes it |
+| DECISION #43 docstrings | Marked RETIRED throughout both files |
+
+**exec activation path in 2026.5.18:** `tools.profile = "full"` (set at the outer `tools` level — already present since v1.0.0) is the correct and sufficient opt-in. No exec-level profile key needed or accepted.
+
+#### ✅ DECISION #44 — Auto-Update Disabled
+
+**Problem:** OpenClaw 2026.5.7 (npm auto-update) reset the entire `openclaw.json`, wiping `agents`, `channels`, `plugins`, and `credentials` ([Issue #80077](https://github.com/openclaw/openclaw/issues/80077)). The `.bak` files created during the update already reflected the wiped config — not the original.
+
+**Fix:** Two new keys written by `write_openclaw_config()` and restored by `_apply_fixes_and_update()` on every run:
+
+```json
+"update": {
+  "auto":         { "enabled": false },
+  "checkOnStart": false
+}
+```
+
+`checkOnStart: false` also suppresses the update banner that can trigger background auto-update in some environments. Backwards-compatible: older OpenClaw builds accept but ignore the `update` block.
+
+**Manual update path:** Run `npm install -g openclaw@latest` manually, then click **🛠 Apply fixes + Update SOUL.md** in the installer to restore all config values.
+
+#### ❌ `tools.exec.profile` in openclaw.json — NEVER REINTRODUCE
+> OpenClaw >= 2026.5.18 rejects `tools.exec.profile` as an unrecognized key in strict exec schema mode.  
+> `_apply_fixes_and_update()` will strip it automatically if found in an existing config.  
+> exec is activated via `tools.profile = "full"` at the outer tools level.
 
 ---
 
