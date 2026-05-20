@@ -1,9 +1,8 @@
 # OpenClawWinInstaller
 
-> **Status: v1.0.4 — PRODUCTION READY** · 2026-05-20  
+> **Status: v1.0.5 — PRODUCTION READY** · 2026-05-20  
 > ✅ OpenClaw 2026.5.18 fully supported — exec schema tightened; `tools.exec.profile` removed (DECISION #43 RETIRED)  
 > ✅ Auto-update disabled by default — prevents 2026.5.7-style config wipe (DECISION #44)  
-> ✅ OpenClaw pinned to 2026.3.28 — GitHub fallback, PS1 version manager (DECISION #45)  
 > ✅ undici preload v2 patches all timeout paths (headersTimeout + Agent + Pool constructors)
 
 A fully automated Windows installer that sets up **OpenClaw** with a local LLM (LYRA via Ollama).  
@@ -42,16 +41,14 @@ From v1.0.4 the system also supports **external LLM agents** (OpenAI-compatible 
 - ✅ Central utility functions: `diag_api()` + `strip_ansi()` — zero duplication across modules
 - ✅ Auto-update safeguard: `update.auto.enabled=false` — prevents silent config wipe on npm update
 - ✅ exec schema hardening: `tools.exec.profile` stripped on Apply-fixes (rejected by OpenClaw 2026.5.18)
-- ✅ Version pin: OpenClaw 2026.3.28 as stable baseline — GitHub .tgz fallback if npm unreachable
-- ✅ PS1 version manager: install / update / switch / list — standalone version management
 
 ---
 
 ## Table of Contents
 
-- [What's New in v1.0.4](#whats-new-in-v105)
+- [What's New in v1.0.5](#whats-new-in-v105)
   - [Observer Session 2026-05-20](#-observer-session-2026-05-20--openclaw-2026518-exec-schema--auto-update-safeguard)
-  - [DECISION #45 — Version Pin + PS1 Scripts](#-decision-45--openclaw-version-pin--ps1-version-manager)
+  - [DECISION #46 — models.providers.ollama.timeoutSeconds version-gated](#-decision-46--modelsprovidersollama-version-gated)
 - [What's New in v1.0.4](#whats-new-in-v104)
   - [Observer Session 2026-04-19](#-observer-session-2026-04-19--openclaw-2026-4x-timeout-resolved--call_observer-skill)
   - [Observer Session 2026-04-03](#-observer-session-2026-04-03--openclaw-2026-4x-breaking-changes--version-pin)
@@ -175,60 +172,30 @@ complete documentation.
 
 ---
 
-### 🔧 DECISION #45 — OpenClaw Version Pin + PS1 Version Manager
+### 🔧 DECISION #46 — `models.providers.ollama` Version-Gated
 
-#### Version Pin: 2026.3.28 as stable baseline
+**Root cause (confirmed 2026-05-20):** `models.providers.ollama.timeoutSeconds` is an **unknown schema field** in OpenClaw 2026.3.x. The gateway crashes silently on start if the key is present. `openclaw doctor --fix` detects and strips it — gateway works again.
 
-`fix_openclaw_installation()` now tries install sources in this order:
+Reproduction sequence:
+1. Apply-fixes writes `timeoutSeconds: 86400` → gateway restart → **crash**
+2. `openclaw doctor --fix` → strips `timeoutSeconds` from `models.providers.ollama`
+3. Gateway starts ✔
 
-| Priority | Source | Notes |
-|---|---|---|
-| 1 | `npm install -g openclaw@2026.3.28` | Pinned stable version |
-| 2 | GitHub `.tgz` fallback | [openclaw-2026.3.28.tgz](https://github.com/isonwillis/OpenClawWinInstaller/releases/download/v1.0.1/openclaw-2026.3.28.tgz) |
-| 3 | `npm install -g openclaw@latest` | Last resort |
-| 4+ | Further fallbacks | Skip-scripts, bare npm, GitHub repo |
+The key is valid and necessary in OpenClaw **≥ 2026.5.0** (DECISION #41). It was written unconditionally by the installer even when running 2026.3.x.
 
-`OPENCLAW_STABLE_VERSION = "2026.3.28"` and `OPENCLAW_GITHUB_FALLBACK` are now class constants in `OpenClawOperations`.
+**Fix:** All three write paths are now version-gated on `meta.lastTouchedVersion`:
 
-**Why 2026.3.28:** Each newer minor version introduced at least one breaking schema change:
+| Version | Behaviour |
+|---|---|
+| `>= 2026.5.0` | `timeoutSeconds: 86400` written — activates `modelRequestTimeoutMs` path |
+| `2026.3.x` (stable pin) | Key **omitted** on write, **stripped** if found in existing config |
 
-| Version | Issue | Decision |
-|---|---|---|
-| 2026.4.x | Hardcoded 60s LLM timeout | undici preload v2 (active) |
-| 2026.5.7 | Auto-update wipes `openclaw.json` | DECISION #44 (active) |
-| 2026.5.18 | `tools.exec.profile` rejected | DECISION #43 (RETIRED — stripped) |
+Timeout on 2026.3.x is handled correctly by the **undici preload** (DECISION #20) and `agents.defaults.timeoutSeconds: 86400` — no provider-level key needed.
 
-Newer versions can still be installed via the PS1 scripts or by passing `-ForceNewVersion`. Apply-fixes in the installer GUI restores all config values afterwards.
-
-#### Three new PS1 scripts
-
-**`install-openclaw.ps1`** — pinned install with GitHub fallback
-```powershell
-.\install-openclaw.ps1                          # install 2026.3.28 (recommended)
-.\install-openclaw.ps1 -Version "2026.5.18"     # specific version (with warning prompt)
-.\install-openclaw.ps1 -Version "latest" -ForceNewVersion  # skip prompt
-```
-
-**`update-openclaw.ps1`** — intelligent update with version comparison
-```powershell
-.\update-openclaw.ps1                           # update/repair to 2026.3.28
-.\update-openclaw.ps1 -TargetVersion "2026.5.18"
-```
-
-**`openclaw-version-manager.ps1`** — unified management CLI
-```powershell
-.\openclaw-version-manager.ps1 status          # installed version + compatibility notes
-.\openclaw-version-manager.ps1 list            # all known versions with issue summary
-.\openclaw-version-manager.ps1 install         # install stable
-.\openclaw-version-manager.ps1 switch          # clean reinstall of stable
-.\openclaw-version-manager.ps1 update -Version 2026.5.18
-```
-
-All three scripts warn on versions newer than 2026.3.28 by listing the known issues — they inform without blocking.
-
-#### ❌ `npm install -g openclaw@latest` as first install attempt — NEVER REINTRODUCE
-> Latest is now the last resort, not the first. The stable pin guarantees a known-good baseline.
-> The GitHub fallback ensures install succeeds even when npm is unreachable.
+#### ❌ `models.providers.ollama.timeoutSeconds` on OpenClaw 2026.3.x — NEVER REINTRODUCE
+> Unknown schema field in OpenClaw 2026.3.x — gateway crash on start.  
+> `Apply-fixes` strips it automatically on 2026.3.x.  
+> Only valid for OpenClaw ≥ 2026.5.0 (DECISION #41).
 
 ---
 

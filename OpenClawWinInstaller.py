@@ -47,12 +47,12 @@ v1.0.4 (2026-03-25):
                 to REJECTED_KEYS_EXEC so Apply-fixes strips it from existing configs.
                 exec is now activated via tools.profile="full" (already set at
                 the tools level). _apply_fixes_and_update() no longer writes it.
-  DECISION #45: Version management PS1 scripts generated dynamically (2026-05-20).
-                _write_version_manager_scripts() in OpenClawConfigManagement.py
-                generates install-openclaw.ps1, update-openclaw.ps1,
-                openclaw-version-manager.ps1 into ~/.openclaw/workspace/
-                on every Apply-fixes run. Stable pin: 2026.3.28 + GitHub .tgz
-                fallback. Called from _apply_fixes_and_update().
+  DECISION #46: models.providers.ollama.timeoutSeconds version-gated (2026-05-20).
+                INVALID in OpenClaw 2026.3.x — gateway crashes on start if present.
+                Confirmed: apply-fixes sets it → crash; doctor strips it → works.
+                Only written for OpenClaw >= 2026.5.0. In 2026.3.x: undici preload
+                (DECISION #20) + agents.defaults.timeoutSeconds=86400 is sufficient.
+                Also strips the key if found on 2026.3.x (cleanup).
   DECISION #44: Auto-update disabled — v2026.5.7 wipes entire openclaw.json.
                 update.auto.enabled=false + update.checkOnStart=false prevent
                 npm-triggered config resets (issue #80077).
@@ -2681,17 +2681,34 @@ class OpenClawWinInstaller(OpenClawOperations):
             cfg["agents"]["defaults"]["timeoutSeconds"] = seconds
             # Remove legacy llm key (rejected by OpenClaw 5.7 schema)
             cfg["agents"]["defaults"].pop("llm", None)
-            # DECISION #41: also set provider-level timeout (correct key in OpenClaw 5.x)
+            # DECISION #41/#46: provider-level timeoutSeconds only for OpenClaw >= 2026.5.0.
+            # In 2026.3.x this key is INVALID — crashes the gateway (DECISION #46).
+            # Undici preload (DECISION #20) handles the timeout in 2026.3.x.
+            _mt_ver = cfg.get("meta", {}).get("lastTouchedVersion", "0.0.0")
+            try:
+                _mt_p = [int(x) for x in _mt_ver.split(".")]
+                _mt_ge500 = len(_mt_p) > 1 and (
+                    _mt_p[0] > 2026 or (_mt_p[0] == 2026 and _mt_p[1] >= 5)
+                )
+            except Exception:
+                _mt_ge500 = False
             cfg.setdefault("models", {}).setdefault("providers", {})
             cfg["models"]["providers"].setdefault("ollama", {})
-            cfg["models"]["providers"]["ollama"]["timeoutSeconds"] = seconds
+            if _mt_ge500:
+                cfg["models"]["providers"]["ollama"]["timeoutSeconds"] = seconds
+            else:
+                # 2026.3.x: strip if present (cleanup from previous installer runs)
+                cfg["models"]["providers"]["ollama"].pop("timeoutSeconds", None)
             shutil.copy2(cfg_path, cfg_path + f".bak_{int(time.time())}")
             with open(cfg_path, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=2, ensure_ascii=False)
 
             label = f"{seconds}s (24h — max)" if seconds == 86400 else f"{seconds}s"
             self.log(f"[Timeout] agents.defaults.timeoutSeconds = {label}  ✓", "SUCCESS")
-            self.log(f"[Timeout] models.providers.ollama.timeoutSeconds = {label}  ✓", "SUCCESS")
+            if _mt_ge500:
+                self.log(f"[Timeout] models.providers.ollama.timeoutSeconds = {label}  ✓", "SUCCESS")
+            else:
+                self.log("[Timeout] models.providers.ollama.timeoutSeconds: NOT set (2026.3.x — DECISION #46)", "INFO")
             if hasattr(self, "_timeout_info"):
                 self._timeout_info.config(
                     text=f"⏱  timeoutSeconds: {label}",
@@ -3117,9 +3134,9 @@ class OpenClawWinInstaller(OpenClawOperations):
             exec activated via tools.profile="full" at the outer tools level.
           - DECISION #44: update.auto.enabled=false — prevent 2026.5.7-style config wipe.
             OpenClaw 2026.5.7 npm auto-update resets openclaw.json entirely (issue #80077).
-          - DECISION #45: _write_version_manager_scripts() — generates install-openclaw.ps1,
-            update-openclaw.ps1, openclaw-version-manager.ps1 into workspace/.
-            Stable pin 2026.3.28 + GitHub .tgz fallback embedded as class constants.
+          - DECISION #46: models.providers.ollama.timeoutSeconds version-gated.
+            Invalid in OpenClaw 2026.3.x (gateway crash). Only set for >= 2026.5.0.
+            Strips the key if present on 2026.3.x. set_model_timeout() also gated.
         """
         cfg_dir       = self.cfg._find_openclaw_config_dir()
         cfg_path      = os.path.join(cfg_dir, "openclaw.json")
@@ -3326,24 +3343,73 @@ class OpenClawWinInstaller(OpenClawOperations):
                 # → activates modelRequestTimeoutMs path (no 120s cap → 24h idle).
                 # Schema: baseUrl (string) + models (array) REQUIRED alongside timeoutSeconds.
                 # models=[] keeps ambient auto-discovery active (hasExplicitModels=false).
+                #
+                # DECISION #46 (2026-05-20): models.providers.ollama.timeoutSeconds is
+                # INVALID in OpenClaw 2026.3.x schema — gateway crashes on start if
+                # this key is present (confirmed: apply-fixes → gateway crash,
+                # doctor --fix strips it → gateway works again).
+                # Version gate: only write timeoutSeconds for OpenClaw >= 2026.5.0.
+                # In 2026.3.x: undici preload (DECISION #20) handles the timeout at
+                # the Node.js layer; agents.defaults.timeoutSeconds=86400 is sufficient.
+                # Also: strip timeoutSeconds if present on 2026.3.x (cleanup after
+                # previous installer runs that wrote it unconditionally).
+                _oc_ver = cfg.get("meta", {}).get("lastTouchedVersion", "0.0.0")
+                try:
+                    _oc_parts = [int(x) for x in _oc_ver.split(".")]
+                    _oc_major = _oc_parts[0] if len(_oc_parts) > 0 else 0
+                    _oc_minor = _oc_parts[1] if len(_oc_parts) > 1 else 0
+                    _oc_ge_500 = (_oc_major > 2026) or (_oc_major == 2026 and _oc_minor >= 5)
+                except Exception:
+                    _oc_ge_500 = False
                 _providers = cfg.setdefault("models", {}).setdefault("providers", {})
                 _ollama = _providers.get("ollama", {})
-                _needs_41 = (
-                    "ollama" not in _providers
-                    or _ollama.get("timeoutSeconds", 0) != 86400
-                    or not _ollama.get("baseUrl", "")
-                    or "models" not in _ollama
-                )
-                if _needs_41:
-                    _providers["ollama"] = {
-                        "baseUrl":        "http://127.0.0.1:11434",
-                        "models":         _ollama.get("models", []),
-                        "timeoutSeconds": 86400,
-                    }
-                    fixes_applied.append(
-                        "models.providers.ollama (DECISION #41 — timeoutSeconds=86400, "
-                        "baseUrl, models=[] for auto-discovery)"
+                if _oc_ge_500:
+                    # OpenClaw >= 2026.5.0: timeoutSeconds is a valid schema field
+                    _needs_41 = (
+                        "ollama" not in _providers
+                        or _ollama.get("timeoutSeconds", 0) != 86400
+                        or not _ollama.get("baseUrl", "")
+                        or "models" not in _ollama
                     )
+                    if _needs_41:
+                        _providers["ollama"] = {
+                            "baseUrl":        "http://127.0.0.1:11434",
+                            "models":         _ollama.get("models", []),
+                            "timeoutSeconds": 86400,
+                        }
+                        fixes_applied.append(
+                            "models.providers.ollama (DECISION #41 — timeoutSeconds=86400, "
+                            "baseUrl, models=[] for auto-discovery — OpenClaw >= 2026.5.0)"
+                        )
+                else:
+                    # OpenClaw 2026.3.x: timeoutSeconds CRASHES the gateway — strip if present
+                    # DECISION #46: undici preload + agents.defaults.timeoutSeconds is sufficient
+                    _needs_strip = (
+                        "ollama" in _providers
+                        and "timeoutSeconds" in _ollama
+                    )
+                    if _needs_strip:
+                        del _providers["ollama"]["timeoutSeconds"]
+                        fixes_applied.append(
+                            "models.providers.ollama.timeoutSeconds STRIPPED "
+                            "(DECISION #46 — invalid schema field in OpenClaw 2026.3.x, "
+                            "causes gateway crash on start)"
+                        )
+                    # Ensure baseUrl and models are present (needed for auto-discovery)
+                    _needs_base = (
+                        "ollama" not in _providers
+                        or not _ollama.get("baseUrl", "")
+                        or "models" not in _ollama
+                    )
+                    if _needs_base:
+                        _providers.setdefault("ollama", {}).update({
+                            "baseUrl": "http://127.0.0.1:11434",
+                            "models":  _ollama.get("models", []),
+                        })
+                        fixes_applied.append(
+                            "models.providers.ollama (baseUrl + models ensured — "
+                            "DECISION #46 2026.3.x path, no timeoutSeconds)"
+                        )
 
                 # DECISION #44: update.auto.enabled = false — v2026.5.7 wipes openclaw.json.
                 # OpenClaw 2026.5.7 (npm auto-update) resets the entire openclaw.json,
@@ -3478,17 +3544,6 @@ class OpenClawWinInstaller(OpenClawOperations):
                 self.log(f"[Fix] sessions.json delete failed: {e}", "WARNING")
         else:
             self.log("[Fix] sessions.json not found — nothing to delete", "INFO")
-
-        # ── DECISION #45: Version management PS1 scripts ──────────────────────
-        # Generated dynamically — stays in sync with OPENCLAW_STABLE_VERSION.
-        try:
-            ok45 = self.cfg._write_version_manager_scripts()
-            if ok45:
-                self.log("[Fix] Version manager scripts written to workspace ✓", "SUCCESS")
-            else:
-                self.log("[Fix] Version manager scripts: partial write", "WARNING")
-        except Exception as _e45:
-            self.log(f"[Fix] Version manager scripts: {_e45}", "WARNING")
 
         # ── Gateway restart ────────────────────────────────────────────────────
         self.root.after(800, self._restart_gateway)
