@@ -47,6 +47,12 @@ v1.0.4 (2026-03-25):
                 to REJECTED_KEYS_EXEC so Apply-fixes strips it from existing configs.
                 exec is now activated via tools.profile="full" (already set at
                 the tools level). _apply_fixes_and_update() no longer writes it.
+  DECISION #45: Version management PS1 scripts generated dynamically (2026-05-20).
+                _write_version_manager_scripts() in OpenClawConfigManagement.py
+                generates install-openclaw.ps1, update-openclaw.ps1,
+                openclaw-version-manager.ps1 into ~/.openclaw/workspace/
+                on every Apply-fixes run. Stable pin: 2026.3.28 + GitHub .tgz
+                fallback. Called from _apply_fixes_and_update().
   DECISION #44: Auto-update disabled — v2026.5.7 wipes entire openclaw.json.
                 update.auto.enabled=false + update.checkOnStart=false prevent
                 npm-triggered config resets (issue #80077).
@@ -3111,6 +3117,9 @@ class OpenClawWinInstaller(OpenClawOperations):
             exec activated via tools.profile="full" at the outer tools level.
           - DECISION #44: update.auto.enabled=false — prevent 2026.5.7-style config wipe.
             OpenClaw 2026.5.7 npm auto-update resets openclaw.json entirely (issue #80077).
+          - DECISION #45: _write_version_manager_scripts() — generates install-openclaw.ps1,
+            update-openclaw.ps1, openclaw-version-manager.ps1 into workspace/.
+            Stable pin 2026.3.28 + GitHub .tgz fallback embedded as class constants.
         """
         cfg_dir       = self.cfg._find_openclaw_config_dir()
         cfg_path      = os.path.join(cfg_dir, "openclaw.json")
@@ -3469,6 +3478,17 @@ class OpenClawWinInstaller(OpenClawOperations):
                 self.log(f"[Fix] sessions.json delete failed: {e}", "WARNING")
         else:
             self.log("[Fix] sessions.json not found — nothing to delete", "INFO")
+
+        # ── DECISION #45: Version management PS1 scripts ──────────────────────
+        # Generated dynamically — stays in sync with OPENCLAW_STABLE_VERSION.
+        try:
+            ok45 = self.cfg._write_version_manager_scripts()
+            if ok45:
+                self.log("[Fix] Version manager scripts written to workspace ✓", "SUCCESS")
+            else:
+                self.log("[Fix] Version manager scripts: partial write", "WARNING")
+        except Exception as _e45:
+            self.log(f"[Fix] Version manager scripts: {_e45}", "WARNING")
 
         # ── Gateway restart ────────────────────────────────────────────────────
         self.root.after(800, self._restart_gateway)
