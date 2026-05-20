@@ -635,6 +635,7 @@ HTML_TEMPLATE = """
                 <!-- ── DOSSIERS ───────────────────────────────── -->
                 <div class="rs-section">
                     <div class="rs-title">📄 Dossiers</div>
+                    <div id="dossierFilterLabel" style="display:none;font-size:0.7em;color:#4488ff;padding:2px 0 4px 0;cursor:pointer;" onclick="filterDossiersBySeed(null,null)"></div>
                     <div id="dossierList" class="rs-dossiers">
                         <div class="rs-empty">Keine Dossiers vorhanden</div>
                     </div>
@@ -1252,8 +1253,9 @@ function renderSeeds(hyps, queueLimit) {
     seeds.forEach(function(h) {
         var icon = h.status === 'active' ? '🔄' : h.status === 'done' ? '✅' : '🌱';
         var conf = h.confidence ? ' ' + h.confidence + '%' : '';
-        var canStop = (h.status !== 'done');
-        html += '<div class="seed-card">';
+        var hasPending = hyps.some(function(x) { return !x.is_seed && x.status === 'pending'; });
+        var canStop = (h.status !== 'done') || hasPending;
+        html += '<div class="seed-card" data-seed-id="' + h.id + '" data-seed-text="' + escHtml(h.text.substring(0,60)) + '" style="cursor:pointer;">';
         html += '<div class="seed-card-header">';
         html += '<span class="seed-badge">' + icon + ' SEED' + conf + '</span>';
         if (canStop) {
@@ -1264,8 +1266,16 @@ function renderSeeds(hyps, queueLimit) {
         html += '</div>';
     });
     el.innerHTML = html;
+    el.querySelectorAll('.seed-card').forEach(function(card) {
+        card.addEventListener('click', function() {
+            filterDossiersBySeed(card.getAttribute('data-seed-id'), card.getAttribute('data-seed-text'));
+        });
+    });
     el.querySelectorAll('.seed-stop-btn').forEach(function(btn) {
-        btn.addEventListener('click', function() { stopSeed(btn.getAttribute('data-seed-id')); });
+        btn.addEventListener('click', function(e) {
+            e.stopPropagation();  // Verhindert Propagation zum seed-card click
+            stopSeed(btn.getAttribute('data-seed-id'));
+        });
     });
     var display = document.getElementById('queueLimitDisplay');
     var slider  = document.getElementById('queueLimitSlider');
@@ -1293,20 +1303,48 @@ function renderHypotheses(hypotheses) {
     });
 }
 
+var _activeSeedFilter = null;
+
+function filterDossiersBySeed(seedId, seedText) {
+    if (!seedId || (_activeSeedFilter && _activeSeedFilter.id === seedId)) {
+        _activeSeedFilter = null;
+    } else {
+        _activeSeedFilter = {id: seedId, text: seedText};
+    }
+    var label = document.getElementById('dossierFilterLabel');
+    if (label) {
+        label.textContent = _activeSeedFilter ? '🔍 ' + seedText.substring(0,40) + '… — klick zum Reset' : '';
+        label.style.display = _activeSeedFilter ? 'block' : 'none';
+    }
+    fetch('/api/research/dossiers')
+        .then(function(r) { return r.json(); })
+        .then(function(data) { renderDossiers(data.dossiers || []); });
+}
+
 function renderDossiers(dossiers) {
-    var list = document.getElementById('dossierList');
-    if (!list) return;
-    if (dossiers.length === 0) {
-        list.innerHTML = '<div style="color:#555;font-size:0.8em;padding:6px;">Keine Dossiers vorhanden</div>';
+    var el = document.getElementById('dossierList');
+    if (!el) return;
+    var filtered = dossiers;
+    if (_activeSeedFilter) {
+        var kws = _activeSeedFilter.text.toLowerCase().split(' ')
+            .filter(function(w) { return w.length > 4; }).slice(0, 5);
+        filtered = dossiers.filter(function(d) {
+            var name = (d.name || '').toLowerCase().replace(/_/g,' ');
+            return kws.some(function(kw) { return name.indexOf(kw) >= 0; });
+        });
+    }
+    if (filtered.length === 0) {
+        el.innerHTML = '<div class="rs-empty">' + (_activeSeedFilter ? 'Keine Dossiers für diesen Seed' : 'Keine Dossiers vorhanden') + '</div>';
         return;
     }
-    list.innerHTML = '';
-    dossiers.forEach(function(d) {
+    el.innerHTML = '';
+    filtered.forEach(function(d) {
         var div = document.createElement('div');
         div.className = 'dossier-item';
-        div.innerHTML = '<span class="dossier-name">📄 ' + escHtml(d.name) + '</span>' + '<span class="dossier-meta">' + (d.updated || '') + ' · ' + (d.findings || 0) + ' Erkenntnisse</span>';
+        div.innerHTML = '<span class="dossier-name">📄 ' + escHtml(d.name) + '</span>' +
+            '<span class="dossier-meta">' + (d.updated || '') + ' · ' + (d.findings || 0) + ' Erkenntnisse</span>';
         div.onclick = (function(name) { return function() { openDossier(name); }; })(d.name);
-        list.appendChild(div);
+        el.appendChild(div);
     });
 }
 
@@ -4250,16 +4288,15 @@ class WebServer:
                                            rec["country"], lbl, True))
 
                     # ── Schritt 2: Verbindungen BEIDER Richtungen ──────────
-                    # Ausgehend: (dieser Knoten) → (Nachbar)
                     res = session.run(
                         """
-                        MATCH (a {id: $nid})-[r:RELATED_TO]->(b)
+                        MATCH (a {id: $nid})-[r]->(b)
                         RETURN a.id          AS src,
                                b.id          AS tgt,
                                b.name        AS bname,
                                b.country     AS bcountry,
                                labels(b)[0]  AS blbl,
-                               r.type        AS rtype
+                               type(r)       AS rtype
                         LIMIT 500
                         """,
                         nid=node_id
@@ -4281,13 +4318,13 @@ class WebServer:
                     # Eingehend: (Nachbar) → (dieser Knoten)
                     res = session.run(
                         """
-                        MATCH (b)-[r:RELATED_TO]->(a {id: $nid})
+                        MATCH (b)-[r]->(a {id: $nid})
                         RETURN b.id          AS src,
                                a.id          AS tgt,
                                b.name        AS bname,
                                b.country     AS bcountry,
                                labels(b)[0]  AS blbl,
-                               r.type        AS rtype
+                               type(r)       AS rtype
                         LIMIT 500
                         """,
                         nid=node_id
@@ -5040,7 +5077,7 @@ class LYRAIntegration:
 class LYRANetworkBuilder:
     """
     Hauptklasse fuer LYRA-NET - koordiniert alle Komponenten.
-    Version 2.0.0 – inkl. autonomem Research Agent (Option C)
+    Version 2.0.1 – inkl. autonomem Research Agent (Option C)
     """
     
     def __init__(self, log_fn=None):
