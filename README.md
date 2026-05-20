@@ -1,6 +1,6 @@
 # OpenClawWinInstaller
 
-> **Status: v1.0.5 — PRODUCTION READY** · 2026-05-20  
+> **Status: v1.0.4 — PRODUCTION READY** · 2026-05-20  
 > ✅ OpenClaw 2026.5.18 fully supported — exec schema tightened; `tools.exec.profile` removed (DECISION #43 RETIRED)  
 > ✅ Auto-update disabled by default — prevents 2026.5.7-style config wipe (DECISION #44)  
 > ✅ undici preload v2 patches all timeout paths (headersTimeout + Agent + Pool constructors)
