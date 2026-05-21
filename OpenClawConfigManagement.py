@@ -211,12 +211,9 @@ ARCHITECTURAL DECISIONS  (read before changing anything)
 
 26. openclaw gateway install --force in Worker flow (2026-03-23)
 
-46. models.providers.ollama.timeoutSeconds version-gated (2026-05-20)
-    INVALID in OpenClaw 2026.3.x schema — gateway crash on start if present.
-    Confirmed: apply-fixes sets it → gateway crash; doctor strips it → works.
-    Only written for OpenClaw >= 2026.5.0. In 2026.3.x: undici preload
-    (DECISION #20) + agents.defaults.timeoutSeconds=86400 is sufficient.
-    Stripped if found in existing configs on 2026.3.x.
+49. _watcher_loop: pre-populate _watcher_seen at startup (2026-05-21)
+    All existing .md files marked as seen before first poll — prevents
+    startup flood where every file enters debounce and fires 5 min later.
 
 27. write_openclaw_config() always called after onboard in Worker flow (2026-03-23)
 
@@ -1772,21 +1769,12 @@ class OpenClawConfig:
             # SCHEMA (OpenClaw 2026.5.7): baseUrl + models[] are REQUIRED when ollama key exists.
             # timeoutSeconds-only → schema rejects: "expected string, received undefined".
             # models=[] keeps auto-discovery active (hasExplicitModels=false → ambient discovery).
-            #
-            # DECISION #46 (2026-05-20): timeoutSeconds is INVALID in OpenClaw 2026.3.x schema.
-            # Gateway crashes on start if present (confirmed 2026-05-20: apply-fixes → crash,
-            # doctor strips key → gateway works). Only write for OpenClaw >= 2026.5.0.
-            # In 2026.3.x: undici preload (DECISION #20) is the correct timeout path.
-            # write_openclaw_config() is called with the installed version available via
-            # self.OPENCLAW_STABLE_VERSION — at install time we pin to 2026.3.28, so
-            # timeoutSeconds is omitted. The key is added post-install only if upgraded.
             "models": {
                 "providers": {
                     "ollama": {
-                        "baseUrl": "http://127.0.0.1:11434",
-                        "models":  [],
-                        # timeoutSeconds intentionally omitted — DECISION #46
-                        # (invalid in 2026.3.x, valid in >= 2026.5.0)
+                        "baseUrl":        "http://127.0.0.1:11434",
+                        "models":         [],
+                        "timeoutSeconds": 86400,
                     },
                 },
             },
@@ -2286,21 +2274,12 @@ class OpenClawConfig:
                 cfg["agents"]["defaults"].pop("llm", None)
             except Exception:
                 pass
-            # DECISION #41/#46: provider-level timeoutSeconds only for OpenClaw >= 2026.5.0.
-            # In 2026.3.x this key crashes the gateway (DECISION #46).
+            # Set provider-level timeout: models.providers.ollama.timeoutSeconds
+            # This is the correct key in OpenClaw 5.x for slow local model timeouts.
             try:
-                _ulm_ver = cfg.get("meta", {}).get("lastTouchedVersion", "0.0.0")
-                _ulm_p   = [int(x) for x in _ulm_ver.split(".")]
-                _ulm_ge500 = len(_ulm_p) > 1 and (
-                    _ulm_p[0] > 2026 or (_ulm_p[0] == 2026 and _ulm_p[1] >= 5)
-                )
                 cfg.setdefault("models", {}).setdefault("providers", {})
                 cfg["models"]["providers"].setdefault("ollama", {})
-                if _ulm_ge500:
-                    cfg["models"]["providers"]["ollama"]["timeoutSeconds"] = 86400
-                else:
-                    # 2026.3.x: strip if present (cleanup)
-                    cfg["models"]["providers"]["ollama"].pop("timeoutSeconds", None)
+                cfg["models"]["providers"]["ollama"]["timeoutSeconds"] = 86400
             except Exception:
                 pass
             try:
@@ -4429,20 +4408,34 @@ class LyraHeadServer:
         Without cwd=project_dir, CLAUDE.md is not loaded.
         """
         self.log(f"[Watcher] Triggering claude — {reason}", "INFO")
-        # Determine project_dir dynamically — avoid hardcoded path (WinError 267)
+        # DECISION #48 (2026-05-21): project_dir resolved dynamically from
+        # the binary/script launch location — no hardcoded paths.
+        # When running as PyInstaller binary, sys.executable IS the .exe.
+        # __file__ is NOT available in frozen binaries — never use it here.
+        import sys as _sys
+        _raw = []
+        if getattr(_sys, "frozen", False):
+            _raw.append(os.path.dirname(os.path.abspath(_sys.executable)))
+        if _sys.argv:
+            _raw.append(os.path.dirname(os.path.abspath(_sys.argv[0])))
+        _raw.append(os.getcwd())
+        _search = []
+        for _c in _raw:
+            _search.append(_c)
+            _search.append(os.path.dirname(_c))
+            _search.append(os.path.dirname(os.path.dirname(_c)))
         project_dir = None
-        for _candidate in [
-            # 1. Same dir as this .py file
-            os.path.dirname(os.path.abspath(__file__)) if "__file__" in dir() else None,
-            # 2. Hardcoded known location as fallback
-            os.path.join(os.path.expanduser("~"), "Python", "Projects", "ClawBotInstaller"),
-        ]:
-            if _candidate and os.path.isfile(
-                    os.path.join(_candidate, "OpenClawWinInstaller.py")):
+        for _candidate in _search:
+            if not _candidate:
+                continue
+            if (os.path.isfile(os.path.join(_candidate, "OpenClawWinInstaller.exe"))
+                    or os.path.isfile(os.path.join(_candidate, "OpenClawWinInstaller.py"))):
                 project_dir = _candidate
                 break
         if not project_dir:
-            self.log("[Watcher] claude trigger skipped: project_dir not found", "WARNING")
+            self.log(
+                f"[Watcher] claude trigger skipped: project_dir not found "
+                f"(searched {len(set(_search))} paths from exe/argv/cwd)", "WARNING")
             return
         prompt = (
             "Passiver Observer-Zyklus (automatisch ausgeloest durch Watcher).\n"
@@ -4711,6 +4704,26 @@ class LyraHeadServer:
         # Start memory watcher (only one instance)
         if self._watcher_thread is None or not self._watcher_thread.is_alive():
             self._watcher_stop.clear()
+            # DECISION #49 (2026-05-21): Pre-populate _watcher_seen with all
+            # existing memory files at startup so they are NOT treated as new.
+            # Without this, every existing .md file enters the debounce pool on
+            # first poll → 5 minutes later all tags fire simultaneously →
+            # multiple Claude instances launched at once.
+            # Only files that appear or change AFTER startup should trigger.
+            if os.path.isdir(self._watcher_dir):
+                _preload_count = 0
+                for _fname in os.listdir(self._watcher_dir):
+                    if not _fname.endswith(".md"):
+                        continue
+                    _fpath = os.path.join(self._watcher_dir, _fname)
+                    try:
+                        self._watcher_seen[_fpath] = os.path.getmtime(_fpath)
+                        _preload_count += 1
+                    except OSError:
+                        pass
+                self.log(
+                    f"[HeadSrv] Watcher pre-loaded {_preload_count} existing "
+                    "memory files — only new/changed files will trigger", "INFO")
             self._watcher_thread = threading.Thread(
                 target=self._watcher_loop, daemon=True, name="LyraMemWatcher"
             )
