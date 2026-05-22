@@ -249,7 +249,7 @@ ARCHITECTURAL DECISIONS  (read before changing anything)
       ✅ Read api_key live from workers.json inside the .ps1 script
       ✅ Write request body to a temp .json file (no inline escaping)
       ✅ curl.exe -w "\nHTTP_STATUS:%{http_code}" → always produces verifiable output
-      ✅ powershell -ExecutionPolicy Bypass -File "C:\\Users\\scari\\...\\script.ps1"
+      ✅ powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\\.openclaw\\workspace\\script.ps1"
       ✅ Verify "HTTP_STATUS:200" in exec output — absence = failure, never assume success
 """
 
@@ -1295,7 +1295,7 @@ class OpenClawConfig:
                 "    \u274c powershell -Command \"& \\\"...\\\\script.ps1\\\"\" \u2192 \\\" terminiert String in cmd.exe\n"
                 "    \u274c %USERPROFILE% in -File Argument \u2192 wird NICHT expandiert \u2192 file not found!\n"
                 "    \u274c Invoke-RestMethod in .ps1 via exec \u2192 schl\u00e4gt f\u00fcr externe HTTPS still fehl \u2192 Lyra halluziniert!\n"
-                "    \u2705 powershell -ExecutionPolicy Bypass -File \"C:\\\\Users\\\\scari\\\\.openclaw\\\\workspace\\\\script.ps1\" \u2192 l\u00e4uft\n"
+                "    \u2705 powershell -ExecutionPolicy Bypass -File \"$env:USERPROFILE\\\\.openclaw\\\\workspace\\\\script.ps1\" \u2192 l\u00e4uft\n"
                 "    \u2705 curl.exe in .ps1 \u2192 liefert HTTP_STATUS im Output \u2192 kein stilles Scheitern m\u00f6glich\n\n"
                 "  \u274c ABSOLUT VERBOTEN: API-Key aus dem Ged\u00e4chtnis verwenden oder erfinden!\n"
                 "  \u274c ABSOLUT VERBOTEN: Eigenes DeepSeek-Skript schreiben statt diesem Template!\n"
@@ -1310,17 +1310,17 @@ class OpenClawConfig:
                 "    \u2192 Auch Retry hilft nicht \u2014 derselbe Fehler. SOFORT zur Loesung B wechseln!\n\n"
                 "  \u2705 EINZIGE FUNKTIONIERENDE L\u00d6SUNG \u2014 deepseek_call.ps1 DIREKT ausfuehren:\n"
                 "    Das Script deepseek_call.ps1 existiert bereits unter:\n"
-                "    C:\\\\Users\\\\scari\\\\.openclaw\\\\workspace\\\\deepseek_call.ps1\n"
+                "    $env:USERPROFILE\\\\.openclaw\\\\workspace\\\\deepseek_call.ps1\n"
                 "    Es liest den Key intern \u2014 kein separates Key-Lesen noetig!\n\n"
                 "    Wenn deepseek_call.ps1 noch nicht existiert oder Prompt angepasst werden muss:\n"
                 "  Schritt 1 \u2014 Verbindung pr\u00fcfen:\n"
                 "    exec: powershell -Command \"Test-NetConnection -ComputerName api.deepseek.com -Port 443\"\n"
                 "    Nur wenn TcpTestSucceeded = True \u2192 weiter.\n\n"
                 "  Schritt 2 \u2014 Script schreiben (write-Tool, KEIN exec):\n"
-                "    Datei: C:\\\\Users\\\\scari\\\\.openclaw\\\\workspace\\\\deepseek_call.ps1\n"
+                "    Datei: $env:USERPROFILE\\\\.openclaw\\\\workspace\\\\deepseek_call.ps1\n"
                 "    Inhalt (curl.exe PFLICHT \u2014 Invoke-RestMethod schl\u00e4gt in exec still fehl!):\n"
-                "      $wJson = \"C:\\\\Users\\\\scari\\\\.openclaw\\\\workers.json\"\n"
-                "      $workdir = \"C:\\\\Users\\\\scari\\\\.openclaw\\\\workspace\"\n"
+                "      $wJson = \"$env:USERPROFILE\\\\.openclaw\\\\workers.json\"\n"
+                "      $workdir = \"$env:USERPROFILE\\\\.openclaw\\\\workspace\"\n"
                 "      $workers = Get-Content $wJson | ConvertFrom-Json\n"
                 "      $key = ($workers | Where-Object { $_.name -eq 'Deepseek' }).api_key\n"
                 "      if (-not $key) { Write-Output \"FEHLER: Deepseek api_key leer in workers.json\"; exit 1 }\n"
@@ -1332,7 +1332,7 @@ class OpenClawConfig:
                 "      Write-Output $combined\n"
                 "      if ($combined -notmatch \"HTTP_STATUS:200\") { Write-Output \"FEHLER: DeepSeek kein HTTP 200\"; exit 1 }\n\n"
                 "  Schritt 3 \u2014 Script ausf\u00fchren:\n"
-                "    exec: powershell -ExecutionPolicy Bypass -File \"C:\\\\Users\\\\scari\\\\.openclaw\\\\workspace\\\\deepseek_call.ps1\"\n"
+                "    exec: powershell -ExecutionPolicy Bypass -File \"$env:USERPROFILE\\\\.openclaw\\\\workspace\\\\deepseek_call.ps1\"\n"
                 "    \u2705 Voller Pfad ohne %USERPROFILE% \u2014 wird immer korrekt aufgel\u00f6st.\n"
                 "    \u274c NICHT: %USERPROFILE%\\\\... \u2192 wird NICHT expandiert \u2192 file not found!\n"
                 "    \u274c NICHT: Invoke-RestMethod im Script \u2192 scheitert still \u2192 Lyra halluziniert!\n\n"
@@ -1769,17 +1769,12 @@ class OpenClawConfig:
             # SCHEMA (OpenClaw 2026.5.7): baseUrl + models[] are REQUIRED when ollama key exists.
             # timeoutSeconds-only → schema rejects: "expected string, received undefined".
             # models=[] keeps auto-discovery active (hasExplicitModels=false → ambient discovery).
-            #
-            # DECISION #46 (2026-05-20): timeoutSeconds REMOVED from this block.
-            # In OpenClaw 2026.3.x this key is INVALID → "Unrecognized key: timeoutSeconds"
-            # → gateway refuses to start. Confirmed: installer writes it → gateway crash.
-            # Only valid in OpenClaw >= 2026.5.0. Omitted here since stable pin is 2026.3.28.
             "models": {
                 "providers": {
                     "ollama": {
-                        "baseUrl": "http://127.0.0.1:11434",
-                        "models":  [],
-                        # timeoutSeconds intentionally omitted — DECISION #46
+                        "baseUrl":        "http://127.0.0.1:11434",
+                        "models":         [],
+                        "timeoutSeconds": 86400,
                     },
                 },
             },
@@ -2279,20 +2274,12 @@ class OpenClawConfig:
                 cfg["agents"]["defaults"].pop("llm", None)
             except Exception:
                 pass
-            # Set provider-level timeout only for OpenClaw >= 2026.5.0 (DECISION #46).
-            # In 2026.3.x timeoutSeconds crashes the gateway — strip if present.
+            # Set provider-level timeout: models.providers.ollama.timeoutSeconds
+            # This is the correct key in OpenClaw 5.x for slow local model timeouts.
             try:
-                _ulm_ver = cfg.get("meta", {}).get("lastTouchedVersion", "0.0.0")
-                _ulm_p   = [int(x) for x in _ulm_ver.split(".")]
-                _ulm_ge500 = len(_ulm_p) > 1 and (
-                    _ulm_p[0] > 2026 or (_ulm_p[0] == 2026 and _ulm_p[1] >= 5)
-                )
                 cfg.setdefault("models", {}).setdefault("providers", {})
                 cfg["models"]["providers"].setdefault("ollama", {})
-                if _ulm_ge500:
-                    cfg["models"]["providers"]["ollama"]["timeoutSeconds"] = 86400
-                else:
-                    cfg["models"]["providers"]["ollama"].pop("timeoutSeconds", None)
+                cfg["models"]["providers"]["ollama"]["timeoutSeconds"] = 86400
             except Exception:
                 pass
             try:
@@ -2635,11 +2622,9 @@ f"REGEL: Wenn {primary_short} 3x hintereinander Timeout → Fallback-Modell wäh
 "## Web Search — Absolutes Verbot + Direktaufruf\n"
 "\n"
 "🚨 VERBOTEN: DuckDuckGo, externe Such-APIs, Sessions Spawn, Subagents, API-Key anfragen, LLM-Antwort als Suchergebnis.\n"
-"🚨 VERBOTEN: Browser-Tool für Web-Suchen (Google, Bing, etc.) — Browser ist für spezifische Seiten, NICHT für Suchen!\n"
-"🚨 VERBOTEN: web_fetch für Suchen — web_fetch ist für bekannte URLs, NICHT für Suchanfragen!\n"
 "Sessions Spawn kennt SOUL.md nicht → halluziniert. Kein delegate_to_worker Tool. Nur exec.\n"
 "\n"
-"✅ EINZIGER KORREKTER WEG für Web-Suchen — exec+PowerShell mit SearXNG:\n"
+"✅ PFLICHT — exec+PowerShell DIREKT:\n"
 "\n"
 "type=web_search (für Internet-Suchen):\n"
 "```powershell\n"
@@ -2674,18 +2659,7 @@ f"REGEL: Wenn {primary_short} 3x hintereinander Timeout → Fallback-Modell wäh
 "   NIEMALS mehr als 3x warten (= 165s total). Danach IMMER zum User eskalieren.\n"
 "   ANTI-PATTERN: 'Ich warte kurz...' + Start-Sleep + wiederholt = FALSCH.\n"
 "\n"
-"WENN Worker nicht erreichbar (type=web_search):\n"
-"❌ NICHT: DeepSeek als Ersatz — DeepSeek kennt keine aktuellen Fakten!\n"
-"❌ NICHT: Aus eigenem Wissen antworten und als Suchergebnis ausgeben!\n"
-"✅ STATTDESSEN: SearXNG direkt auf Port 8080 (läuft immer lokal):\n"
-"\n"
-"```powershell\n"
-"$q = [System.Uri]::EscapeDataString('SUCHBEGRIFF')\n"
-"$r = Invoke-RestMethod -Uri \"http://127.0.0.1:8080/search?q=$q&format=json\" -TimeoutSec 10\n"
-"$r.results | Select-Object -First 5 | ForEach-Object { \"$($_.title)`n$($_.url)`n$($_.content)\" }\n"
-"```\n"
-"\n"
-"WENN Worker nicht erreichbar (andere Tasks) → Automatisch auf Deepseek ausweichen.\n"
+"WENN Worker nicht erreichbar → Automatisch auf Deepseek ausweichen (ausser type=web_search → dann melden).\n"
 "WENN task_id leer → GET http://192.168.2.102:18790/health prüfen.\n"
 "\n"
 "---\n"
@@ -2955,9 +2929,6 @@ f"REGEL: Wenn {primary_short} 3x hintereinander Timeout → Fallback-Modell wäh
         that section is merged back into the new content before writing.
         This ensures LYRA's session learnings are not overwritten on reinstall.
 
-        After writing, applies _soul_replacements() to patch any contradictory
-        rules that may exist in both the installer content and LYRA_ADDITIONS.
-
         Returns True on success.
         """
         lyra_additions = ""
@@ -2979,10 +2950,6 @@ f"REGEL: Wenn {primary_short} 3x hintereinander Timeout → Fallback-Modell wäh
         if lyra_additions:
             final_content = installer_content.rstrip() + "\n\n" + lyra_additions
 
-        # Apply known corrections — overrides contradictory rules that may
-        # exist in both installer_content and preserved LYRA_ADDITIONS.
-        final_content = self._soul_replacements(final_content)
-
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
@@ -2993,85 +2960,6 @@ f"REGEL: Wenn {primary_short} 3x hintereinander Timeout → Fallback-Modell wäh
         except Exception as e:
             self._log(f"  [workspace] Write failed: {e}", "ERROR")
             return False
-
-    def _soul_replacements(self, content: str) -> str:
-        """
-        Patches known contradictory or outdated rules in SOUL.md content.
-
-        Called by safe_write_workspace() after merging installer content and
-        LYRA_ADDITIONS. Ensures that corrections introduced in new DECISION
-        entries override any old contradictory text that may have survived in
-        preserved LYRA_ADDITIONS or older installer content versions.
-
-        Each entry: (old_pattern, new_text, description)
-        Pattern matching is plain string replace (case-sensitive, first occurrence
-        of each unique pattern).
-        """
-        import re
-
-        replacements = [
-            # DECISION #50 (2026-05-22): SearXNG direktaufruf bei fehlendem Worker.
-            # Alte Regel: web_search ohne Worker → User melden / auf DeepSeek ausweichen.
-            # Neue Regel: SearXNG Port 8080 direkt ansprechen.
-            (
-                r"UNREACHABLE: Automatisch auf \[openai\] Deepseek ausweichen\.",
-                "UNREACHABLE: SearXNG Port 8080 direkt nutzen (exec, siehe Web Search Abschnitt).",
-                "DECISION #50: DeepSeek-Ausweichen bei web_search entfernt"
-            ),
-            (
-                r"Ausnahme: type=web_search → User melden \(SearXNG läuft nur lokal\)\.",
-                "type=web_search → SearXNG direkt: Invoke-RestMethod 'http://127.0.0.1:8080/search?q=QUERY&format=json'",
-                "DECISION #50: web_search Ausnahmeregel korrigiert"
-            ),
-            (
-                r"DELEGATION-REGEL: UNREACHABLE: Automatisch auf \[openai\] Deepseek \(api\.deepseek\.com\) ausweichen\.",
-                "DELEGATION-REGEL: UNREACHABLE web_search → SearXNG Port 8080 direkt (NIE DeepSeek).",
-                "DECISION #50: Delegation-Regel DeepSeek entfernt"
-            ),
-            (
-                r"DELEGATION-REGEL: Ausnahme: type=web_search → User melden \(SearXNG nur lokal\)\.",
-                "DELEGATION-REGEL: web_search immer via SearXNG 8080, NIE DeepSeek als Suchergebnis.",
-                "DECISION #50: Delegation-Ausnahmeregel korrigiert"
-            ),
-            (
-                r"→ Automatisch auf \[openai\] Deepseek \(api\.deepseek\.com\) ausweichen\.",
-                "→ SearXNG direkt Port 8080 (exec+Invoke-RestMethod) — NIE DeepSeek für web_search.",
-                "DECISION #50: DeepSeek-Ausweichen generisch entfernt"
-            ),
-            (
-                r"→ Ausnahme: type=web_search → User melden, kein Fallback \(SearXNG ist lokal\)\.",
-                "→ web_search: SearXNG 8080 direkt, NIE DeepSeek als Suchergebnis.",
-                "DECISION #50: Kein-Fallback-Regel korrigiert"
-            ),
-            (
-                r"WENN Worker nicht erreichbar → Automatisch auf Deepseek ausweichen \(ausser type=web_search → dann melden\)\.",
-                "WENN Worker nicht erreichbar (web_search) → SearXNG Port 8080 direkt. Andere Tasks → DeepSeek.",
-                "DECISION #50: Hauptregel korrigiert"
-            ),
-            # DECISION #51 (2026-05-22): Browser-Tool für Web-Suchen verboten.
-            # LYRA nutzte Browser (Google/Bing) statt SearXNG trotz SOUL.md-Regel.
-            # Explizites Verbot in _soul_replacements damit es auch in LYRA_ADDITIONS greift.
-            (
-                r"🚨 VERBOTEN: DuckDuckGo, externe Such-APIs",
-                "🚨 VERBOTEN: Browser-Tool für Suchen (Google/Bing) — Browser nur für spezifische URLs!\n"
-                "🚨 VERBOTEN: web_fetch für Suchen — nur für bekannte URLs!\n"
-                "🚨 VERBOTEN: DuckDuckGo, externe Such-APIs",
-                "DECISION #51: Browser-Tool für Suchen verboten"
-            ),
-        ]
-
-        count = 0
-        for pattern, replacement, desc in replacements:
-            new_content, n = re.subn(pattern, replacement, content)
-            if n > 0:
-                content = new_content
-                count += n
-                self._log(f"  [soul_fix] {desc} ({n}x)", "INFO")
-
-        if count:
-            self._log(f"  [soul_fix] {count} veraltete Regel(n) korrigiert ✓", "SUCCESS")
-
-        return content
 
     def _build_bootstrap_content(self) -> str:
         """
@@ -4551,11 +4439,11 @@ class LyraHeadServer:
             return
         prompt = (
             "Passiver Observer-Zyklus (automatisch ausgeloest durch Watcher).\n"
-            "1. Lies C:\\Users\\scari\\.openclaw\\workspace\\memory\\ — alle Dateien "
+            "1. Lies $env:USERPROFILE\\.openclaw\\workspace\\memory\\ — alle Dateien "
             "der letzten 24 Stunden.\n"
             "2. Suche nach [CORRECTION] und [SOUL-UPDATE-VORSCHLAG] Tags.\n"
-            "3. Lies C:\\Users\\scari\\.openclaw\\workspace\\SOUL.md und "
-            "C:\\Users\\scari\\.openclaw\\workers.json.\n"
+            "3. Lies $env:USERPROFILE\\.openclaw\\workspace\\SOUL.md und "
+            "$env:USERPROFILE\\.openclaw\\workers.json.\n"
             "4. Wende alle gefundenen Verbesserungen auf beide Tracks an "
             "(SOUL.md + OpenClawConfigManagement.py).\n"
             "5. Schreibe Log nach "
