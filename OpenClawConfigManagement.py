@@ -1100,6 +1100,33 @@ class OpenClawConfig:
             self._log(f"[Workers] save_workers failed: {e}", "ERROR")
             return False
 
+    def _get_project_dir(self) -> str:
+        """
+        Returns the installer project directory dynamically.
+        Uses the same logic as DECISION #48 (_trigger_claude).
+        Falls back to a generic placeholder if not found.
+        Never returns a hardcoded user-specific path.
+        """
+        import sys as _sys
+        _raw = []
+        if getattr(_sys, "frozen", False):
+            _raw.append(os.path.dirname(os.path.abspath(_sys.executable)))
+        if _sys.argv:
+            _raw.append(os.path.dirname(os.path.abspath(_sys.argv[0])))
+        _raw.append(os.getcwd())
+        _search = []
+        for _c in _raw:
+            _search.append(_c)
+            _search.append(os.path.dirname(_c))
+            _search.append(os.path.dirname(os.path.dirname(_c)))
+        for _candidate in _search:
+            if not _candidate:
+                continue
+            if (os.path.isfile(os.path.join(_candidate, "OpenClawWinInstaller.exe"))
+                    or os.path.isfile(os.path.join(_candidate, "OpenClawWinInstaller.py"))):
+                return _candidate
+        return "<INSTALLER_DIR>"  # Fallback — nie ein hardcodierter Pfad
+
     def _build_worker_soul_section(self, workers: list) -> str:
         """
         Generates the ## Agent Registry SOUL.md section.
@@ -1181,9 +1208,9 @@ class OpenClawConfig:
                     f"    STATUS: Kein HTTP-Endpunkt — Erreichbarkeit via Prozesscheck.\n"
                     f"    PRÜFEN: exec → wmic process where \"name='powershell.exe'\" get CommandLine\n"
                     f"            'lyra_observer' im Output → läuft | nicht vorhanden → gestoppt\n"
-                    f"    STARTEN: exec → powershell -ExecutionPolicy Bypass -File \"C:\\Python\\Projects\\ClawBotInstaller\\lyra_observer.ps1\"\n"
-                    f"    STOPPEN: exec → powershell -ExecutionPolicy Bypass -File \"C:\\Python\\Projects\\ClawBotInstaller\\lyra_observer_stop.ps1\"\n"
-                    f"    NICHT: Online nach Repository suchen — Observer ist LOKAL: C:\\Python\\Projects\\ClawBotInstaller\\lyra_observer.ps1\n"
+                    f"    STARTEN: exec → powershell -ExecutionPolicy Bypass -File \"{self._get_project_dir()}\\lyra_observer.ps1\"\n"
+                    f"    STOPPEN: exec → powershell -ExecutionPolicy Bypass -File \"{self._get_project_dir()}\\lyra_observer_stop.ps1\"\n"
+                    f"    NICHT: Online nach Repository suchen — Observer ist LOKAL: {self._get_project_dir()}\\lyra_observer.ps1\n"
                     f"    NICHT: HTTP-Request versuchen (port=0, kein Server)\n"
                     f"    NICHT: claude_code Tasks senden — Observer läuft eigenständig\n"
                 )
@@ -4447,7 +4474,7 @@ class LyraHeadServer:
             "4. Wende alle gefundenen Verbesserungen auf beide Tracks an "
             "(SOUL.md + OpenClawConfigManagement.py).\n"
             "5. Schreibe Log nach "
-            "C:\\Python\\Projects\\ClawBotInstaller\\ClaudeCode\\logs\\.\n"
+            f"{self._get_project_dir()}\\ClaudeCode\\logs\\.\n"
             "6. Beende danach."
         )
         try:
