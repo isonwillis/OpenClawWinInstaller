@@ -45,6 +45,15 @@ from typing import Optional
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
 
+# Force UTF-8 stdout/stderr on Windows (CP1252 cannot encode emoji)
+import sys as _sys
+if hasattr(_sys.stdout, 'reconfigure'):
+    try: _sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception: pass
+if hasattr(_sys.stderr, 'reconfigure'):
+    try: _sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception: pass
+
 _LOG_LOCK = threading.Lock()
 
 def _ts() -> str:
@@ -54,7 +63,12 @@ def unified_log(msg: str, level: str = "INFO"):
     icons = {"ERROR": "❌", "SUCCESS": "✅", "WARNING": "⚠️", "INFO": "📌"}
     icon = icons.get(level, "📌")
     with _LOG_LOCK:
-        print(f"[{_ts()}] {icon} [LYRA-UNIFIED] {msg}")
+        try:
+            print(f"[{_ts()}] {icon} [LYRA-UNIFIED] {msg}")
+        except UnicodeEncodeError:
+            # Fallback: replace unencodable chars (CP1252 terminal)
+            safe = f"[{_ts()}] {icon} [LYRA-UNIFIED] {msg}"
+            print(safe.encode('cp1252', errors='replace').decode('cp1252'))
 
 # ── Imports aus den Original-Modulen ─────────────────────────────────────────
 
@@ -1054,10 +1068,38 @@ def initialize_and_run(auto_mode: bool = False):
 
     threading.Thread(target=_open_browser, daemon=True).start()
 
+    # ── Port-Konflikt prüfen und auflösen ────────────────────────────────────
+    import socket as _socket
+    _test = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    try:
+        _test.bind(('127.0.0.1', UNIFIED_PORT))
+        _test.close()
+    except OSError:
+        unified_log(f"Port {UNIFIED_PORT} bereits belegt — versuche alten Prozess zu beenden...", "WARNING")
+        try:
+            import subprocess as _sp
+            # Finde PID der den Port hält und beende ihn
+            r = _sp.run(
+                ['powershell', '-Command',
+                 f'(Get-NetTCPConnection -LocalPort {UNIFIED_PORT} -ErrorAction SilentlyContinue).OwningProcess'],
+                capture_output=True, text=True, timeout=5
+            )
+            pid_str = r.stdout.strip()
+            if pid_str and pid_str.isdigit():
+                _sp.run(['taskkill', '/PID', pid_str, '/F'], timeout=5, capture_output=True)
+                unified_log(f"Prozess PID {pid_str} beendet — warte 2s...", "INFO")
+                time.sleep(2)
+            else:
+                unified_log(f"Port {UNIFIED_PORT} belegt aber PID nicht ermittelbar — Abbruch.", "ERROR")
+                sys.exit(1)
+        except Exception as _e:
+            unified_log(f"Port-Konflikt konnte nicht aufgelöst werden: {_e}", "ERROR")
+            sys.exit(1)
+
     # ── Unified Server starten (blocking) ─────────────────────────────────────
     unified_log(f"Unified Server startet auf http://127.0.0.1:{UNIFIED_PORT}")
-    unified_log(f"  🗺️  ICIJ Network:         /icij/")
-    unified_log(f"  🕵️  Narrative Forensics:  /forensics/")
+    unified_log(f"  ICIJ Network:         /icij/")
+    unified_log(f"  Narrative Forensics:  /forensics/")
     unified_log("Fenster minimieren, nicht schliessen.")
 
     logging.getLogger('werkzeug').setLevel(logging.ERROR)
