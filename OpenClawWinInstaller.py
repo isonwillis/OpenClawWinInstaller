@@ -47,6 +47,9 @@ v1.0.4 (2026-03-25):
                 to REJECTED_KEYS_EXEC so Apply-fixes strips it from existing configs.
                 exec is now activated via tools.profile="full" (already set at
                 the tools level). _apply_fixes_and_update() no longer writes it.
+  DECISION #52: browser unrecognized keys stripped in _apply_fixes_and_update (2026-05-22).
+                targetUrl and maxWidth cause 'Config invalid' gateway crash.
+                Any key outside {enabled, headless, defaultProfile, profiles} is stripped.
   DECISION #46: models.providers.ollama.timeoutSeconds version-gated (2026-05-20).
                 INVALID in OpenClaw 2026.3.x — gateway crashes on start if present.
                 Confirmed: apply-fixes sets it → crash; doctor strips it → works.
@@ -170,6 +173,7 @@ class OpenClawWinInstaller(OpenClawOperations):
         # Auto-start task server on Lyra at app launch (no manual click needed)
         if self._saved_role == "Lyra":
             self.root.after(1000, self._auto_start_head_task_server)
+            self.root.after(2000, self._auto_start_gateway_if_needed)
             self.root.after(4000, self._cc_auto_start)
 
     # ──────────────────────────────────────────────────────────────────
@@ -888,11 +892,11 @@ class OpenClawWinInstaller(OpenClawOperations):
         role_frame.pack(fill=tk.X, pady=(4, 2))
         ttk.Label(role_frame, text="🎭 LYRA Role:",
                   font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT, padx=(0, 8))
-        self._lyra_role_var = tk.StringVar(value="pattern_recognition")
+        self._lyra_role_var = tk.StringVar(value="research_agent")
         self._lyra_role_cb  = ttk.Combobox(
             role_frame,
             textvariable=self._lyra_role_var,
-            values=["pattern_recognition", "cinematic_coordinator", "research_agent"],
+            values=["research_agent", "cinematic_coordinator", "dna_analyzer"],
             state="readonly", width=24
         )
         self._lyra_role_cb.pack(side=tk.LEFT)
@@ -1529,17 +1533,27 @@ class OpenClawWinInstaller(OpenClawOperations):
 
     def _load_lyra_role(self):
         """Loads saved role from lyra_role.json and updates the UI."""
+        valid_roles = {"research_agent", "cinematic_coordinator", "dna_analyzer"}
         try:
             with open(self._lyra_role_file(), "r", encoding="utf-8") as f:
-                role = json.load(f).get("role", "pattern_recognition")
+                role = json.load(f).get("role", "research_agent")
         except Exception:
-            role = "pattern_recognition"
+            role = "research_agent"
+        # Reset unknown/removed roles to default (e.g. pattern_recognition)
+        if role not in valid_roles:
+            self.log(f"[Role] Unbekannte Rolle '{role}' — setze auf 'research_agent'", "WARNING")
+            role = "research_agent"
+            try:
+                with open(self._lyra_role_file(), "w", encoding="utf-8") as f:
+                    json.dump({"role": role}, f)
+            except Exception:
+                pass
         if hasattr(self, "_lyra_role_var"):
             self._lyra_role_var.set(role)
         self._apply_role_info(role)
         # Auto-Start LYRA-NET wenn research_agent gespeichert ist und nicht läuft
         if role == "research_agent" and not self._is_lyra_net_running():
-            self.log("[Role] research_agent geladen – starte LYRA-NET in 3s...", "INFO")
+            self.log("[Role] research_agent geladen – starte LYRA Unified in 3s...", "INFO")
             self.root.after(3000, self._start_role_app)
 
     def _open_browser_when_ready(self, url: str, retries: int = 24, interval_ms: int = 2500):
@@ -1558,14 +1572,23 @@ class OpenClawWinInstaller(OpenClawOperations):
                 self.log("[Role] Server nicht erreichbar nach 60s – Browser nicht geöffnet", "WARNING")
 
     def _is_lyra_net_running(self) -> bool:
-        """Prüft ob LYRA-NET bereits läuft (Port 18800 antwortet)."""
-        try:
-            import urllib.request
-            urllib.request.urlopen("http://127.0.0.1:18800/api/health", timeout=2)
-            return True
-        except Exception:
-            return False
-        self._apply_role_info(role)
+        """Prüft ob LYRA Unified oder LYRA-NET bereits auf Port 18800 läuft.
+        Prüft mehrere Endpunkte da lyra_unified.py /api/health nicht direkt
+        anbietet (nur /icij/api/health und /forensics/api/health).
+        """
+        import urllib.request
+        for url in [
+            "http://127.0.0.1:18800/",
+            "http://127.0.0.1:18800/api/health",
+            "http://127.0.0.1:18800/api/status",
+            "http://127.0.0.1:18800/icij/api/health",
+        ]:
+            try:
+                urllib.request.urlopen(url, timeout=2)
+                return True
+            except Exception:
+                continue
+        return False
 
     def _save_lyra_role(self, role: str):
         """Persists role to lyra_role.json."""
@@ -1581,15 +1604,15 @@ class OpenClawWinInstaller(OpenClawOperations):
     def _apply_role_info(self, role: str):
         """Updates the role info label."""
         labels = {
-            "pattern_recognition": (
-                "🧬 Pattern Recognition — "
-                "Suche nach Signaturen im Rauschen der DNA, des Codes, des Lebens.  "
-                "📚 Memory: [:pattern_recognition] + [:shared]"
-            ),
             "cinematic_coordinator": (
                 "🎬 Cinematic Coordinator — "
                 "LYRA produziert den Film ueber ihre eigene Entstehung.  "
                 "📚 Memory: [:cinematic_coordinator] + [:shared]"
+            ),
+            "dna_analyzer": (
+                "🧬 DNA Rhythm Analyzer — "
+                "Mustererkennung in DNA-Sequenzen.  "
+                "📚 Memory: [:dna_analyzer] + [:shared]"
             ),
             "research_agent": (
                 "🔬 Research Agent — "
@@ -1667,16 +1690,19 @@ class OpenClawWinInstaller(OpenClawOperations):
 
         # ── research_agent ────────────────────────────────────────────────────
         if role == "research_agent":
-            # Kandidatenpfade in Reihenfolge: korrekter Pfad, v2-Variante, cwd
+            # Kandidatenpfade: lyra_unified.py bevorzugt (ICIJ + Forensics),
+            # Fallback auf standalone lyra_network_builder.py
             candidates = [
+                os.path.join(proj, "Tools", "lyra_network_builder", "lyra_unified.py"),
                 os.path.join(proj, "Tools", "lyra_network_builder", "lyra_network_builder.py"),
                 os.path.join(proj, "Tools", "lyra_network_builder", "lyra_network_builder_v2.py"),
-                os.path.join(proj, "lyra_network_builder_v2.py"),
+                os.path.join(proj, "lyra_unified.py"),
+                os.path.join(os.getcwd(), "lyra_unified.py"),
                 os.path.join(os.getcwd(), "lyra_network_builder.py"),
             ]
             app_path = next((p for p in candidates if os.path.isfile(p)), None)
 
-            # Prüfen ob LYRA-NET bereits läuft (Port 18800 antwortet)
+            # Prüfen ob bereits läuft (Port 18800 antwortet)
             already_running = False
             try:
                 import urllib.request
@@ -1686,33 +1712,59 @@ class OpenClawWinInstaller(OpenClawOperations):
                 pass
 
             if already_running:
-                # App läuft schon – nur Browser öffnen
                 import webbrowser
-                webbrowser.open("http://127.0.0.1:18800/research")
-                self.log("[Role] LYRA-NET läuft bereits – Research UI geöffnet ✓", "SUCCESS")
+                webbrowser.open("http://127.0.0.1:18800")
+                self.log("[Role] LYRA Unified läuft bereits – UI geöffnet ✓", "SUCCESS")
                 return
 
             if not app_path:
                 self.log(
-                    "[Role] lyra_network_builder_v2.py nicht gefunden.\n"
+                    "[Role] lyra_unified.py nicht gefunden.\n"
                     f"       Gesucht in: {', '.join(candidates)}\n"
-                    "       Bitte Datei in den Projektordner kopieren.",
+                    "       Bitte lyra_unified.py in den Tool-Ordner kopieren.",
                     "ERROR"
                 )
                 return
 
-            # App starten – sichtbares Konsolenfenster (CREATE_NEW_CONSOLE = 0x10)
             import subprocess
             try:
+                env = os.environ.copy()
+                env["PYTHONUTF8"] = "1"  # Fix UnicodeEncodeError on CP1252 terminals
                 subprocess.Popen(
                     ["python", app_path, "--auto"],
                     creationflags=0x00000010,   # CREATE_NEW_CONSOLE
-                    cwd=os.path.dirname(app_path)
+                    cwd=os.path.dirname(app_path),
+                    env=env
                 )
                 self.log(f"[Role] {os.path.basename(app_path)} gestartet (--auto) ✓", "SUCCESS")
-                # Browser öffnen sobald Server erreichbar ist (max 60s warten)
                 self.root.after(500, lambda: self._open_browser_when_ready(
-                    "http://127.0.0.1:18800/research", retries=24, interval_ms=2500))
+                    "http://127.0.0.1:18800", retries=24, interval_ms=2500))
+            except Exception as e:
+                self.log(f"[Role] Start fehlgeschlagen: {e}", "ERROR")
+            return
+
+        # ── dna_analyzer ─────────────────────────────────────────────────────
+        if role == "dna_analyzer":
+            candidates = [
+                os.path.join(proj, "Tools", "DNARythmAnalyzer", "DNARythmAnalyzer.py"),
+                os.path.join(os.getcwd(), "DNARythmAnalyzer.py"),
+            ]
+            app_path = next((p for p in candidates if os.path.isfile(p)), None)
+            if not app_path:
+                self.log(
+                    "[Role] DNARythmAnalyzer.py nicht gefunden.\n"
+                    f"       Gesucht in: {', '.join(candidates)}",
+                    "ERROR"
+                )
+                return
+            import subprocess
+            try:
+                subprocess.Popen(
+                    ["python", app_path],
+                    creationflags=0x00000010,
+                    cwd=os.path.dirname(app_path)
+                )
+                self.log(f"[Role] {os.path.basename(app_path)} gestartet ✓", "SUCCESS")
             except Exception as e:
                 self.log(f"[Role] Start fehlgeschlagen: {e}", "ERROR")
             return
@@ -2372,6 +2424,23 @@ class OpenClawWinInstaller(OpenClawOperations):
         # First check after 12s, second after 18s (container sometimes takes longer)
         self.root.after(12000, lambda: self._check_searxng(sl, base_url))
         self.root.after(18000, lambda: self._check_searxng(sl, base_url))
+
+    def _auto_start_gateway_if_needed(self):
+        """
+        Called 2s after app launch for Lyra role.
+        Checks if gateway is running — if not, starts it automatically.
+        Prevents the situation where binary/script is restarted but the
+        gateway was closed and requires manual 'Restart Gateway' click.
+        """
+        import urllib.request
+        try:
+            token = self._read_gateway_token()
+            url   = f"http://127.0.0.1:18789/health?token={token}"
+            urllib.request.urlopen(url, timeout=3)
+            self.log("[Gateway] Already running ✓", "INFO")
+        except Exception:
+            self.log("[Gateway] Not running — auto-starting...", "INFO")
+            self._restart_gateway()
 
     def _check_gateway(self):
         """
@@ -3185,6 +3254,24 @@ class OpenClawWinInstaller(OpenClawOperations):
                 if exec_cfg.get("security") == "allowlist":
                     cfg["tools"]["exec"]["security"] = "full"
                     fixes_applied.append("tools.exec.security (allowlist → full)")
+
+                # DECISION #52 (2026-05-22): browser unrecognized keys strip.
+                # OpenClaw 2026.3.28 schema rejects unknown keys in the browser block.
+                # Keys 'targetUrl' and 'maxWidth' cause: "Config invalid — browser:
+                # Unrecognized keys: targetUrl, maxWidth" → gateway refuses to start.
+                # Source: written by LYRA or older installer versions.
+                # Fix: strip any keys not in the known valid browser schema.
+                _BROWSER_VALID = {"enabled", "headless", "defaultProfile", "profiles"}
+                _browser_cfg = cfg.get("browser", {})
+                _browser_bad = [k for k in list(_browser_cfg.keys())
+                                if k not in _BROWSER_VALID]
+                if _browser_bad:
+                    for _bk in _browser_bad:
+                        del cfg["browser"][_bk]
+                    fixes_applied.append(
+                        f"browser keys stripped (DECISION #52 — schema rejected: "
+                        f"{', '.join(_browser_bad)})"
+                    )
 
                 # DECISION #43 RETIRED (2026.5.18): profile="coding" was a workaround
                 # for OpenClaw 2026.1.x–2026.5.17 where tools.exec.security="full" alone

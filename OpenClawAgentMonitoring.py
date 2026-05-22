@@ -217,7 +217,10 @@ class _HealthPoller(threading.Thread):
             elif not online:
                 info = f"HTTP {sc}"
             results.append({"agent": a, "online": online, "info": info})
-        self._root.after(0, lambda r=results: self._on_result(r))
+        try:
+            self._root.after(0, lambda r=results: self._on_result(r))
+        except RuntimeError:
+            pass  # main thread destroyed (shutdown/restart) — ignore
 
 
 # ── MonitoringTab ──────────────────────────────────────────────────────────────
@@ -300,7 +303,10 @@ class MonitoringTab:
         """Wire on_result_callback so results appear automatically."""
         def _cb(result: dict):
             # Called from server thread — schedule on main thread
-            self._root.after(0, lambda r=result: self._on_result_received(r))
+            try:
+                self._root.after(0, lambda r=result: self._on_result_received(r))
+            except RuntimeError:
+                pass  # main thread destroyed — ignore
         head_server.on_result_callback = _cb
 
     def destroy(self):
