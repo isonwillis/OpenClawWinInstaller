@@ -1796,12 +1796,15 @@ class OpenClawConfig:
             # SCHEMA (OpenClaw 2026.5.7): baseUrl + models[] are REQUIRED when ollama key exists.
             # timeoutSeconds-only → schema rejects: "expected string, received undefined".
             # models=[] keeps auto-discovery active (hasExplicitModels=false → ambient discovery).
+            #
+            # DECISION #46 (2026-05-20): timeoutSeconds REMOVED — invalid in 2026.3.x schema.
+            # Gateway crash confirmed: "Unrecognized key: timeoutSeconds" on every start.
             "models": {
                 "providers": {
                     "ollama": {
-                        "baseUrl":        "http://127.0.0.1:11434",
-                        "models":         [],
-                        "timeoutSeconds": 86400,
+                        "baseUrl": "http://127.0.0.1:11434",
+                        "models":  [],
+                        # timeoutSeconds intentionally omitted — DECISION #46
                     },
                 },
             },
@@ -2301,12 +2304,20 @@ class OpenClawConfig:
                 cfg["agents"]["defaults"].pop("llm", None)
             except Exception:
                 pass
-            # Set provider-level timeout: models.providers.ollama.timeoutSeconds
-            # This is the correct key in OpenClaw 5.x for slow local model timeouts.
+            # Set provider-level timeout only for OpenClaw >= 2026.5.0 (DECISION #46).
+            # In 2026.3.x timeoutSeconds is an unrecognized key → gateway crash.
             try:
+                _ulm_ver = cfg.get("meta", {}).get("lastTouchedVersion", "0.0.0")
+                _ulm_p   = [int(x) for x in _ulm_ver.split(".")]
+                _ulm_ge500 = len(_ulm_p) > 1 and (
+                    _ulm_p[0] > 2026 or (_ulm_p[0] == 2026 and _ulm_p[1] >= 5)
+                )
                 cfg.setdefault("models", {}).setdefault("providers", {})
                 cfg["models"]["providers"].setdefault("ollama", {})
-                cfg["models"]["providers"]["ollama"]["timeoutSeconds"] = 86400
+                if _ulm_ge500:
+                    cfg["models"]["providers"]["ollama"]["timeoutSeconds"] = 86400
+                else:
+                    cfg["models"]["providers"]["ollama"].pop("timeoutSeconds", None)
             except Exception:
                 pass
             try:
