@@ -1,8 +1,12 @@
 # OpenClawWinInstaller
 
-> **Status: v1.0.4 — PRODUCTION READY** · 2026-05-20  
-> ✅ OpenClaw 2026.5.18 fully supported — exec schema tightened; `tools.exec.profile` removed (DECISION #43 RETIRED)  
-> ✅ Auto-update disabled by default — prevents 2026.5.7-style config wipe (DECISION #44)  
+> **Status: v1.0.4 — PRODUCTION READY** · 2026-05-23  
+> ✅ OpenClaw pinned to 2026.3.28 — stable baseline, GitHub .tgz fallback (DECISION #45)  
+> ✅ `models.providers.ollama.timeoutSeconds` version-gated — gateway crash fixed (DECISION #46)  
+> ✅ Claude Code Observer: dynamic project_dir + startup flood fixed (DECISION #47-49)  
+> ✅ SearXNG direct fallback — DeepSeek/Browser forbidden for web search (DECISION #50/51)  
+> ✅ Browser invalid key strip — `targetUrl`/`maxWidth` cause gateway crash (DECISION #52)  
+> ✅ No hardcoded user paths — `scari` and installer paths replaced dynamically  
 > ✅ undici preload v2 patches all timeout paths (headersTimeout + Agent + Pool constructors)
 
 A fully automated Windows installer that sets up **OpenClaw** with a local LLM (LYRA via Ollama).  
@@ -46,9 +50,11 @@ From v1.0.4 the system also supports **external LLM agents** (OpenAI-compatible 
 
 ## Table of Contents
 
-- [What's New in v1.0.5](#whats-new-in-v105)
-  - [Observer Session 2026-05-20](#-observer-session-2026-05-20--openclaw-2026518-exec-schema--auto-update-safeguard)
-  - [DECISION #46 — models.providers.ollama.timeoutSeconds version-gated](#-decision-46--modelsprovidersollama-version-gated)
+- [What's New in v1.0.4 (continued)](#whats-new-in-v104-continued)
+  - [Observer Session 2026-05-20 + DECISION #43/44](#-observer-session-2026-05-20--openclaw-2026518-exec-schema--auto-update-safeguard)
+  - [DECISION #45 — OpenClaw Version Pin + PS1 Scripts](#-decision-45--openclaw-version-pin--ps1-version-manager)
+  - [DECISION #46 — models.providers.ollama version-gated](#-decision-46--modelsprovidersollama-version-gated)
+  - [DECISION #47-52 — Observer, SearXNG, Browser, path fixes](#-decision-47-49--claude-code-observer-fixes)
 - [What's New in v1.0.4](#whats-new-in-v104)
   - [Observer Session 2026-04-19](#-observer-session-2026-04-19--openclaw-2026-4x-timeout-resolved--call_observer-skill)
   - [Observer Session 2026-04-03](#-observer-session-2026-04-03--openclaw-2026-4x-breaking-changes--version-pin)
@@ -199,7 +205,64 @@ Timeout on 2026.3.x is handled correctly by the **undici preload** (DECISION #20
 
 ---
 
-## What's New in v1.0.4
+## What's New in v1.0.4 (continued)
+
+### 🔧 DECISION #45 — OpenClaw Version Pin + PS1 Version Manager
+
+`fix_openclaw_installation()` now tries `npm install -g openclaw@2026.3.28` first, then GitHub `.tgz` fallback, then latest as last resort. `OPENCLAW_STABLE_VERSION` and `OPENCLAW_GITHUB_FALLBACK` as class constants. Three PS1 scripts generated dynamically into workspace on every Apply-fixes: `install-openclaw.ps1`, `update-openclaw.ps1`, `openclaw-version-manager.ps1`.
+
+#### ❌ `npm install -g openclaw@latest` as first install attempt — NEVER REINTRODUCE
+> Stable pin 2026.3.28 is the baseline. Latest is last resort only.
+
+---
+
+### 🔧 DECISION #46 — `models.providers.ollama` Version-Gated
+
+`models.providers.ollama.timeoutSeconds` is **invalid** in OpenClaw 2026.3.x — gateway crashes with `Unrecognized key: timeoutSeconds`. The key was written unconditionally by `write_openclaw_config()` and `_update_llm_model()` causing repeated gateway failures after every install/Apply-fixes. Both write paths are now version-gated: only written for OpenClaw ≥ 2026.5.0, stripped on 2026.3.x.
+
+#### ❌ `models.providers.ollama.timeoutSeconds` on OpenClaw 2026.3.x — NEVER REINTRODUCE
+> Unrecognized key → gateway crash. `_apply_fixes_and_update()` strips it automatically.
+
+---
+
+### 🔧 DECISION #47-49 — Claude Code Observer Fixes
+
+**#47 — `_watcher_loop` tag-check before seen-update:** Previously `_watcher_seen[path] = mtime` was set immediately on any mtime change — if LYRA then wrote a tag to an already-scanned file, the change was silently missed. Fix: peek content on mtime change; only mark as seen if no tag present. Files with tags stay "unseen" until debounce fires.
+
+**#48 — `_trigger_claude` dynamic project_dir:** Old code used `__file__` (unavailable in frozen binary) and hardcoded `~\Python\Projects\ClawBotInstaller` (wrong user path). Fix: `sys.executable` (frozen binary path) → `sys.argv[0]` → `cwd`, plus parent/grandparent walk. Accepts both `.exe` and `.py` marker files.
+
+**#49 — Startup flood prevention:** On first poll, all existing memory files entered the debounce pool → 5 minutes later all fired simultaneously → 15 Claude instances launched. Fix: `start()` pre-populates `_watcher_seen` with all existing files before the watcher thread starts.
+
+---
+
+### 🔧 DECISION #50-51 — SearXNG Direct + Browser Forbidden for Web Search
+
+LYRA was falling back to DeepSeek (via `deepseek_call.ps1`) and Browser-Tool (Google/Bing) for web searches instead of SearXNG. Root cause: SOUL.md had contradictory rules that survived `safe_write_workspace()` merges via LYRA_ADDITIONS.
+
+Fix: new `_soul_replacements()` method — called by `safe_write_workspace()` after merge, patches 7 known contradictory patterns via regex. Runs on every Apply-fixes, SOUL.md write, and agent update. Additionally, `tools.web.search.enabled=false` was already set; SOUL.md now explicitly forbids Browser-Tool and web_fetch for searches.
+
+#### ❌ Browser-Tool or web_fetch for web searches — NEVER REINTRODUCE
+> Browser is for specific known URLs only. web_fetch is for known URLs only.
+> Web searches: SearXNG Port 8080 via exec+PowerShell. Always.
+
+---
+
+### 🔧 DECISION #52 — Browser Invalid Key Strip
+
+OpenClaw 2026.3.28 rejects unknown keys in the `browser` block — `targetUrl` and `maxWidth` cause `Config invalid: browser: Unrecognized keys`. `_apply_fixes_and_update()` now strips any key outside `{enabled, headless, defaultProfile, profiles}` on every run.
+
+---
+
+### 🔧 No Hardcoded User Paths
+
+All occurrences of `C:\Users\scari` (10 instances) and `C:\Python\Projects\ClawBotInstaller` (4 instances) replaced:
+- User paths → `$env:USERPROFILE`
+- Installer paths → `self._get_project_dir()` (new helper, same DECISION #48 logic)
+- `_get_project_dir()` returns `<INSTALLER_DIR>` as fallback — never a hardcoded path
+
+---
+
+## What's New in v1.0.4 — May 2026 Updates
 
 ### 🔭 Observer Session 2026-05-20 — OpenClaw 2026.5.18 exec Schema + Auto-Update Safeguard
 
